@@ -10,6 +10,8 @@ Building space games in a standard game engine usually runs into two big problem
 - **Simulation nodes** (`JrOrbitDriver`, `JrRailOrbiter`, `JrBallisticOrbiter`) calculate accurate 3D orbits, multi-body gravity, spacecraft thrust, and trajectory forecasts behind the scenes—using either real-world astronomical units or custom game numbers.
 - **Visual follower nodes** (`JrOrbiter2D` and `JrOrbiter3D`) read that simulation, scale the distances down into comfortable Godot scene coordinates, and move your meshes, sprites, cameras, or map icons.
 
+![JR Orrery 3D Planetary System, Submoons, and Live Trajectory Forecasts](docs/images/demo_3d_planetary_system.png)
+
 ---
 
 ## Simulation Scale vs. Gameplay Scale
@@ -41,6 +43,11 @@ From the included `demo_real_scale_leo.tscn` scenario (`distance_unit = KILOMETE
 | **LEO Satellite** | `6,778 km` from Earth center | `6.78` units from Earth | `101.7 px` from Earth |
 | **Moon** | `363,300 km` from Earth | `363.3` units from Earth | `5,449.5 px` from Earth |
 | **Sun** | `147,098,074 km` away | `147,098` units away | `2,206,471 px` away |
+
+![Real-Scale LEO Editor Scene Tree and JrOrbitDriver Configuration](docs/images/editor_real_scale_configuration.png)
+*Godot Editor view of `demo_real_scale_leo.tscn`: `JrOrbitDriver` runs in **Kilometers**, **Seconds**, and **Solar Masses** with `Perspective` locked to `Earth`, while `View3D` (`JrOrbiter3D`, `position_scale = 0.001`) renders Earth, the 400 km LEO satellite, and the low-thrust ion spiral right at `(0, 0, 0)`.*
+
+![Real-Scale LEO and Low-Thrust Ion Spiral at Runtime](docs/images/demo_real_scale_leo.png)
 
 ---
 
@@ -184,6 +191,12 @@ driver.end_batch_updates();
 
 When simulation playback is paused in the editor, selecting an orbiter (or its 2D/3D visual node) displays interactive handles:
 
+![3D Keplerian Orbit & Axial Tilt Gizmos, Scene Tree, and JrRailOrbiter Inspector](docs/images/editor_3d_keplerian_gizmos.png)
+*Editing `PlanetBeta` (`JrRailOrbiter`): interactive 3D conic, inclination, ascending-node, and axial-tilt handles in the viewport alongside nested moons/submoons in the Scene Tree and orbital elements in the Inspector.*
+
+![3D Ballistic State-Vector Gizmos and JrBallisticOrbiter Inspector](docs/images/editor_ballistic_inspector_gizmos.png)
+*Editing `BinaryCruiserProbe` (`JrBallisticOrbiter`) in `STATE_VECTORS` mode: 3D position, velocity arrow, and elevation handles with live trajectory preview around a coupled binary star system.*
+
 | Handle | Color | Viewport | What It Adjusts |
 | :--- | :--- | :--- | :--- |
 | **Periapsis** | Orange | 2D & 3D | Closest approach distance and orbit rotation (`argument_of_periapsis`). Hold `Ctrl` to lock `eccentricity`; hold `Alt` to lock rotation. |
@@ -207,6 +220,14 @@ Open and run `res://addons/jr_orrery/demo/demo.tscn` to explore five interactive
 3. **Planet–Moon Lagrange Points (Stable L4 & L5)** (`demo_lagrange_points.tscn`) — Co-rotating Planet–Moon view (`SYNODIC_ORBITAL`) showing probes orbiting around the leading (`+60°`) and trailing (`-60°`) Trojan Lagrange points.
 4. **Binary Stars & Circumbinary Planet** (`demo_binary_stars.tscn`) — Two stars coupled via `binary_partner` around a shared barycenter, orbited by a circumbinary planet and a free-flying ballistic probe.
 5. **GPU Asteroid Swarm (256 Ballistic Bodies)** (`demo_asteroid_swarm.tscn`) — 256 GPU-stepped asteroids orbiting a star while being gravitationally perturbed by a passing gas giant.
+
+| 2D Synodic Frame — Stable L4 & L5 Trojan Orbits | 3D Coupled Binary Stars & Circumbinary Probe |
+| :---: | :---: |
+| ![2D Lagrange Points Synodic View](docs/images/demo_2d_lagrange_synodic.png) | ![3D Binary Stars and Circumbinary Planet](docs/images/demo_binary_stars.png) |
+
+| 256-Body GPU Compute Asteroid Swarm |
+| :---: |
+| ![256-Body GPU Asteroid Swarm](docs/images/demo_asteroid_swarm.png) |
 
 ### Demo Controls
 - **Switch 2D / 3D View**: Click **Switch View** in the HUD or press `Tab` / `V`.
