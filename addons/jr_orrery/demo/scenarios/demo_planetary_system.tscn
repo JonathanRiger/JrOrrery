@@ -1,0 +1,807 @@
+[gd_scene format=3 uid="uid://c6m4x8p1rak2a"]
+
+[ext_resource type="Script" uid="uid://djosw6ac6d8tc" path="res://addons/jr_orrery/jr_orbit_driver.gd" id="2_driver"]
+[ext_resource type="Script" uid="uid://ch5eml314pv8i" path="res://addons/jr_orrery/jr_rail_orbiter.gd" id="3_orbiter"]
+[ext_resource type="Script" uid="uid://ba457um4mr2ae" path="res://addons/jr_orrery/jr_orbiter_2d.gd" id="4_orb2d"]
+[ext_resource type="Script" uid="uid://bcsy7wpn5t14l" path="res://addons/jr_orrery/jr_orbiter_3d.gd" id="5_orb3d"]
+[ext_resource type="Texture2D" uid="uid://d041g8ak7c8qr" path="res://icon.svg" id="6_icon"]
+[ext_resource type="Script" uid="uid://b0xjkb55cwm3c" path="res://addons/jr_orrery/jr_ballistic_orbiter.gd" id="7_ballistic"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_nrioe"]
+albedo_color = Color(1, 0.85, 0.25, 1)
+emission_enabled = true
+emission = Color(1, 0.78, 0.2, 1)
+emission_energy_multiplier = 2.2
+
+[sub_resource type="SphereMesh" id="SphereMesh_ksnm6"]
+radius = 2.2
+height = 4.4
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_wsy14"]
+albedo_color = Color(0.95, 0.55, 0.35, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_s6agx"]
+radius = 0.7
+height = 1.4
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_ohln0"]
+shading_mode = 0
+albedo_color = Color(0.9675, 0.7075, 0.5775, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_7jixs"]
+top_radius = 0.042
+bottom_radius = 0.042
+height = 2.1
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_rldoc"]
+albedo_color = Color(0.35, 0.75, 1, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_fdn43"]
+radius = 0.95
+height = 1.9
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_o8a64"]
+shading_mode = 0
+albedo_color = Color(0.5775, 0.8375, 1, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_6u28l"]
+top_radius = 0.057
+bottom_radius = 0.057
+height = 2.85
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_qa5vk"]
+albedo_color = Color(0.75, 0.85, 0.95, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_urjns"]
+radius = 0.35
+height = 0.7
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_vy5nf"]
+shading_mode = 0
+albedo_color = Color(0.8375, 0.9025, 0.9675, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_aha1r"]
+top_radius = 0.025
+bottom_radius = 0.025
+height = 1.05
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_tfqp4"]
+albedo_color = Color(0.95, 0.75, 0.4, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_2ioss"]
+radius = 1.35
+height = 2.7
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_tw07s"]
+shading_mode = 0
+albedo_color = Color(0.9675, 0.8375, 0.61, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_22uy1"]
+top_radius = 0.081
+bottom_radius = 0.081
+height = 4.05
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_j8rml"]
+albedo_color = Color(1, 0.9, 0.4, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_h4p5p"]
+radius = 0.32
+height = 0.64
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_200o8"]
+shading_mode = 0
+albedo_color = Color(1, 0.935, 0.61, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_rn17c"]
+top_radius = 0.025
+bottom_radius = 0.025
+height = 0.96
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_bhr4x"]
+albedo_color = Color(0.5, 0.95, 0.7, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_6m52m"]
+radius = 0.48
+height = 0.96
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_a1vf5"]
+shading_mode = 0
+albedo_color = Color(0.675, 0.9675, 0.805, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_2ykml"]
+top_radius = 0.0288
+bottom_radius = 0.0288
+height = 1.44
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_f8mvp"]
+albedo_color = Color(0.85, 1, 0.92, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_6ywrt"]
+radius = 0.22
+height = 0.44
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_x1e1m"]
+shading_mode = 0
+albedo_color = Color(0.9025, 1, 0.948, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_5rt3r"]
+top_radius = 0.025
+bottom_radius = 0.025
+height = 0.66
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_utv18"]
+albedo_color = Color(0.8, 0.7, 0.95, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_7yo4j"]
+radius = 0.4
+height = 0.8
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_0o535"]
+shading_mode = 0
+albedo_color = Color(0.87, 0.805, 0.9675, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_nipyv"]
+top_radius = 0.025
+bottom_radius = 0.025
+height = 1.2
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_2h1ag"]
+albedo_color = Color(0.45, 0.6, 1, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_jcvxl"]
+radius = 1.15
+height = 2.3
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_0fne6"]
+shading_mode = 0
+albedo_color = Color(0.6425, 0.74, 1, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_g1gj7"]
+top_radius = 0.069
+bottom_radius = 0.069
+height = 3.45
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_kt1ot"]
+albedo_color = Color(0.65, 0.85, 1, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_jwumy"]
+radius = 0.38
+height = 0.76
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_stdyj"]
+shading_mode = 0
+albedo_color = Color(0.7725, 0.9025, 1, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_rc21u"]
+top_radius = 0.025
+bottom_radius = 0.025
+height = 1.14
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_4dlxp"]
+albedo_color = Color(0.6, 0.75, 0.95, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_qphph"]
+radius = 0.32
+height = 0.64
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_lp430"]
+shading_mode = 0
+albedo_color = Color(0.74, 0.8375, 0.9675, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_bkvjj"]
+top_radius = 0.025
+bottom_radius = 0.025
+height = 0.96
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_probe_solar"]
+albedo_color = Color(0.2, 0.95, 1, 1)
+emission_enabled = true
+emission = Color(0.15, 0.85, 1, 1)
+emission_energy_multiplier = 1.4
+
+[sub_resource type="SphereMesh" id="SphereMesh_probe_solar"]
+radius = 0.42
+height = 0.84
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_probe_solar_axis"]
+shading_mode = 0
+albedo_color = Color(0.65, 0.98, 1, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_probe_solar_axis"]
+top_radius = 0.035
+bottom_radius = 0.035
+height = 1.45
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_probe_gamma"]
+albedo_color = Color(1, 0.38, 0.78, 1)
+emission_enabled = true
+emission = Color(1, 0.28, 0.72, 1)
+emission_energy_multiplier = 1.4
+
+[sub_resource type="SphereMesh" id="SphereMesh_probe_gamma"]
+radius = 0.28
+height = 0.56
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_probe_gamma_axis"]
+shading_mode = 0
+albedo_color = Color(1, 0.68, 0.88, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_probe_gamma_axis"]
+top_radius = 0.025
+bottom_radius = 0.025
+height = 0.95
+
+[node name="ScenarioPlanetarySystem" type="Node"]
+
+[node name="JrOrbitDriver" type="Node" parent="."]
+script = ExtResource("2_driver")
+mass = 541.4
+ballistic_substeps = 4
+
+[node name="PlanetAlpha" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.1176470588235294
+periapsis = 7.5
+apoapsis = 9.5
+inclination = 0.06981317007977328
+longitude_of_the_ascending_node = 0.2617993877991496
+mean_motion = 0.45
+orbital_period = 13.962634015954636
+mass = 4.5
+axial_tilt = 0.12217304763960302
+rotational_motion = 0.7853981633974483
+sidereal_period = 8.0
+
+[node name="PlanetBeta" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.08823529411764706
+periapsis = 15.5
+apoapsis = 18.5
+inclination = -0.11344640137963147
+longitude_of_the_ascending_node = -0.6981317007977319
+argument_of_periapsis = 1.0471975511965974
+mean_motion = 0.24
+orbital_period = 26.179938779914945
+mass = 12.0
+axial_tilt = 0.408407044966673
+axial_tilt_longitude = 0.5235987755982987
+rotational_motion = 1.2566370614359172
+sidereal_period = 5.0
+
+[node name="BetaMoon" type="Node" parent="JrOrbitDriver/PlanetBeta"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.11111111111111116
+periapsis = 2.8
+apoapsis = 3.5
+inclination = 0.2094395102393194
+longitude_of_the_ascending_node = 0.43633231299858233
+argument_of_periapsis = -1.5707963267948966
+mean_motion = 1.2
+orbital_period = 5.235987755982989
+mass = 0.6
+axial_tilt = 0.11693705988361991
+rotational_motion = 1.1999971938845655
+sidereal_period = 5.236000000000001
+
+[node name="PlanetGamma" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.07462686567164178
+periapsis = 31.0
+apoapsis = 36.0
+inclination = 0.1919862177193763
+longitude_of_the_ascending_node = 1.3089969389957472
+argument_of_periapsis = -2.094395102393195
+mean_motion = 0.12
+orbital_period = 52.35987755982989
+mass = 36.0
+axial_tilt = 0.46600291028248586
+axial_tilt_longitude = -0.34906585039886595
+rotational_motion = 1.9634954084936207
+sidereal_period = 3.2
+
+[node name="GammaMoonIo" type="Node" parent="JrOrbitDriver/PlanetGamma"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.06249999999999998
+periapsis = 3.0
+apoapsis = 3.4000000000000004
+inclination = 0.03490658503988664
+mean_motion = 1.6
+orbital_period = 3.9269908169872414
+mass = 0.5
+rotational_motion = 1.6110731556870734
+sidereal_period = 3.9
+
+[node name="GammaMoonRhea" type="Node" parent="JrOrbitDriver/PlanetGamma"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.07462686567164178
+periapsis = 6.2
+apoapsis = 7.2
+inclination = -0.13962634015954656
+longitude_of_the_ascending_node = 0.7853981633974483
+argument_of_periapsis = 1.5707963267948966
+mean_motion = 0.65
+orbital_period = 9.66643893412244
+mass = 0.9
+axial_tilt = 0.2617993877991496
+rotational_motion = 1.0471975511965976
+sidereal_period = 6.0
+
+[node name="RheaSubmoon" type="Node" parent="JrOrbitDriver/PlanetGamma/GammaMoonRhea"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.08571428571428566
+periapsis = 1.6
+apoapsis = 1.9
+inclination = 0.3839724354387526
+longitude_of_the_ascending_node = 0.17453292519943275
+mean_motion = 2.4
+orbital_period = 2.6179938779914944
+mass = 0.15
+axial_tilt = 0.17453292519943275
+rotational_motion = 2.41660973353061
+sidereal_period = 2.6
+
+[node name="GammaMoonCallisto" type="Node" parent="JrOrbitDriver/PlanetGamma"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.05990783410138252
+periapsis = 10.2
+apoapsis = 11.5
+inclination = 2.827433388230814
+longitude_of_the_ascending_node = -0.5235987755982987
+argument_of_periapsis = 3.141592653589793
+mean_motion = 0.35
+orbital_period = 17.951958020513104
+mass = 0.7
+axial_tilt = 2.9670597283903604
+rotational_motion = 0.6981317007977318
+sidereal_period = 9.0
+
+[node name="GammaSatellite" type="Node" parent="JrOrbitDriver/PlanetGamma"]
+script = ExtResource("7_ballistic")
+initial_position = Vector3(0, 3.2, -3.2)
+initial_velocity = Vector3(2.82, 0.35, 0.35)
+manual_rotation = Vector3(0.45, -0.35, 0)
+preview_duration = 16.0
+preview_steps = 192
+
+[node name="PlanetDelta" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.08771929824561403
+periapsis = 52.0
+apoapsis = 62.0
+inclination = -2.7052603405912112
+longitude_of_the_ascending_node = 1.9198621771937625
+argument_of_periapsis = 2.6179938779914944
+mean_motion = 0.07
+orbital_period = 89.7597901025655
+mass = 22.0
+axial_tilt = 1.7069320084504542
+axial_tilt_longitude = 0.7853981633974483
+rotational_motion = 1.3962634015954636
+sidereal_period = 4.5
+
+[node name="DeltaMoonTriton" type="Node" parent="JrOrbitDriver/PlanetDelta"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.07692307692307693
+periapsis = 3.6
+apoapsis = 4.199999999999999
+inclination = -2.5307274153917785
+longitude_of_the_ascending_node = 0.34906585039886595
+argument_of_periapsis = -0.7853981633974483
+mean_motion = 0.95
+orbital_period = 6.613879270715354
+mass = 0.6
+axial_tilt = 0.2617993877991496
+rotational_motion = 0.9519977738150888
+sidereal_period = 6.6000000000000005
+
+[node name="DeltaMoonNereid" type="Node" parent="JrOrbitDriver/PlanetDelta"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.1807228915662651
+periapsis = 6.8
+apoapsis = 9.8
+inclination = 0.48869219055841207
+longitude_of_the_ascending_node = -1.0471975511965974
+argument_of_periapsis = 2.356194490192345
+mean_motion = 0.42
+orbital_period = 14.959965017094254
+mass = 0.4
+axial_tilt = 0.6108652381980155
+rotational_motion = 0.8377580409572781
+sidereal_period = 7.5
+
+[node name="SolarProbe" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("7_ballistic")
+initial_position = Vector3(0, 2.2, -12)
+initial_velocity = Vector3(7.8, 0.4, 0)
+manual_rotation = Vector3(0.35, 0.6, 0)
+preview_duration = 24.0
+preview_steps = 240
+
+[node name="View3D" type="Node3D" parent="."]
+
+[node name="CameraPivot" type="Node3D" parent="View3D"]
+transform = Transform3D(0.9393727, -0.1792283, 0.29232877, 0, 0.8525245, 0.52268726, -0.3428978, -0.49099815, 0.8008383, 0, 0, 0)
+
+[node name="Camera3D" type="Camera3D" parent="View3D/CameraPivot"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 68)
+current = true
+far = 2000.0
+
+[node name="CentralStar" type="Node3D" parent="View3D" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../JrOrbitDriver")
+
+[node name="StarMesh" type="MeshInstance3D" parent="View3D/CentralStar"]
+material_override = SubResource("StandardMaterial3D_nrioe")
+mesh = SubResource("SphereMesh_ksnm6")
+
+[node name="StarOmniLight" type="OmniLight3D" parent="View3D/CentralStar"]
+light_color = Color(1, 0.95, 0.82, 1)
+light_energy = 3.5
+omni_range = 250.0
+omni_attenuation = 0.6
+
+[node name="PlanetAlpha" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/PlanetAlpha")
+editor_orbit_color = Color(0.95, 0.55, 0.35, 0.85)
+editor_ghost_radius = 0.455
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetAlpha"]
+material_override = SubResource("StandardMaterial3D_wsy14")
+mesh = SubResource("SphereMesh_s6agx")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetAlpha"]
+material_override = SubResource("StandardMaterial3D_ohln0")
+mesh = SubResource("CylinderMesh_7jixs")
+
+[node name="PlanetBeta" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/PlanetBeta")
+editor_orbit_color = Color(0.35, 0.75, 1, 0.85)
+editor_ghost_radius = 0.6175
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetBeta"]
+material_override = SubResource("StandardMaterial3D_rldoc")
+mesh = SubResource("SphereMesh_fdn43")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetBeta"]
+material_override = SubResource("StandardMaterial3D_o8a64")
+mesh = SubResource("CylinderMesh_6u28l")
+
+[node name="BetaMoon" type="Node3D" parent="View3D/CentralStar/PlanetBeta" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetBeta/BetaMoon")
+editor_orbit_color = Color(0.75, 0.85, 0.95, 0.75)
+editor_ghost_radius = 0.2275
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetBeta/BetaMoon"]
+material_override = SubResource("StandardMaterial3D_qa5vk")
+mesh = SubResource("SphereMesh_urjns")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetBeta/BetaMoon"]
+material_override = SubResource("StandardMaterial3D_vy5nf")
+mesh = SubResource("CylinderMesh_aha1r")
+
+[node name="PlanetGamma" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/PlanetGamma")
+editor_orbit_color = Color(0.95, 0.75, 0.4, 0.85)
+editor_ghost_radius = 0.8775
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma"]
+material_override = SubResource("StandardMaterial3D_tfqp4")
+mesh = SubResource("SphereMesh_2ioss")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma"]
+material_override = SubResource("StandardMaterial3D_tw07s")
+mesh = SubResource("CylinderMesh_22uy1")
+
+[node name="GammaMoonIo" type="Node3D" parent="View3D/CentralStar/PlanetGamma" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetGamma/GammaMoonIo")
+editor_orbit_color = Color(1, 0.9, 0.4, 0.75)
+editor_ghost_radius = 0.208
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma/GammaMoonIo"]
+material_override = SubResource("StandardMaterial3D_j8rml")
+mesh = SubResource("SphereMesh_h4p5p")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma/GammaMoonIo"]
+material_override = SubResource("StandardMaterial3D_200o8")
+mesh = SubResource("CylinderMesh_rn17c")
+
+[node name="GammaMoonRhea" type="Node3D" parent="View3D/CentralStar/PlanetGamma" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetGamma/GammaMoonRhea")
+editor_orbit_color = Color(0.5, 0.95, 0.7, 0.8)
+editor_ghost_radius = 0.312
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma/GammaMoonRhea"]
+material_override = SubResource("StandardMaterial3D_bhr4x")
+mesh = SubResource("SphereMesh_6m52m")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma/GammaMoonRhea"]
+material_override = SubResource("StandardMaterial3D_a1vf5")
+mesh = SubResource("CylinderMesh_2ykml")
+
+[node name="RheaSubmoon" type="Node3D" parent="View3D/CentralStar/PlanetGamma/GammaMoonRhea" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../../../JrOrbitDriver/PlanetGamma/GammaMoonRhea/RheaSubmoon")
+editor_orbit_color = Color(0.85, 1, 0.92, 0.75)
+editor_ghost_radius = 0.2
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma/GammaMoonRhea/RheaSubmoon"]
+material_override = SubResource("StandardMaterial3D_f8mvp")
+mesh = SubResource("SphereMesh_6ywrt")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma/GammaMoonRhea/RheaSubmoon"]
+material_override = SubResource("StandardMaterial3D_x1e1m")
+mesh = SubResource("CylinderMesh_5rt3r")
+
+[node name="GammaMoonCallisto" type="Node3D" parent="View3D/CentralStar/PlanetGamma" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetGamma/GammaMoonCallisto")
+editor_orbit_color = Color(0.8, 0.7, 0.95, 0.75)
+editor_ghost_radius = 0.26
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma/GammaMoonCallisto"]
+material_override = SubResource("StandardMaterial3D_utv18")
+mesh = SubResource("SphereMesh_7yo4j")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma/GammaMoonCallisto"]
+material_override = SubResource("StandardMaterial3D_0o535")
+mesh = SubResource("CylinderMesh_nipyv")
+
+[node name="GammaSatellite" type="Node3D" parent="View3D/CentralStar/PlanetGamma" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetGamma/GammaSatellite")
+editor_orbit_color = Color(1, 0.38, 0.78, 0.9)
+editor_ghost_radius = 0.22
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma/GammaSatellite"]
+material_override = SubResource("StandardMaterial3D_probe_gamma")
+mesh = SubResource("SphereMesh_probe_gamma")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetGamma/GammaSatellite"]
+material_override = SubResource("StandardMaterial3D_probe_gamma_axis")
+mesh = SubResource("CylinderMesh_probe_gamma_axis")
+
+[node name="PlanetDelta" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/PlanetDelta")
+editor_orbit_color = Color(0.45, 0.6, 1, 0.85)
+editor_ghost_radius = 0.7475
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetDelta"]
+material_override = SubResource("StandardMaterial3D_2h1ag")
+mesh = SubResource("SphereMesh_jcvxl")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetDelta"]
+material_override = SubResource("StandardMaterial3D_0fne6")
+mesh = SubResource("CylinderMesh_g1gj7")
+
+[node name="DeltaMoonTriton" type="Node3D" parent="View3D/CentralStar/PlanetDelta" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetDelta/DeltaMoonTriton")
+editor_orbit_color = Color(0.65, 0.85, 1, 0.75)
+editor_ghost_radius = 0.247
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetDelta/DeltaMoonTriton"]
+material_override = SubResource("StandardMaterial3D_kt1ot")
+mesh = SubResource("SphereMesh_jwumy")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetDelta/DeltaMoonTriton"]
+material_override = SubResource("StandardMaterial3D_stdyj")
+mesh = SubResource("CylinderMesh_rc21u")
+
+[node name="DeltaMoonNereid" type="Node3D" parent="View3D/CentralStar/PlanetDelta" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetDelta/DeltaMoonNereid")
+editor_orbit_color = Color(0.6, 0.75, 0.95, 0.75)
+editor_ghost_radius = 0.208
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/PlanetDelta/DeltaMoonNereid"]
+material_override = SubResource("StandardMaterial3D_4dlxp")
+mesh = SubResource("SphereMesh_qphph")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/PlanetDelta/DeltaMoonNereid"]
+material_override = SubResource("StandardMaterial3D_lp430")
+mesh = SubResource("CylinderMesh_bkvjj")
+
+[node name="SolarProbe" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/SolarProbe")
+editor_orbit_color = Color(0.2, 0.95, 1, 0.9)
+editor_ghost_radius = 0.3
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/SolarProbe"]
+material_override = SubResource("StandardMaterial3D_probe_solar")
+mesh = SubResource("SphereMesh_probe_solar")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/CentralStar/SolarProbe"]
+material_override = SubResource("StandardMaterial3D_probe_solar_axis")
+mesh = SubResource("CylinderMesh_probe_solar_axis")
+
+[node name="View2D" type="Node2D" parent="."]
+
+[node name="Camera2D" type="Camera2D" parent="View2D"]
+position = Vector2(576, 324)
+enabled = false
+zoom = Vector2(0.55, 0.55)
+
+[node name="CentralStar" type="Node2D" parent="View2D" node_paths=PackedStringArray("orbiter")]
+position = Vector2(576, 324)
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../JrOrbitDriver")
+position_scale = 15.0
+
+[node name="StarSprite" type="Sprite2D" parent="View2D/CentralStar"]
+modulate = Color(1, 0.85, 0.25, 1)
+scale = Vector2(0.42, 0.42)
+texture = ExtResource("6_icon")
+
+[node name="PlanetAlpha" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/PlanetAlpha")
+position_scale = 15.0
+editor_orbit_color = Color(0.95, 0.55, 0.35, 0.85)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetAlpha"]
+modulate = Color(0.95, 0.55, 0.35, 1)
+scale = Vector2(0.2, 0.2)
+texture = ExtResource("6_icon")
+
+[node name="PlanetBeta" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/PlanetBeta")
+position_scale = 15.0
+editor_orbit_color = Color(0.35, 0.75, 1, 0.85)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetBeta"]
+modulate = Color(0.35, 0.75, 1, 1)
+scale = Vector2(0.26, 0.26)
+texture = ExtResource("6_icon")
+
+[node name="BetaMoon" type="Node2D" parent="View2D/CentralStar/PlanetBeta" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetBeta/BetaMoon")
+position_scale = 15.0
+editor_orbit_color = Color(0.75, 0.85, 0.95, 0.75)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetBeta/BetaMoon"]
+modulate = Color(0.8, 0.85, 0.9, 1)
+scale = Vector2(0.11, 0.11)
+texture = ExtResource("6_icon")
+
+[node name="PlanetGamma" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/PlanetGamma")
+position_scale = 15.0
+editor_orbit_color = Color(0.95, 0.75, 0.4, 0.85)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetGamma"]
+modulate = Color(0.95, 0.75, 0.4, 1)
+scale = Vector2(0.34, 0.34)
+texture = ExtResource("6_icon")
+
+[node name="GammaMoonIo" type="Node2D" parent="View2D/CentralStar/PlanetGamma" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetGamma/GammaMoonIo")
+position_scale = 15.0
+editor_orbit_color = Color(1, 0.9, 0.4, 0.75)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetGamma/GammaMoonIo"]
+modulate = Color(1, 0.9, 0.4, 1)
+scale = Vector2(0.1, 0.1)
+texture = ExtResource("6_icon")
+
+[node name="GammaMoonRhea" type="Node2D" parent="View2D/CentralStar/PlanetGamma" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetGamma/GammaMoonRhea")
+position_scale = 15.0
+editor_orbit_color = Color(0.5, 0.95, 0.7, 0.8)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetGamma/GammaMoonRhea"]
+modulate = Color(0.5, 0.95, 0.7, 1)
+scale = Vector2(0.15, 0.15)
+texture = ExtResource("6_icon")
+
+[node name="RheaSubmoon" type="Node2D" parent="View2D/CentralStar/PlanetGamma/GammaMoonRhea" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../../../JrOrbitDriver/PlanetGamma/GammaMoonRhea/RheaSubmoon")
+position_scale = 15.0
+editor_orbit_color = Color(0.85, 1, 0.92, 0.75)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetGamma/GammaMoonRhea/RheaSubmoon"]
+modulate = Color(0.9, 1, 0.95, 1)
+scale = Vector2(0.075, 0.075)
+texture = ExtResource("6_icon")
+
+[node name="GammaMoonCallisto" type="Node2D" parent="View2D/CentralStar/PlanetGamma" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetGamma/GammaMoonCallisto")
+position_scale = 15.0
+editor_orbit_color = Color(0.8, 0.7, 0.95, 0.75)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetGamma/GammaMoonCallisto"]
+modulate = Color(0.8, 0.7, 0.95, 1)
+scale = Vector2(0.12, 0.12)
+texture = ExtResource("6_icon")
+
+[node name="GammaSatellite" type="Node2D" parent="View2D/CentralStar/PlanetGamma" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetGamma/GammaSatellite")
+position_scale = 15.0
+editor_orbit_color = Color(1, 0.38, 0.78, 0.9)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetGamma/GammaSatellite"]
+modulate = Color(1, 0.38, 0.78, 1)
+scale = Vector2(0.11, 0.11)
+texture = ExtResource("6_icon")
+
+[node name="PlanetDelta" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/PlanetDelta")
+position_scale = 15.0
+editor_orbit_color = Color(0.45, 0.6, 1, 0.85)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetDelta"]
+modulate = Color(0.45, 0.6, 1, 1)
+scale = Vector2(0.3, 0.3)
+texture = ExtResource("6_icon")
+
+[node name="DeltaMoonTriton" type="Node2D" parent="View2D/CentralStar/PlanetDelta" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetDelta/DeltaMoonTriton")
+position_scale = 15.0
+editor_orbit_color = Color(0.65, 0.85, 1, 0.75)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetDelta/DeltaMoonTriton"]
+modulate = Color(0.7, 0.85, 1, 1)
+scale = Vector2(0.12, 0.12)
+texture = ExtResource("6_icon")
+
+[node name="DeltaMoonNereid" type="Node2D" parent="View2D/CentralStar/PlanetDelta" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../../JrOrbitDriver/PlanetDelta/DeltaMoonNereid")
+position_scale = 15.0
+editor_orbit_color = Color(0.6, 0.75, 0.95, 0.75)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/PlanetDelta/DeltaMoonNereid"]
+modulate = Color(0.65, 0.75, 0.9, 1)
+scale = Vector2(0.1, 0.1)
+texture = ExtResource("6_icon")
+
+[node name="SolarProbe" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/SolarProbe")
+position_scale = 15.0
+editor_orbit_color = Color(0.2, 0.95, 1, 0.9)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/SolarProbe"]
+modulate = Color(0.2, 0.95, 1, 1)
+scale = Vector2(0.16, 0.16)
+texture = ExtResource("6_icon")

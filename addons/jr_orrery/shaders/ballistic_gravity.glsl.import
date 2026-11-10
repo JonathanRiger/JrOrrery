@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cw77js31kkmfq"
+path="res://.godot/imported/ballistic_gravity.glsl-ef4c9b53e341fc1528044a9582a43906.res"
+
+[deps]
+
+source_file="res://addons/jr_orrery/shaders/ballistic_gravity.glsl"
+dest_files=["res://.godot/imported/ballistic_gravity.glsl-ef4c9b53e341fc1528044a9582a43906.res"]
+
+[params]
+

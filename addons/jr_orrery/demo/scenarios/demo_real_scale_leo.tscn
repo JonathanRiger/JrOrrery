@@ -1,0 +1,267 @@
+[gd_scene format=3 uid="uid://ed7e2nx2tuij"]
+
+[ext_resource type="Script" uid="uid://djosw6ac6d8tc" path="res://addons/jr_orrery/jr_orbit_driver.gd" id="2_driver"]
+[ext_resource type="Script" uid="uid://ch5eml314pv8i" path="res://addons/jr_orrery/jr_rail_orbiter.gd" id="3_orbiter"]
+[ext_resource type="Script" uid="uid://ba457um4mr2ae" path="res://addons/jr_orrery/jr_orbiter_2d.gd" id="4_orb2d"]
+[ext_resource type="Script" uid="uid://bcsy7wpn5t14l" path="res://addons/jr_orrery/jr_orbiter_3d.gd" id="5_orb3d"]
+[ext_resource type="Texture2D" uid="uid://d041g8ak7c8qr" path="res://icon.svg" id="6_icon"]
+[ext_resource type="Script" uid="uid://b0xjkb55cwm3c" path="res://addons/jr_orrery/jr_ballistic_orbiter.gd" id="7_ballistic"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_sun"]
+albedo_color = Color(1, 0.85, 0.25, 1)
+emission_enabled = true
+emission = Color(1, 0.78, 0.2, 1)
+emission_energy_multiplier = 2.4
+
+[sub_resource type="SphereMesh" id="SphereMesh_sun"]
+radius = 4.0
+height = 8.0
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_earth"]
+albedo_color = Color(0.25, 0.65, 1, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.55
+
+[sub_resource type="SphereMesh" id="SphereMesh_earth"]
+radius = 4.2
+height = 8.4
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_earth_axis"]
+shading_mode = 0
+albedo_color = Color(0.55, 0.82, 1, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_earth_axis"]
+top_radius = 0.08
+bottom_radius = 0.08
+height = 11.5
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_moon"]
+albedo_color = Color(0.82, 0.85, 0.9, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.75
+
+[sub_resource type="SphereMesh" id="SphereMesh_moon"]
+radius = 1.4
+height = 2.8
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_leo"]
+albedo_color = Color(0.25, 1, 0.65, 1)
+emission_enabled = true
+emission = Color(0.18, 0.95, 0.58, 1)
+emission_energy_multiplier = 1.6
+
+[sub_resource type="SphereMesh" id="SphereMesh_leo"]
+radius = 0.36
+height = 0.72
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_spiral"]
+albedo_color = Color(1, 0.52, 0.2, 1)
+emission_enabled = true
+emission = Color(1, 0.45, 0.15, 1)
+emission_energy_multiplier = 1.7
+
+[sub_resource type="SphereMesh" id="SphereMesh_spiral"]
+radius = 0.38
+height = 0.76
+
+[node name="ScenarioRealScaleLEO" type="Node"]
+
+[node name="JrOrbitDriver" type="Node" parent="." node_paths=PackedStringArray("perspective_node")]
+script = ExtResource("2_driver")
+time_scale = 600.0
+distance_unit = 1
+time_unit = 0
+mass = 1.0
+mass_unit = 7
+ballistic_substeps = 8
+perspective_node = NodePath("Earth")
+perspective_rotation_mode = 0
+
+[node name="Earth" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.0167
+periapsis = 147098074.0
+sync_motion_to_gravity = true
+mass = 1.0
+mass_unit = 5
+axial_tilt = 0.4091
+rotational_motion = 7.292115e-05
+
+[node name="Moon" type="Node" parent="JrOrbitDriver/Earth"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.0549
+periapsis = 363300.0
+inclination = 0.0898
+sync_motion_to_gravity = true
+mass = 1.0
+mass_unit = 4
+rotational_motion = 2.6617e-06
+
+[node name="LEOSatellite" type="Node" parent="JrOrbitDriver/Earth"]
+script = ExtResource("7_ballistic")
+initial_state_mode = 1
+initial_eccentricity = 0.001
+initial_periapsis = 6778.137
+initial_inclination = 0.4887
+preview_duration = 5600.0
+preview_steps = 160
+
+[node name="IonSpiralProbe" type="Node" parent="JrOrbitDriver/Earth"]
+script = ExtResource("7_ballistic")
+initial_state_mode = 1
+initial_eccentricity = 0.001
+initial_periapsis = 7500.0
+initial_inclination = -0.1745
+initial_mean_anomaly_at_epoch = 1.5708
+thrust_frame = 2
+acceleration_unit = 1
+external_acceleration = Vector3(0, 0, -0.35)
+preview_duration = 28000.0
+preview_steps = 256
+
+[node name="View3D" type="Node3D" parent="."]
+
+[node name="CameraPivot" type="Node3D" parent="View3D"]
+transform = Transform3D(0.9393727, -0.1792283, 0.29232877, 0, 0.8525245, 0.52268726, -0.3428978, -0.49099815, 0.8008383, 0, 0, 0)
+
+[node name="Camera3D" type="Camera3D" parent="View3D/CameraPivot"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 32)
+current = true
+far = 4000.0
+
+[node name="CentralStar" type="Node3D" parent="View3D" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../JrOrbitDriver")
+position_scale = 0.001
+
+[node name="StarMesh" type="MeshInstance3D" parent="View3D/CentralStar"]
+material_override = SubResource("StandardMaterial3D_sun")
+mesh = SubResource("SphereMesh_sun")
+
+[node name="Earth" type="Node3D" parent="View3D" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../JrOrbitDriver/Earth")
+transform_mode = 1
+position_scale = 0.001
+draw_orbit_in_editor = false
+editor_orbit_color = Color(0.25, 0.65, 1, 0.85)
+editor_ghost_radius = 2.0
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/Earth"]
+material_override = SubResource("StandardMaterial3D_earth")
+mesh = SubResource("SphereMesh_earth")
+
+[node name="SpinAxisIndicator" type="MeshInstance3D" parent="View3D/Earth"]
+material_override = SubResource("StandardMaterial3D_earth_axis")
+mesh = SubResource("CylinderMesh_earth_axis")
+
+[node name="EarthLight" type="OmniLight3D" parent="View3D/Earth"]
+light_color = Color(0.75, 0.88, 1, 1)
+light_energy = 1.4
+omni_range = 80.0
+
+[node name="Moon" type="Node3D" parent="View3D" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../JrOrbitDriver/Earth/Moon")
+transform_mode = 1
+position_scale = 0.001
+editor_orbit_color = Color(0.82, 0.85, 0.92, 0.75)
+editor_ghost_radius = 1.1
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/Moon"]
+material_override = SubResource("StandardMaterial3D_moon")
+mesh = SubResource("SphereMesh_moon")
+
+[node name="LEOSatellite" type="Node3D" parent="View3D" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../JrOrbitDriver/Earth/LEOSatellite")
+transform_mode = 1
+position_scale = 0.001
+editor_orbit_color = Color(0.25, 1, 0.65, 0.92)
+editor_ghost_radius = 0.35
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/LEOSatellite"]
+material_override = SubResource("StandardMaterial3D_leo")
+mesh = SubResource("SphereMesh_leo")
+
+[node name="IonSpiralProbe" type="Node3D" parent="View3D" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../JrOrbitDriver/Earth/IonSpiralProbe")
+transform_mode = 1
+position_scale = 0.001
+editor_orbit_color = Color(1, 0.52, 0.2, 0.92)
+editor_ghost_radius = 0.35
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/IonSpiralProbe"]
+material_override = SubResource("StandardMaterial3D_spiral")
+mesh = SubResource("SphereMesh_spiral")
+
+[node name="View2D" type="Node2D" parent="."]
+
+[node name="Camera2D" type="Camera2D" parent="View2D"]
+position = Vector2(576, 324)
+enabled = false
+zoom = Vector2(1.15, 1.15)
+
+[node name="CentralStar" type="Node2D" parent="View2D" node_paths=PackedStringArray("orbiter")]
+position = Vector2(576, 324)
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../JrOrbitDriver")
+position_scale = 0.015
+
+[node name="StarSprite" type="Sprite2D" parent="View2D/CentralStar"]
+modulate = Color(1, 0.85, 0.25, 1)
+scale = Vector2(0.45, 0.45)
+texture = ExtResource("6_icon")
+
+[node name="SystemOrigin" type="Node2D" parent="View2D"]
+position = Vector2(576, 324)
+
+[node name="Earth" type="Node2D" parent="View2D/SystemOrigin" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/Earth")
+transform_mode = 1
+position_scale = 0.015
+draw_orbit_in_editor = false
+editor_orbit_color = Color(0.25, 0.65, 1, 0.85)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/SystemOrigin/Earth"]
+modulate = Color(0.25, 0.65, 1, 1)
+scale = Vector2(0.32, 0.32)
+texture = ExtResource("6_icon")
+
+[node name="Moon" type="Node2D" parent="View2D/SystemOrigin" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/Earth/Moon")
+transform_mode = 1
+position_scale = 0.015
+editor_orbit_color = Color(0.82, 0.85, 0.92, 0.75)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/SystemOrigin/Moon"]
+modulate = Color(0.82, 0.85, 0.92, 1)
+scale = Vector2(0.16, 0.16)
+texture = ExtResource("6_icon")
+
+[node name="LEOSatellite" type="Node2D" parent="View2D/SystemOrigin" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/Earth/LEOSatellite")
+transform_mode = 1
+position_scale = 0.015
+editor_orbit_color = Color(0.25, 1, 0.65, 0.92)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/SystemOrigin/LEOSatellite"]
+modulate = Color(0.25, 1, 0.65, 1)
+scale = Vector2(0.13, 0.13)
+texture = ExtResource("6_icon")
+
+[node name="IonSpiralProbe" type="Node2D" parent="View2D/SystemOrigin" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/Earth/IonSpiralProbe")
+transform_mode = 1
+position_scale = 0.015
+editor_orbit_color = Color(1, 0.52, 0.2, 0.92)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/SystemOrigin/IonSpiralProbe"]
+modulate = Color(1, 0.52, 0.2, 1)
+scale = Vector2(0.14, 0.14)
+texture = ExtResource("6_icon")

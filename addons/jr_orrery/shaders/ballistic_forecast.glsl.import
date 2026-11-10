@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bniifuywy0j4g"
+path="res://.godot/imported/ballistic_forecast.glsl-8f2d9f80df1cfae764c2cdc2266ec66d.res"
+
+[deps]
+
+source_file="res://addons/jr_orrery/shaders/ballistic_forecast.glsl"
+dest_files=["res://.godot/imported/ballistic_forecast.glsl-8f2d9f80df1cfae764c2cdc2266ec66d.res"]
+
+[params]
+

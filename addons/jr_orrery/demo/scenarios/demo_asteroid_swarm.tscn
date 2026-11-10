@@ -1,0 +1,299 @@
+[gd_scene format=3 uid="uid://be87y4stdwrgm"]
+
+[ext_resource type="Script" path="res://addons/jr_orrery/demo/scenarios/demo_swarm_spawner.gd" id="1_spawner"]
+[ext_resource type="Script" uid="uid://djosw6ac6d8tc" path="res://addons/jr_orrery/jr_orbit_driver.gd" id="2_driver"]
+[ext_resource type="Script" uid="uid://ch5eml314pv8i" path="res://addons/jr_orrery/jr_rail_orbiter.gd" id="3_orbiter"]
+[ext_resource type="Script" uid="uid://ba457um4mr2ae" path="res://addons/jr_orrery/jr_orbiter_2d.gd" id="4_orb2d"]
+[ext_resource type="Script" uid="uid://bcsy7wpn5t14l" path="res://addons/jr_orrery/jr_orbiter_3d.gd" id="5_orb3d"]
+[ext_resource type="Texture2D" uid="uid://d041g8ak7c8qr" path="res://icon.svg" id="6_icon"]
+[ext_resource type="Script" uid="uid://b0xjkb55cwm3c" path="res://addons/jr_orrery/jr_ballistic_orbiter.gd" id="7_ballistic"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_star"]
+albedo_color = Color(1, 0.85, 0.25, 1)
+emission_enabled = true
+emission = Color(1, 0.78, 0.2, 1)
+emission_energy_multiplier = 2.2
+
+[sub_resource type="SphereMesh" id="SphereMesh_star"]
+radius = 2.4
+height = 4.8
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_rocky"]
+albedo_color = Color(0.95, 0.55, 0.35, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.65
+
+[sub_resource type="SphereMesh" id="SphereMesh_rocky"]
+radius = 0.75
+height = 1.5
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_jupiter"]
+albedo_color = Color(0.95, 0.75, 0.4, 1)
+albedo_texture = ExtResource("6_icon")
+roughness = 0.6
+
+[sub_resource type="SphereMesh" id="SphereMesh_jupiter"]
+radius = 1.65
+height = 3.3
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_ceres"]
+albedo_color = Color(0.25, 0.95, 1, 1)
+emission_enabled = true
+emission = Color(0.2, 0.88, 1, 1)
+emission_energy_multiplier = 1.5
+
+[sub_resource type="SphereMesh" id="SphereMesh_featured"]
+radius = 0.38
+height = 0.76
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_vesta"]
+albedo_color = Color(0.35, 1, 0.55, 1)
+emission_enabled = true
+emission = Color(0.28, 0.92, 0.48, 1)
+emission_energy_multiplier = 1.5
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_pallas"]
+albedo_color = Color(1, 0.45, 0.82, 1)
+emission_enabled = true
+emission = Color(1, 0.35, 0.75, 1)
+emission_energy_multiplier = 1.5
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_hygiea"]
+albedo_color = Color(1, 0.82, 0.25, 1)
+emission_enabled = true
+emission = Color(1, 0.75, 0.2, 1)
+emission_energy_multiplier = 1.5
+
+[node name="ScenarioAsteroidSwarm" type="Node"]
+script = ExtResource("1_spawner")
+
+[node name="JrOrbitDriver" type="Node" parent="."]
+script = ExtResource("2_driver")
+mass = 800.0
+ballistic_substeps = 2
+
+[node name="InnerRockyPlanet" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.05
+periapsis = 11.0
+sync_motion_to_gravity = true
+mass = 3.0
+rotational_motion = 0.8
+
+[node name="JupiterPerturber" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("3_orbiter")
+eccentricity = 0.048
+periapsis = 38.0
+sync_motion_to_gravity = true
+mass = 45.0
+rotational_motion = 1.6
+
+[node name="AsteroidCeres" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("7_ballistic")
+initial_state_mode = 1
+initial_eccentricity = 0.076
+initial_periapsis = 20.5
+initial_inclination = 0.12
+preview_duration = 28.0
+preview_steps = 160
+
+[node name="AsteroidVesta" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("7_ballistic")
+initial_state_mode = 1
+initial_eccentricity = 0.089
+initial_periapsis = 18.2
+initial_inclination = -0.09
+initial_longitude_of_the_ascending_node = 1.5708
+initial_mean_anomaly_at_epoch = 1.2
+preview_duration = 28.0
+preview_steps = 160
+
+[node name="AsteroidPallas" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("7_ballistic")
+initial_state_mode = 1
+initial_eccentricity = 0.14
+initial_periapsis = 23.0
+initial_inclination = 0.28
+initial_longitude_of_the_ascending_node = -1.0472
+initial_mean_anomaly_at_epoch = 2.8
+preview_duration = 28.0
+preview_steps = 160
+
+[node name="AsteroidHygiea" type="Node" parent="JrOrbitDriver"]
+script = ExtResource("7_ballistic")
+initial_state_mode = 1
+initial_eccentricity = 0.11
+initial_periapsis = 26.2
+initial_inclination = -0.06
+initial_longitude_of_the_ascending_node = 2.618
+initial_mean_anomaly_at_epoch = -1.7
+preview_duration = 28.0
+preview_steps = 160
+
+[node name="View3D" type="Node3D" parent="."]
+
+[node name="CameraPivot" type="Node3D" parent="View3D"]
+transform = Transform3D(0.9393727, -0.1792283, 0.29232877, 0, 0.8525245, 0.52268726, -0.3428978, -0.49099815, 0.8008383, 0, 0, 0)
+
+[node name="Camera3D" type="Camera3D" parent="View3D/CameraPivot"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 66)
+current = true
+far = 2000.0
+
+[node name="CentralStar" type="Node3D" parent="View3D" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../JrOrbitDriver")
+
+[node name="StarMesh" type="MeshInstance3D" parent="View3D/CentralStar"]
+material_override = SubResource("StandardMaterial3D_star")
+mesh = SubResource("SphereMesh_star")
+
+[node name="StarOmniLight" type="OmniLight3D" parent="View3D/CentralStar"]
+light_color = Color(1, 0.95, 0.82, 1)
+light_energy = 3.5
+omni_range = 250.0
+omni_attenuation = 0.6
+
+[node name="InnerRockyPlanet" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/InnerRockyPlanet")
+editor_orbit_color = Color(0.95, 0.55, 0.35, 0.85)
+editor_ghost_radius = 0.5
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/InnerRockyPlanet"]
+material_override = SubResource("StandardMaterial3D_rocky")
+mesh = SubResource("SphereMesh_rocky")
+
+[node name="JupiterPerturber" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/JupiterPerturber")
+editor_orbit_color = Color(0.95, 0.75, 0.4, 0.85)
+editor_ghost_radius = 1.0
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/JupiterPerturber"]
+material_override = SubResource("StandardMaterial3D_jupiter")
+mesh = SubResource("SphereMesh_jupiter")
+
+[node name="AsteroidCeres" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/AsteroidCeres")
+editor_orbit_color = Color(0.25, 0.95, 1, 0.9)
+editor_ghost_radius = 0.3
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/AsteroidCeres"]
+material_override = SubResource("StandardMaterial3D_ceres")
+mesh = SubResource("SphereMesh_featured")
+
+[node name="AsteroidVesta" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/AsteroidVesta")
+editor_orbit_color = Color(0.35, 1, 0.55, 0.9)
+editor_ghost_radius = 0.3
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/AsteroidVesta"]
+material_override = SubResource("StandardMaterial3D_vesta")
+mesh = SubResource("SphereMesh_featured")
+
+[node name="AsteroidPallas" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/AsteroidPallas")
+editor_orbit_color = Color(1, 0.45, 0.82, 0.9)
+editor_ghost_radius = 0.3
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/AsteroidPallas"]
+material_override = SubResource("StandardMaterial3D_pallas")
+mesh = SubResource("SphereMesh_featured")
+
+[node name="AsteroidHygiea" type="Node3D" parent="View3D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("5_orb3d")
+orbiter = NodePath("../../../JrOrbitDriver/AsteroidHygiea")
+editor_orbit_color = Color(1, 0.82, 0.25, 0.9)
+editor_ghost_radius = 0.3
+
+[node name="BodyMesh" type="MeshInstance3D" parent="View3D/CentralStar/AsteroidHygiea"]
+material_override = SubResource("StandardMaterial3D_hygiea")
+mesh = SubResource("SphereMesh_featured")
+
+[node name="View2D" type="Node2D" parent="."]
+
+[node name="Camera2D" type="Camera2D" parent="View2D"]
+position = Vector2(576, 324)
+enabled = false
+zoom = Vector2(0.55, 0.55)
+
+[node name="CentralStar" type="Node2D" parent="View2D" node_paths=PackedStringArray("orbiter")]
+position = Vector2(576, 324)
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../JrOrbitDriver")
+position_scale = 13.0
+
+[node name="StarSprite" type="Sprite2D" parent="View2D/CentralStar"]
+modulate = Color(1, 0.85, 0.25, 1)
+scale = Vector2(0.42, 0.42)
+texture = ExtResource("6_icon")
+
+[node name="InnerRockyPlanet" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/InnerRockyPlanet")
+position_scale = 13.0
+editor_orbit_color = Color(0.95, 0.55, 0.35, 0.85)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/InnerRockyPlanet"]
+modulate = Color(0.95, 0.55, 0.35, 1)
+scale = Vector2(0.2, 0.2)
+texture = ExtResource("6_icon")
+
+[node name="JupiterPerturber" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/JupiterPerturber")
+position_scale = 13.0
+editor_orbit_color = Color(0.95, 0.75, 0.4, 0.85)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/JupiterPerturber"]
+modulate = Color(0.95, 0.75, 0.4, 1)
+scale = Vector2(0.35, 0.35)
+texture = ExtResource("6_icon")
+
+[node name="AsteroidCeres" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/AsteroidCeres")
+position_scale = 13.0
+editor_orbit_color = Color(0.25, 0.95, 1, 0.9)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/AsteroidCeres"]
+modulate = Color(0.25, 0.95, 1, 1)
+scale = Vector2(0.14, 0.14)
+texture = ExtResource("6_icon")
+
+[node name="AsteroidVesta" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/AsteroidVesta")
+position_scale = 13.0
+editor_orbit_color = Color(0.35, 1, 0.55, 0.9)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/AsteroidVesta"]
+modulate = Color(0.35, 1, 0.55, 1)
+scale = Vector2(0.14, 0.14)
+texture = ExtResource("6_icon")
+
+[node name="AsteroidPallas" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/AsteroidPallas")
+position_scale = 13.0
+editor_orbit_color = Color(1, 0.45, 0.82, 0.9)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/AsteroidPallas"]
+modulate = Color(1, 0.45, 0.82, 1)
+scale = Vector2(0.14, 0.14)
+texture = ExtResource("6_icon")
+
+[node name="AsteroidHygiea" type="Node2D" parent="View2D/CentralStar" node_paths=PackedStringArray("orbiter")]
+script = ExtResource("4_orb2d")
+orbiter = NodePath("../../../JrOrbitDriver/AsteroidHygiea")
+position_scale = 13.0
+editor_orbit_color = Color(1, 0.82, 0.25, 0.9)
+
+[node name="Sprite2D" type="Sprite2D" parent="View2D/CentralStar/AsteroidHygiea"]
+modulate = Color(1, 0.82, 0.25, 1)
+scale = Vector2(0.14, 0.14)
+texture = ExtResource("6_icon")

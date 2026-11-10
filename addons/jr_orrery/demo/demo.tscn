@@ -1,0 +1,288 @@
+[gd_scene format=3 uid="uid://bymftx4cb04no"]
+
+[ext_resource type="Script" uid="uid://b6n8w2x4q9k1p" path="res://addons/jr_orrery/demo/demo_controller.gd" id="1_ctrl"]
+[ext_resource type="PackedScene" path="res://addons/jr_orrery/demo/scenarios/demo_planetary_system.tscn" id="2_scen_planetary"]
+[ext_resource type="PackedScene" path="res://addons/jr_orrery/demo/scenarios/demo_real_scale_leo.tscn" id="3_scen_leo"]
+[ext_resource type="PackedScene" path="res://addons/jr_orrery/demo/scenarios/demo_lagrange_points.tscn" id="4_scen_lagrange"]
+[ext_resource type="PackedScene" path="res://addons/jr_orrery/demo/scenarios/demo_binary_stars.tscn" id="5_scen_binary"]
+[ext_resource type="PackedScene" path="res://addons/jr_orrery/demo/scenarios/demo_asteroid_swarm.tscn" id="6_scen_swarm"]
+
+[sub_resource type="Environment" id="Environment_cxue0"]
+background_mode = 1
+background_color = Color(0.03, 0.04, 0.07, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.28, 0.32, 0.42, 1)
+glow_enabled = true
+glow_intensity = 0.45
+glow_bloom = 0.15
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_kj7dk"]
+bg_color = Color(0.08, 0.1, 0.15, 0.88)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(0.35, 0.55, 0.85, 0.65)
+corner_radius_top_left = 8
+corner_radius_top_right = 8
+corner_radius_bottom_right = 8
+corner_radius_bottom_left = 8
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_btn_normal"]
+content_margin_left = 10.0
+content_margin_top = 6.0
+content_margin_right = 10.0
+content_margin_bottom = 6.0
+bg_color = Color(0.16, 0.24, 0.38, 0.95)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(0.45, 0.7, 1, 0.8)
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_btn_hover"]
+content_margin_left = 10.0
+content_margin_top = 6.0
+content_margin_right = 10.0
+content_margin_bottom = 6.0
+bg_color = Color(0.22, 0.34, 0.52, 0.98)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(0.6, 0.82, 1, 0.95)
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_btn_pressed"]
+content_margin_left = 10.0
+content_margin_top = 6.0
+content_margin_right = 10.0
+content_margin_bottom = 6.0
+bg_color = Color(0.12, 0.18, 0.3, 1)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(0.55, 0.78, 1, 1)
+corner_radius_top_left = 5
+corner_radius_top_right = 5
+corner_radius_bottom_right = 5
+corner_radius_bottom_left = 5
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_collapse_normal"]
+content_margin_left = 8.0
+content_margin_top = 3.0
+content_margin_right = 8.0
+content_margin_bottom = 3.0
+bg_color = Color(0.14, 0.2, 0.32, 0.92)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(0.42, 0.65, 0.95, 0.75)
+corner_radius_top_left = 4
+corner_radius_top_right = 4
+corner_radius_bottom_right = 4
+corner_radius_bottom_left = 4
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_collapse_hover"]
+content_margin_left = 8.0
+content_margin_top = 3.0
+content_margin_right = 8.0
+content_margin_bottom = 3.0
+bg_color = Color(0.22, 0.34, 0.52, 0.98)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(0.6, 0.82, 1, 0.95)
+corner_radius_top_left = 4
+corner_radius_top_right = 4
+corner_radius_bottom_right = 4
+corner_radius_bottom_left = 4
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_collapse_pressed"]
+content_margin_left = 8.0
+content_margin_top = 3.0
+content_margin_right = 8.0
+content_margin_bottom = 3.0
+bg_color = Color(0.1, 0.16, 0.26, 1)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(0.55, 0.78, 1, 1)
+corner_radius_top_left = 4
+corner_radius_top_right = 4
+corner_radius_bottom_right = 4
+corner_radius_bottom_left = 4
+
+[node name="Demo" type="Node" node_paths=PackedStringArray("info_panel", "instructions_container", "collapse_button", "title_label", "scenario_selector", "overview_label", "camera_status_label", "controls_label", "reference_status_label", "switch_view_button")]
+script = ExtResource("1_ctrl")
+scenario_scenes = Array[PackedScene]([ExtResource("2_scen_planetary"), ExtResource("3_scen_leo"), ExtResource("4_scen_lagrange"), ExtResource("5_scen_binary"), ExtResource("6_scen_swarm")])
+scenario_titles = PackedStringArray("1. Planetary System & Submoons", "2. Real-Scale LEO (1 AU) & Low-Thrust Spiral", "3. Planet–Moon Lagrange Points (Stable L4 & L5)", "4. Binary Stars & Circumbinary Planet", "5. GPU Asteroid Swarm (256 Ballistic Bodies)")
+scenario_descriptions = PackedStringArray("Hierarchical Keplerian system (JrRailOrbiter) with planets, moons, a submoon (RheaSubmoon), and GPU ballistic probes (JrBallisticOrbiter) with live trajectory forecasts and wakes.", "Real-scale Sun–Earth–Moon system in Kilometers & Seconds (Earth at 1 AU = 149.6M km). Showcases a drift-free 400 km Low Earth Orbit satellite and an ORBITAL-frame prograde ion-thrust spiral at 600x time warp.", "Co-rotating Planet–Moon synodic reference frame (PerspectiveRotationMode.SYNODIC_ORBITAL) locked to MajorMoon around HostPlanet. Showcases stable L4 (+60° leading) and L5 (-60° trailing) Trojan tadpole orbits.", "Massless barycenter (JrOrbitDriver, mass = 0) with reciprocally coupled binary stars (StarAlpha & StarBeta via binary_partner), a circumbinary planet, and a ballistic probe navigating the dual gravity wells.", "Batched GLSL compute-shader N-body stepping of 256 JrBallisticOrbiter asteroids perturbed by a massive gas giant (JupiterPerturber), using collect_ballistic_nodes() to flatten the simulation hierarchy.")
+info_panel = NodePath("UILayer/HUDRoot/InfoPanel")
+instructions_container = NodePath("UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer")
+collapse_button = NodePath("UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/HeaderRow/CollapseButton")
+title_label = NodePath("UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/HeaderRow/TitleLabel")
+scenario_selector = NodePath("UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer/ScenarioRow/ScenarioSelector")
+overview_label = NodePath("UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer/OverviewLabel")
+camera_status_label = NodePath("UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer/CameraStatusLabel")
+controls_label = NodePath("UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer/ControlsLabel")
+reference_status_label = NodePath("UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer/ReferenceStatusLabel")
+switch_view_button = NodePath("UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer/SwitchViewButton")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_cxue0")
+
+[node name="SunFillLight" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.8480481, -0.32625088, 0.4175821, 0, 0.7880108, 0.6156615, -0.52991927, -0.5221106, 0.668271, 0, 0, 0)
+light_color = Color(1, 0.96, 0.88, 1)
+light_energy = 0.55
+
+[node name="UILayer" type="CanvasLayer" parent="."]
+
+[node name="HUDRoot" type="Control" parent="UILayer"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+
+[node name="InfoPanel" type="PanelContainer" parent="UILayer/HUDRoot"]
+layout_mode = 0
+offset_left = 16.0
+offset_top = 16.0
+offset_right = 478.0
+offset_bottom = 456.0
+mouse_filter = 1
+theme_override_styles/panel = SubResource("StyleBoxFlat_kj7dk")
+
+[node name="MarginContainer" type="MarginContainer" parent="UILayer/HUDRoot/InfoPanel"]
+layout_mode = 2
+theme_override_constants/margin_left = 14
+theme_override_constants/margin_top = 12
+theme_override_constants/margin_right = 14
+theme_override_constants/margin_bottom = 12
+
+[node name="VBoxContainer" type="VBoxContainer" parent="UILayer/HUDRoot/InfoPanel/MarginContainer"]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="HeaderRow" type="HBoxContainer" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer"]
+layout_mode = 2
+theme_override_constants/separation = 12
+
+[node name="TitleLabel" type="Label" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/HeaderRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_colors/font_color = Color(0.55, 0.78, 1, 1)
+theme_override_font_sizes/font_size = 16
+text = "JR Orrery — 3D Orbital Mechanics Demo"
+
+[node name="CollapseButton" type="Button" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/HeaderRow"]
+layout_mode = 2
+size_flags_vertical = 4
+focus_mode = 0
+mouse_default_cursor_shape = 2
+theme_override_colors/font_color = Color(0.92, 0.96, 1, 1)
+theme_override_font_sizes/font_size = 12
+theme_override_styles/normal = SubResource("StyleBoxFlat_collapse_normal")
+theme_override_styles/hover = SubResource("StyleBoxFlat_collapse_hover")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_collapse_pressed")
+text = "▲ Hide [H]"
+
+[node name="InstructionsContainer" type="VBoxContainer" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer"]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="HSeparatorTop" type="HSeparator" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer"]
+layout_mode = 2
+mouse_filter = 2
+
+[node name="ScenarioRow" type="HBoxContainer" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="ScenarioLabel" type="Label" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer/ScenarioRow"]
+layout_mode = 2
+theme_override_colors/font_color = Color(1, 0.85, 0.4, 1)
+theme_override_font_sizes/font_size = 13
+text = "Scenario [1–5]:"
+
+[node name="ScenarioSelector" type="OptionButton" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer/ScenarioRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+focus_mode = 0
+mouse_default_cursor_shape = 2
+theme_override_colors/font_color = Color(0.95, 0.98, 1, 1)
+theme_override_font_sizes/font_size = 13
+theme_override_styles/normal = SubResource("StyleBoxFlat_btn_normal")
+theme_override_styles/hover = SubResource("StyleBoxFlat_btn_hover")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_btn_pressed")
+
+[node name="OverviewLabel" type="Label" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer"]
+custom_minimum_size = Vector2(430, 0)
+layout_mode = 2
+theme_override_colors/font_color = Color(0.88, 0.91, 0.96, 1)
+theme_override_font_sizes/font_size = 13
+text = "Hierarchical Keplerian system (JrRailOrbiter) with planets, moons, a submoon (RheaSubmoon), and GPU ballistic probes (JrBallisticOrbiter) with live trajectory forecasts and wakes."
+autowrap_mode = 3
+
+[node name="CameraStatusLabel" type="Label" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.65, 0.85, 1, 1)
+theme_override_font_sizes/font_size = 13
+text = "Active Camera: Camera3D (3D Orbital Rig)"
+
+[node name="SwitchViewButton" type="Button" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer"]
+layout_mode = 2
+focus_mode = 0
+mouse_default_cursor_shape = 2
+theme_override_colors/font_color = Color(0.95, 0.98, 1, 1)
+theme_override_font_sizes/font_size = 13
+theme_override_styles/normal = SubResource("StyleBoxFlat_btn_normal")
+theme_override_styles/hover = SubResource("StyleBoxFlat_btn_hover")
+theme_override_styles/pressed = SubResource("StyleBoxFlat_btn_pressed")
+text = "Transfer to 2D View (Camera2D)  [Tab / V]"
+
+[node name="ControlsHeaderLabel" type="Label" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer"]
+layout_mode = 2
+theme_override_colors/font_color = Color(1, 0.85, 0.4, 1)
+theme_override_font_sizes/font_size = 14
+text = "Controls"
+
+[node name="ControlsLabel" type="Label" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.85, 0.88, 0.94, 1)
+theme_override_font_sizes/font_size = 13
+text = "• Keys 1–5 (or Dropdown): Switch showcase scenario
+• Tab / V (or Button): Transfer to 2D View (Camera2D)
+• Right-Click & Drag: Orbit 3D camera around selected body
+• Mouse Wheel: Zoom 3D camera in and out
+• Double-Click Planet / Moon / Probe: Lock perspective to that body
+• Double-Click Central Star: Reset to root perspective
+• R Key: Cycle Inertial / Surface-Locked / Synodic (L1–L5) frame
+• H Key (or Hide/Instructions): Collapse or expand this panel"
+
+[node name="HSeparatorBottom" type="HSeparator" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer"]
+layout_mode = 2
+mouse_filter = 2
+
+[node name="ReferenceStatusLabel" type="Label" parent="UILayer/HUDRoot/InfoPanel/MarginContainer/VBoxContainer/InstructionsContainer"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.45, 0.95, 0.65, 1)
+theme_override_font_sizes/font_size = 13
+text = "Active Reference: System Root (Heliocentric/Barycentric) [Surface-Locked]"
+
+[node name="ActiveScenario" parent="." instance=ExtResource("2_scen_planetary")]
