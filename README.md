@@ -150,39 +150,42 @@ MainScene
 ```gdscript
 extends Node
 
-@export var driver: JrOrbitDriver;
-@export var earth: JrRailOrbiter;
-@export var ship: JrBallisticOrbiter;
+@export var driver: JrOrbitDriver
+@export var earth: JrRailOrbiter
+@export var ship: JrBallisticOrbiter
+
 
 func fire_prograde_boost() -> void:
-	# Instantaneously add 0.5 simulation speed units in the ship's prograde (-Z) orbital direction:
-	ship.apply_orbital_impulse(Vector3.FORWARD * 0.5);
+	# Instantaneously add 0.5 simulation speed units in the prograde (-Z) direction:
+	ship.apply_orbital_impulse(Vector3.FORWARD * 0.5)
+
 
 func engage_ion_drive() -> void:
 	# Apply continuous 0.02 m/s^2 prograde thrust:
-	ship.thrust_frame = JrBallisticOrbiter.ThrustFrame.ORBITAL;
-	ship.acceleration_unit = JrOrreryUnits.AccelerationUnit.METERS_PER_SECOND_SQUARED;
-	ship.external_acceleration = Vector3.FORWARD * 0.02;
+	ship.thrust_frame = JrBallisticOrbiter.ThrustFrame.ORBITAL
+	ship.acceleration_unit = JrOrreryUnits.AccelerationUnit.METERS_PER_SECOND_SQUARED
+	ship.external_acceleration = Vector3.FORWARD * 0.02
+
 
 func center_view_on_earth_lagrange_frame() -> void:
 	# Keep Earth at (0, 0, 0) and co-rotate the view with Earth's orbit around the Sun:
-	driver.perspective_node = earth;
-	driver.perspective_rotation_mode = JrOrbitDriver.PerspectiveRotationMode.SYNODIC_ORBITAL;
+	driver.perspective_node = earth
+	driver.perspective_rotation_mode = JrOrbitDriver.PerspectiveRotationMode.SYNODIC_ORBITAL
 ```
 
 ### 3. Spawn Large Asteroid Belts or Debris Clouds
 When spawning hundreds of `JrBallisticOrbiter` nodes by script, wrap the loop in `begin_batch_updates()` / `end_batch_updates()` so all bodies initialize in a single GPU pass. Calling `collect_ballistic_nodes()` optionally flattens nested ballistic nodes directly under `JrOrbitDriver` while keeping their spawned orbits intact:
 
 ```gdscript
-driver.begin_batch_updates();
+driver.begin_batch_updates()
 for i: int in range(256):
-	var asteroid: JrBallisticOrbiter = JrBallisticOrbiter.new();
-	asteroid.initial_position = Vector3(0.0, 0.0, -20.0 - float(i) * 0.05);
-	asteroid.initial_velocity = Vector3(2.8, 0.0, 0.0);
-	asteroid.runtime_forecast_enabled = false;
-	driver.add_child(asteroid);
-driver.collect_ballistic_nodes();
-driver.end_batch_updates();
+	var asteroid := JrBallisticOrbiter.new()
+	asteroid.initial_position = Vector3(0.0, 0.0, -20.0 - float(i) * 0.05)
+	asteroid.initial_velocity = Vector3(2.8, 0.0, 0.0)
+	asteroid.runtime_forecast_enabled = false
+	driver.add_child(asteroid)
+driver.collect_ballistic_nodes()
+driver.end_batch_updates()
 ```
 
 ---

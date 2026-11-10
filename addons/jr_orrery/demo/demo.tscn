@@ -1,6 +1,6 @@
 [gd_scene format=3 uid="uid://bymftx4cb04no"]
 
-[ext_resource type="Script" uid="uid://b6n8w2x4q9k1p" path="res://addons/jr_orrery/demo/demo_controller.gd" id="1_ctrl"]
+[ext_resource type="Script" uid="uid://b6n8w2x4q9k1p" path="res://addons/jr_orrery/demo/jr_demo_controller.gd" id="1_ctrl"]
 [ext_resource type="PackedScene" path="res://addons/jr_orrery/demo/scenarios/demo_planetary_system.tscn" id="2_scen_planetary"]
 [ext_resource type="PackedScene" path="res://addons/jr_orrery/demo/scenarios/demo_real_scale_leo.tscn" id="3_scen_leo"]
 [ext_resource type="PackedScene" path="res://addons/jr_orrery/demo/scenarios/demo_lagrange_points.tscn" id="4_scen_lagrange"]

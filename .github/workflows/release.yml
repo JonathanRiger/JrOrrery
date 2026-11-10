@@ -1,0 +1,96 @@
+# Publishes a GitHub Release with an Asset-Library-ready addon zip whenever a v* tag is pushed.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to package and publish (e.g. v1.0)"
+        required: true
+        default: "v1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  publish-release:
+    name: Package Addon & Publish GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build addon zip archive
+        id: package
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REF_NAME}"
+          ARCHIVE="jr-orrery-${TAG}.zip"
+
+          # git archive honors .gitattributes export-ignore rules so only addons/jr_orrery/ is packaged.
+          git archive --format=zip --output="${ARCHIVE}" "${TAG}"
+
+          # Verify the expected plugin manifest is present inside the archive.
+          unzip -l "${ARCHIVE}" | grep -q "addons/jr_orrery/plugin.cfg"
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "archive=${ARCHIVE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare release notes
+        env:
+          TAG: ${{ steps.package.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          if [ "${TAG}" = "v1.0" ]; then
+            cat <<'EOF' > release_notes.md
+          **JR Orrery v1.0** is the initial stable release of the orbital mechanics, N-body spacecraft trajectory, and multi-scale 2D/3D visualization plugin for **Godot 4.7+**.
+
+          ### Highlights
+          - **Decoupled Simulation & Scene Scale**: Simulate solar systems at true astronomical scales (`Kilometers`, `Astronomical Units`, `Earth Radii`, `Seconds`, `Days`, `Solar Masses`, `Earth Masses`) while driving `Node3D` (`JrOrbiter3D`) and `Node2D` (`JrOrbiter2D`) visuals at comfortable Godot scene coordinates via `position_scale`.
+          - **Analytical Keplerian Hierarchies (`JrRailOrbiter`)**: Circular, elliptical, parabolic, and hyperbolic orbits with arbitrarily deep moon/submoon hierarchies, axial tilt, sidereal spin, and coupled binary star barycenters (`binary_partner`).
+          - **GPU-Accelerated N-Body Trajectories (`JrBallisticOrbiter`)**: Hybrid universal-variable Kick-Drift-Kick GLSL compute solver (with automatic CPU fallback) supporting multi-body gravity, automatic Hill-sphere SOI handoffs, drift-free time-warp conics, continuous thrust (`INERTIAL`, `LOCAL_BODY`, `ORBITAL`), instant delta-v impulses, and live trajectory forecasting.
+          - **Dynamic Reference Frames (`JrOrbitDriver`)**: Re-center the scene origin on any star, planet, moon, or spacecraft at runtime (`perspective_node`) in `INERTIAL`, `BODY_SPIN` (surface-locked), or `SYNODIC_ORBITAL` (co-rotating L1–L5 Lagrange) frames, plus optional 2D `lock_to_ecliptic` mode.
+          - **Interactive 2D & 3D Editor Gizmos**: Click-and-drag handles for periapsis, apoapsis, semi-parameter, inclination, ascending node, axial tilt, epoch anomaly, and ballistic state vectors with full Undo/Redo and animated editor ghosts.
+          - **Five Interactive Showcase Scenarios**: Includes `demo.tscn` demonstrating planetary systems with submoons, real-scale 1 AU + 400 km LEO & low-thrust ion spirals, stable L4/L5 Lagrange points, coupled binary stars, and a 256-body GPU asteroid swarm.
+
+          ### Installation
+          1. Download **`jr-orrery-v1.0.zip`** below (contains only `addons/jr_orrery/`) or clone the full repository to try the interactive demo scenes.
+          2. Extract `addons/jr_orrery` into your Godot 4.7+ project's `addons/` folder.
+          3. Enable **JR Orrery** under **Project > Project Settings > Plugins**.
+          EOF
+          fi
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.package.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${ARCHIVE}" --clobber
+            if [ -f release_notes.md ]; then
+              gh release edit "${TAG}" --title "JR Orrery ${TAG}" --notes-file release_notes.md
+            fi
+          else
+            if [ -f release_notes.md ]; then
+              gh release create "${TAG}" "${ARCHIVE}" \
+                --verify-tag \
+                --title "JR Orrery ${TAG}" \
+                --notes-file release_notes.md
+            else
+              gh release create "${TAG}" "${ARCHIVE}" \
+                --verify-tag \
+                --title "JR Orrery ${TAG}" \
+                --generate-notes
+            fi
+          fi

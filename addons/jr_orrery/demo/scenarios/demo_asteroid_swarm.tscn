@@ -1,6 +1,6 @@
 [gd_scene format=3 uid="uid://be87y4stdwrgm"]
 
-[ext_resource type="Script" path="res://addons/jr_orrery/demo/scenarios/demo_swarm_spawner.gd" id="1_spawner"]
+[ext_resource type="Script" path="res://addons/jr_orrery/demo/scenarios/jr_demo_swarm_spawner.gd" id="1_spawner"]
 [ext_resource type="Script" uid="uid://djosw6ac6d8tc" path="res://addons/jr_orrery/jr_orbit_driver.gd" id="2_driver"]
 [ext_resource type="Script" uid="uid://ch5eml314pv8i" path="res://addons/jr_orrery/jr_rail_orbiter.gd" id="3_orbiter"]
 [ext_resource type="Script" uid="uid://ba457um4mr2ae" path="res://addons/jr_orrery/jr_orbiter_2d.gd" id="4_orb2d"]
