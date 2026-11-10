@@ -1,87 +1,108 @@
 # JR Orrery
 
-**JR Orrery** is a Godot 4.7+ addon for simulating and visualizing hierarchical analytical Keplerian ("on-rails") orbits and GPU-accelerated N-body ballistic trajectories across both **2D** and **3D** scenes with dynamic reference-frame switching and real-scale astronomical precision.
+**JR Orrery** is a Godot 4.7+ plugin for building solar systems, planetary orbits, spacecraft trajectories, and orbital maps in **2D**, **3D**, or both at the same time.
 
-Simulation math is cleanly decoupled from visual presentation: a pure `Node` hierarchy computes 3D orbital kinematics and GPU compute-shader physics, while `JrOrbiter2D` and `JrOrbiter3D` follower nodes project or apply those transforms to your sprites, meshes, and cameras.
+Building space games in a standard game engine usually runs into two big problems:
+1. **Scale**: Real space distances span millions of kilometers, which breaks standard 3D camera clipping planes, shadows, and 32-bit floating-point coordinates—or forces you to fake orbital speeds and sizes by hand.
+2. **Reference Frames**: Sometimes the camera needs to follow a star system from above, sometimes it needs to hover over a spinning planet, and sometimes it needs to stay centered on a tiny spacecraft in Low Earth Orbit.
 
----
-
-## Features
-
-### Decoupled Simulation & Dual 2D/3D Visual Followers
-- **Call Down / Signal Up Architecture**: Simulation nodes (`JrOrbitDriver`, `JrRailOrbiter`, `JrBallisticOrbiter`) inherit from `JrOrreryElement` (`Node`), bubbling hierarchy changes upward and pushing time, physical units, and reference frames downward.
-- **Simultaneous 2D & 3D Views**: Drive `JrOrbiter2D` (`Node2D`) and `JrOrbiter3D` (`Node3D`) followers from the same simulation nodes at the same time, with independent `position_scale` multipliers.
-- **Flexible Scene Hierarchies (`TransformMode`)**:
-  - `LOCAL`: Parent visual moons under visual planets—parent axial tilt and sidereal spin are automatically canceled so child orbits remain fixed in the system's reference plane.
-  - `SYSTEM`: Keep all visual followers as flat siblings under a common root, applying full perspective-shifted transforms directly.
-  - `AUTO`: Automatically selects `LOCAL` when parented to another `JrOrbiter2D`/`JrOrbiter3D`, or `SYSTEM` otherwise.
-- **Editor Transform Guards**: Detects accidental manual drags on simulation-controlled visual nodes in the editor, warns in the Scene dock, and restores the calculated orbital transform.
-
-### Analytical Keplerian Orbits (`JrRailOrbiter`)
-- **All Conic Sections**: Supports circular ($e = 0$), elliptical ($0 < e < 1$), parabolic ($e = 1$), and hyperbolic ($e > 1$) trajectories using Taylor warm-started Newton-Raphson Kepler solvers and analytical Barker parabolic solvers.
-- **Full 3D Orientation & Spin**: Configurable `inclination`, `longitude_of_the_ascending_node` (RAAN), `argument_of_periapsis`, `mean_anomaly_at_epoch`, `axial_tilt` (obliquity), `axial_tilt_longitude`, `rotational_motion` / `sidereal_period`, and `rotation_at_epoch`.
-- **Gravity-Synced Motion**: Enable `sync_motion_to_gravity` to automatically derive `mean_motion` and `orbital_period` from parent and self mass via Kepler's Third Law ($\sqrt{(\mu_{\text{parent}} + \mu_{\text{self}}) / |a|^3}$).
-- **Binary Star & Binary Body Coupling**: Link two sibling `JrRailOrbiter` nodes under a zero-mass barycenter via `binary_partner` to reciprocally lock their eccentricities, inclinations, ascending nodes, opposite arguments of periapsis ($+180^\circ$), mass-weighted periapses ($q_1 \mu_1 = q_2 \mu_2$), and shared binary orbital period. Children parented to a massless binary barycenter automatically inherit the pair's combined $\mu$ for circumbinary orbits.
-
-### GPU-Accelerated Hybrid N-Body Ballistics (`JrBallisticOrbiter`)
-- **Batched GLSL Compute Shaders (`JrBallisticComputeSolver`)**: Steps hundreds of ballistic bodies in parallel on a shared local `RenderingDevice` (`ballistic_gravity.glsl`), with an identical CPU solver fallback for headless or server environments.
-- **Universal-Variable Kick-Drift-Kick & Battin $f(q)$ Tides**: Propagates motion in dominant-anchor-relative coordinates using Stumpff functions $C(z)$ and $S(z)$, integrating differential third-body tidal perturbations via Battin's $f(q)$ formulation without subtracting large heliocentric coordinates.
-- **Lowest Common Ancestor (LCA) Precision**: Resolves inter-well and perspective offset vectors by walking the hierarchy only up to the Lowest Common Ancestor, preventing `float32` catastrophic cancellation even for meter-scale Low Earth Orbits at $1\text{ AU}$ ($1.496 \times 10^{11}\text{ m}$) from a star.
-- **Tidal Culling & Tier-1 On-Rails Coasting**: Distant third-body tides below `tidal_cull_threshold` are culled without square roots. Unperturbed bodies with zero thrust automatically freeze onto analytical Tier-1 epoch conics (eliminating numerical energy drift over high time-warp) and wake up automatically when crossing an analytical tidal wake radius or firing thrusters.
-- **Automatic Hill-Sphere Anchor Switching**: Transitions dominant gravity-well anchors automatically using Hill-sphere hysteresis (`0.98 * r_Hill` entry, `1.05 * r_Hill` exit) and emits `dominant_body_changed(previous_body, current_body)`, or locks to an explicit `pinned_anchor`.
-- **Dual Initial-State Authoring**: Author initial conditions as Cartesian `STATE_VECTORS` (`initial_position`, `initial_velocity`) or `KEPLERIAN_ELEMENTS` (`initial_periapsis`, `initial_eccentricity`, etc.) with live bidirectional synchronization.
-- **Continuous & Impulsive Propulsion**:
-  - Continuous `external_acceleration` scaled by physical `AccelerationUnit` in `INERTIAL`, `BODY_LOCAL`, or instantaneous `ORBITAL` (Prograde `-Z`, Orbit Normal `+Y`, Radial Outward `+X`) frames.
-  - Runtime delta-v helpers: `apply_impulse()`, `apply_local_impulse()`, and `apply_orbital_impulse()`.
-- **Live GPU Trajectory Forecasting**: Dispatches `ballistic_forecast.glsl` to predict future paths across moving gravity wells, continuous orbital burns, and mid-forecast Sphere-of-Influence handoffs (`get_forecast_points()`, `get_forecast_points_2d()`, `get_forecast_reference_ids()`).
-
-### Variable Perspectives & Reference Frames (`JrOrbitDriver`)
-- **Dynamic Origin Shifting (`perspective_node`)**: Lock any planet, moon, submoon, or spacecraft at the visual system origin at runtime without altering the underlying physics.
-- **Three Reference-Frame Rotation Modes (`PerspectiveRotationMode`)**:
-  - `INERTIAL`: Fixes `perspective_node` at the origin while keeping coordinate axes aligned to the inertial stars.
-  - `BODY_SPIN`: Locks both position and axial spin orientation of `perspective_node` (e.g., geostationary / surface-fixed views).
-  - `SYNODIC_ORBITAL`: Co-rotates with `perspective_node`'s orbital radius vector around its parent focus so Lagrange points ($L_1$–$L_5$) remain stationary on screen.
-- **Unified Reference Direction & Planar Lock**: Configure system-wide `reference_rotation`, `euler_order`, `positive_is_clockwise`, and `lock_to_ecliptic` (which constrains all orbits, ballistic states, thrust vectors, and tilts flat onto the ecliptic plane while still permitting prograde $0^\circ$ and retrograde $180^\circ$ motion).
-
-### 64-Bit Physical Unit System (`JrOrreryUnits`)
-Configure simulation scales using CODATA 2018 and IAU 2015 nominal gravitational constants (`GM`), converted in 64-bit floating-point precision on the CPU before GPU upload:
-- **Distance Units**: `METERS`, `KILOMETERS`, `MEGAMETERS`, `EARTH_RADII`, `LUNAR_DISTANCES`, `ASTRONOMICAL_UNITS`.
-- **Time Units**: `SECONDS`, `MINUTES`, `HOURS`, `DAYS`, `YEARS`.
-- **Mass Units**: `DRIVER_GM` (raw $\mu$), `KILOGRAMS`, `METRIC_TONS`, `TERAGRAMS`, `LUNAR_MASSES`, `EARTH_MASSES`, `JUPITER_MASSES`, `SOLAR_MASSES`.
-- **Acceleration Units**: `DRIVER_UNITS`, `METERS_PER_SECOND_SQUARED`, `STANDARD_GRAVITIES_G` ($g_0 = 9.80665\text{ m/s}^2$).
-
-### Interactive 2D & 3D Editor Tooling
-- **2D & 3D Viewport Conic Gizmos**: Select any `JrRailOrbiter`, Keplerian `JrBallisticOrbiter`, or its `JrOrbiter2D`/`JrOrbiter3D` follower (or direct visual child) to drag interactive handles directly in the viewport with full Undo/Redo support:
-  - **2D & 3D**: Periapsis, Apoapsis (automatically swaps periapsis/apoapsis when dragged past the opposite apsis), Semi-Parameter (eccentricity), and Mean Anomaly at Epoch.
-  - **3D Exclusive**: Ascending Node (RAAN), Inclination, Axial Tilt (north pole), Axial Tilt Longitude, and Starting Day Angle (`rotation_at_epoch`).
-- **2D & 3D Ballistic Vector Gizmos**: In `STATE_VECTORS` mode, drag initial position, scaled velocity arrows, and 3D vertical elevation stems directly in the editor with live coordinate/speed readouts.
-- **Animated Editor Preview Ghosts**: Preview orbital revolutions, unbound flybys, body spin, and forward-integrated N-body ballistic paths live in the 2D and 3D editor viewports (`editor_play_speed`) without dirtying saved node transforms.
+**JR Orrery** solves both problems by separating **orbital simulation** from **visual gameplay nodes**:
+- **Simulation nodes** (`JrOrbitDriver`, `JrRailOrbiter`, `JrBallisticOrbiter`) calculate accurate 3D orbits, multi-body gravity, spacecraft thrust, and trajectory forecasts behind the scenes—using either real-world astronomical units or custom game numbers.
+- **Visual follower nodes** (`JrOrbiter2D` and `JrOrbiter3D`) read that simulation, scale the distances down into comfortable Godot scene coordinates, and move your meshes, sprites, cameras, or map icons.
 
 ---
 
-## Architecture Overview
+## Simulation Scale vs. Gameplay Scale
 
-```text
-JrOrreryElement (Abstract Node)
-├── JrOrbitDriver          # Root simulation controller, units, time, perspective & GPU solver host
-├── JrRailOrbiter          # Analytical Keplerian conic & binary-coupled orbiting body
-└── JrBallisticOrbiter     # Hybrid GPU N-body, tidal & thrust-driven ballistic body
+One of the core ideas behind JR Orrery is that **the physics scale of your solar system does not have to match the visual coordinate scale of your Godot scene**.
 
-Visual Followers (subscribe to JrOrreryElement.transform_updated)
-├── JrOrbiter2D (Node2D)   # Top-down X-Z projection, 2D editor orbit polyline & ghost
-└── JrOrbiter3D (Node3D)   # Full 3D transform & basis, ImmediateMesh 3D orbit line & wireframe ghost
-```
+### 1. Real Scale in the Simulation
+Inside `JrOrbitDriver`, `JrRailOrbiter`, and `JrBallisticOrbiter`, you can build systems at real astronomical sizes—or any consistent unit system you choose (`Kilometers`, `Astronomical Units`, `Earth Radii`, `Seconds`, `Days`, `Solar Masses`, `Earth Masses`, `m/s²`, `g`, etc.):
+- A planet can orbit `150,000,000 km` (`1 AU`) from its star while a satellite orbits just `400 km` above that planet's surface.
+- Orbital periods, escape velocities, slingshots, Lagrange points, and thruster delta-v all work naturally using real numbers—without manually tuning fake gravity values.
+- Under the hood, JR Orrery tracks orbits relative to their local parent body rather than subtracting huge solar-system-wide coordinates, so a small satellite orbiting a distant planet never suffers from floating-point jitter.
 
-| Class | Base Type | Purpose |
+### 2. Gameplay Scale in 2D and 3D Nodes (`position_scale`)
+Placing a `Node3D` at `x = 150,000,000` in Godot would cause severe rendering jitter, broken shadow maps, and camera frustum issues. Instead, `JrOrbiter3D` and `JrOrbiter2D` provide a **`position_scale`** property that converts simulated distances into practical scene units:
+
+- **Keep Scene Coordinates Comfortable**: Multiply large simulated distances down into normal Godot ranges. For example, if the simulation runs in **Kilometers**, setting `position_scale = 0.001` on `JrOrbiter3D` maps `1,000 km` to `1.0` Godot 3D unit—putting a `6,778 km` Low Earth Orbit at a crisp `6.78` units from Earth's center.
+- **Size Planets & Ships for Gameplay (or True Scale)**: `position_scale` only scales **orbital positions**, never the `scale` or rotational `Basis` of your visual child nodes. You can make a spacecraft mesh, collider, or 2D map icon large enough for the player to see and click without affecting its physics—or match mesh radii to `position_scale` whenever you want true 1:1 planetary proportions.
+- **Drive a 3D World and a 2D Tactical Map Together**: Because each visual follower has its own `position_scale`, a single `JrOrbitDriver` simulation can simultaneously drive:
+  - A **3D flight view** (`JrOrbiter3D` with `position_scale = 0.001` in 3D meters/units), and
+  - A **2D navigation map or radar display** (`JrOrbiter2D` with `position_scale = 0.015` in screen pixels).
+- **Keep the Active Body at `(0, 0, 0)`**: Setting `perspective_node` on `JrOrbitDriver` locks any chosen planet, moon, or player ship to `(0, 0, 0)` in scene space and shifts the rest of the system around it *before* applying `position_scale`. Your gameplay camera, physics shapes, and VFX always operate right near the scene origin with full precision.
+
+### Example: Real-Scale LEO vs. 3D & 2D Gameplay Coordinates
+From the included `demo_real_scale_leo.tscn` scenario (`distance_unit = KILOMETERS`, `perspective_node = Earth`):
+
+| Body / Value | Simulation Value (Real Scale) | 3D Scene (`position_scale = 0.001`) | 2D Map (`position_scale = 0.015`) |
+| :--- | :--- | :--- | :--- |
+| **Earth** (Active Origin) | `147,098,074 km` from Sun | `(0, 0, 0)` — `4.2` unit sphere | Map center — `Sprite2D` icon |
+| **LEO Satellite** | `6,778 km` from Earth center | `6.78` units from Earth | `101.7 px` from Earth |
+| **Moon** | `363,300 km` from Earth | `363.3` units from Earth | `5,449.5 px` from Earth |
+| **Sun** | `147,098,074 km` away | `147,098` units away | `2,206,471 px` away |
+
+---
+
+## Custom Nodes
+
+Enabling the plugin adds five custom nodes to Godot's **Create New Node** dialog:
+
+| Node | Inherits | What It Does |
 | :--- | :--- | :--- |
-| `JrOrbitDriver` | `JrOrreryElement` (`Node`) | Owns simulation `time`, `time_scale`, physical unit scales, `JrReferenceDirection`, `perspective_node`, and `JrBallisticComputeSolver`. |
-| `JrRailOrbiter` | `JrOrreryElement` (`Node`) | Analytical 3D conic section solver (elliptical, circular, parabolic, hyperbolic), axial spin, gravity-synced period, and binary coupling. |
-| `JrBallisticOrbiter` | `JrOrreryElement` (`Node`) | Physics-integrated spacecraft/asteroid supporting state-vector or Keplerian initialization, continuous/impulsive thrust, Hill-sphere handoffs, and GPU forecasts. |
-| `JrOrbiter2D` | `Node2D` | Projects a `JrOrreryElement`'s 3D motion onto 2D (`Vector2(x, z) * position_scale`) with optional yaw sync. |
-| `JrOrbiter3D` | `Node3D` | Applies a `JrOrreryElement`'s 3D translation (`* position_scale`) and orthonormal rotational `Basis`. |
-| `JrOrreryUnits` | `RefCounted` | Static physical unit enums and 64-bit SI / IAU `GM` conversion utilities. |
-| `JrReferenceDirection` | `RefCounted` | Unified 3D ecliptic plane, vernal point, handedness, and planar-lock helper. |
-| `JrBallisticComputeSolver` | `RefCounted` | Manages shared `RenderingDevice` pipelines (`ballistic_gravity.glsl` & `ballistic_forecast.glsl`) and CPU fallback. |
+| **`JrOrbitDriver`** | `Node` | The root controller of an orbital system. Controls simulation time, time warp (`time_scale`), physical units, system plane orientation, and which body sits at the scene origin (`perspective_node`). |
+| **`JrRailOrbiter`** | `Node` | An "on-rails" body (star, planet, moon, comet) that follows an exact Keplerian orbit (circular, elliptical, parabolic, or hyperbolic) with configurable axial tilt and day/night spin. |
+| **`JrBallisticOrbiter`** | `Node` | A free-flying physics body (spacecraft, probe, asteroid, missile) affected by gravity from all massive bodies in the system, continuous engines, and instant delta-v burns. |
+| **`JrOrbiter3D`** | `Node3D` | Moves and rotates a 3D node (meshes, cameras, lights, physics bodies) to follow a `JrRailOrbiter`, `JrBallisticOrbiter`, or `JrOrbitDriver`. |
+| **`JrOrbiter2D`** | `Node2D` | Projects a body's 3D motion onto a top-down 2D `Node2D` plane (`Vector2(x, z) * position_scale`), with optional 2D rotation sync. |
+
+---
+
+## Key Features
+
+### Planetary Systems & "On-Rails" Orbits (`JrRailOrbiter`)
+- **Closed & Escape Orbits**: Supports circular (`eccentricity = 0`), elliptical (`0 < eccentricity < 1`), parabolic (`eccentricity = 1`), and hyperbolic (`eccentricity > 1`) paths.
+- **Moons, Submoons & Deep Hierarchies**: Nest `JrRailOrbiter` nodes as deep as you want (Star → Planet → Moon → Submoon).
+- **Axial Tilt & Sidereal Spin**: Configure planetary seasons and day lengths with `axial_tilt`, `axial_tilt_longitude`, `sidereal_period` (or `rotational_motion`), and `rotation_at_epoch`.
+- **Automatic Gravity-Based Orbital Speeds**: Turn on `sync_motion_to_gravity` to automatically calculate orbital speed and `orbital_period` from the parent body's mass and the orbit's size.
+- **Binary Stars & Circumbinary Worlds**: Link two sibling `JrRailOrbiter` nodes under a massless barycenter (`mass = 0`) using `binary_partner`. Adjusting one star's orbit or mass automatically updates its partner's counterweight distance, opposite periapsis, and shared orbital period—and any planets parented to the barycenter automatically feel the combined gravity of both stars.
+
+### Physics-Driven Spacecraft, Transfers & Asteroid Swarms (`JrBallisticOrbiter`)
+- **GPU-Accelerated N-Body Gravity**: Steps hundreds of ballistic bodies in parallel on the GPU using GLSL compute shaders (and automatically falls back to an identical CPU solver in headless or Compatibility builds).
+- **Multi-Body Gravity, Slingshots & Lagrange Points**: Bodies feel gravitational pull from the central star, planets, and moons simultaneously, enabling realistic lunar free-return trajectories, gravity assists, and stable L4/L5 Trojan orbits.
+- **Automatic Sphere-of-Influence Handoffs**: As a spacecraft travels from interplanetary space into a planet's or moon's gravity well, JR Orrery automatically switches its dominant reference body (emitting `dominant_body_changed`) so local orbits stay rock-solid. You can also lock a body to a specific reference with `pinned_anchor`.
+- **Drift-Free Time Warp**: When a ballistic body has its engines off and isn't being tugged by nearby third bodies, it automatically freezes onto an exact Keplerian orbit so high time-warp speeds won't cause orbits to decay—waking back up the moment thrusters fire or another massive body approaches.
+- **Author via Vectors or Orbital Elements**: Set up a spacecraft's starting path using either 3D position/velocity vectors (`STATE_VECTORS`) or standard orbital parameters like periapsis, apoapsis, and inclination (`KEPLERIAN_ELEMENTS`). Both stay in sync automatically.
+- **Continuous Thrusters & Instant Burns**:
+  - Apply continuous acceleration (`external_acceleration`) for ion drives, low-thrust spirals, or continuous burns in **Inertial**, **Body-Local**, or **Orbital** (Prograde `-Z`, Normal `+Y`, Radial Outward `+X`) directions.
+  - Trigger instant delta-v maneuvers from code with `apply_impulse()`, `apply_local_impulse()`, and `apply_orbital_impulse()`.
+- **Live Trajectory Forecasting**: Automatically predicts and exposes future flight-path points (`get_forecast_points()`, `get_forecast_points_2d()`), accounting for moving planets, continuous prograde/retrograde burns, and upcoming gravity-well transitions.
+
+### Dynamic Perspectives & Reference Frames (`JrOrbitDriver`)
+- **Switch Origin to Any Body (`perspective_node`)**: Center the entire visual scene on a planet, moon, space station, or spacecraft at runtime without changing how the physics simulation runs.
+- **Three Reference Frame Modes (`PerspectiveRotationMode`)**:
+  - **`INERTIAL`**: Keeps the chosen body at `(0, 0, 0)`, while the background coordinate axes stay fixed to the stars.
+  - **`BODY_SPIN`**: Rotates the universe with the chosen body's surface spin—ideal for surface bases, launchpads, or geostationary views.
+  - **`SYNODIC_ORBITAL`**: Rotates the view along with the chosen body's orbit around its parent, making Lagrange points (L1–L5) and transfer loops appear stationary.
+- **Flat 2D Mode (`lock_to_ecliptic`)**: Building a strictly 2D top-down space game? Enable `lock_to_ecliptic` on `JrOrbitDriver` to flatten all inclinations, ballistic velocities, thruster burns, and spin axes onto a single plane (while still allowing both clockwise/prograde and counter-clockwise/retrograde orbits).
+
+### Built-In Physical Units (`JrOrreryUnits`)
+Mix and match real-world units in the Inspector without looking up gravitational constants:
+- **Distance**: `METERS`, `KILOMETERS`, `MEGAMETERS`, `EARTH_RADII`, `LUNAR_DISTANCES`, `ASTRONOMICAL_UNITS`
+- **Time**: `SECONDS`, `MINUTES`, `HOURS`, `DAYS`, `YEARS`
+- **Mass**: `DRIVER_GM` (custom raw gravity), `KILOGRAMS`, `METRIC_TONS`, `TERAGRAMS`, `LUNAR_MASSES`, `EARTH_MASSES`, `JUPITER_MASSES`, `SOLAR_MASSES`
+- **Acceleration**: `DRIVER_UNITS`, `METERS_PER_SECOND_SQUARED`, `STANDARD_GRAVITIES_G` (`1 g = 9.80665 m/s²`)
+
+### Flexible Scene Layouts (`TransformMode`)
+`JrOrbiter2D` and `JrOrbiter3D` support both nested and flat visual scene trees:
+- **Nested Visual Trees (`LOCAL`)**: Parent a moon's `JrOrbiter3D` under a planet's `JrOrbiter3D`. The planet's axial tilt and daily spin are automatically canceled out so the moon's orbit doesn't wobble as the planet spins.
+- **Flat Visual Trees (`SYSTEM`)**: Place all `JrOrbiter3D` or `JrOrbiter2D` nodes side by side under one parent node—ideal when switching `perspective_node` between arbitrary bodies at runtime.
+- **Automatic (`AUTO`)**: Uses `LOCAL` when parented to another `JrOrbiter2D`/`JrOrbiter3D`, and `SYSTEM` otherwise.
+
+### Interactive 2D & 3D Editor Tools
+- **Click-and-Drag Viewport Gizmos**: Select an orbiter or its 2D/3D visual node in the editor to drag Periapsis, Apoapsis, Eccentricity, Ascending Node, Inclination, Axial Tilt, Epoch Position, or Ballistic Velocity vectors directly in the 2D or 3D viewport—complete with Undo/Redo.
+- **Animated Editor Ghosts**: Preview orbital speeds, flybys, planet spin, and curved N-body trajectories right inside the editor (`editor_play_speed`) without dirtying or modifying your saved scene transforms.
+- **Accidental Drag Protection**: If you accidentally drag a simulation-driven `JrOrbiter2D` or `JrOrbiter3D` with Godot's Move tool, it warns you and snaps back to its true orbital position so your scene never gets out of sync.
 
 ---
 
@@ -94,52 +115,56 @@ Visual Followers (subscribe to JrOrreryElement.transform_updated)
 
 ## Quick Start
 
-### 1. Build a Simulation Hierarchy
-Add a `JrOrbitDriver` node to your scene, then add `JrRailOrbiter` and `JrBallisticOrbiter` children beneath it to represent stars, planets, moons, and spacecraft:
+### 1. Set Up a Solar System Scene
+Create a `JrOrbitDriver` branch for your simulation data, and a `Node3D` (or `Node2D`) branch for your game visuals:
 
 ```text
 MainScene
-├── JrOrbitDriver (mass = 1.0, mass_unit = SOLAR_MASSES, distance_unit = ASTRONOMICAL_UNITS, time_unit = DAYS)
-│   ├── Earth (JrRailOrbiter: periapsis = 1.0, sync_motion_to_gravity = true, mass = 1.0, mass_unit = EARTH_MASSES)
+├── JrOrbitDriver (mass = 1.0 SOLAR_MASSES, distance_unit = ASTRONOMICAL_UNITS, time_unit = DAYS)
+│   ├── Earth (JrRailOrbiter: periapsis = 1.0, sync_motion_to_gravity = true, mass = 1.0 EARTH_MASSES)
 │   │   ├── Moon (JrRailOrbiter: periapsis = 0.00257, sync_motion_to_gravity = true)
-│   │   └── Probe (JrBallisticOrbiter: initial_state_mode = KEPLERIAN_ELEMENTS)
-└── View3D (Node3D)
-    ├── SunFollower (JrOrbiter3D: orbiter = JrOrbitDriver, position_scale = 20.0)
-    ├── EarthFollower (JrOrbiter3D: orbiter = Earth, position_scale = 20.0)
-    ├── MoonFollower (JrOrbiter3D: orbiter = Moon, position_scale = 20.0)
-    └── ProbeFollower (JrOrbiter3D: orbiter = Probe, position_scale = 20.0)
+│   │   └── PlayerShip (JrBallisticOrbiter: initial_state_mode = KEPLERIAN_ELEMENTS)
+└── GameWorld3D (Node3D)
+    ├── SunVisual (JrOrbiter3D: orbiter = JrOrbitDriver, position_scale = 50.0)
+    │   └── MeshInstance3D
+    ├── EarthVisual (JrOrbiter3D: orbiter = Earth, position_scale = 50.0)
+    │   └── MeshInstance3D
+    ├── MoonVisual (JrOrbiter3D: orbiter = Moon, position_scale = 50.0)
+    │   └── MeshInstance3D
+    └── ShipVisual (JrOrbiter3D: orbiter = PlayerShip, position_scale = 50.0)
+        └── MeshInstance3D
 ```
 
 > [!TIP]
-> Attaching a `JrOrbiter2D` or `JrOrbiter3D` follower to the root `JrOrbitDriver` allows your central star visual to shift and rotate automatically whenever `JrOrbitDriver.perspective_node` is set to an orbiting planet or spacecraft!
+> Attaching a `JrOrbiter3D` or `JrOrbiter2D` to the root `JrOrbitDriver` lets your central star's mesh or sprite move automatically whenever you center the system on a planet or ship via `perspective_node`!
 
-### 2. Apply Spacecraft Maneuvers & Switch Perspectives in GDScript
+### 2. Control Spacecraft & Switch Perspectives in GDScript
 
 ```gdscript
 extends Node
 
 @export var driver: JrOrbitDriver;
 @export var earth: JrRailOrbiter;
-@export var probe: JrBallisticOrbiter;
+@export var ship: JrBallisticOrbiter;
 
-func perform_prograde_burn() -> void:
-	# Apply an instantaneous 0.5 driver-unit/time-unit prograde delta-v (-Z in orbital RTN frame):
-	probe.apply_orbital_impulse(Vector3.FORWARD * 0.5);
+func fire_prograde_boost() -> void:
+	# Instantaneously add 0.5 simulation speed units in the ship's prograde (-Z) orbital direction:
+	ship.apply_orbital_impulse(Vector3.FORWARD * 0.5);
 
-func enable_continuous_ion_thrust() -> void:
-	# Apply continuous 0.01 m/s^2 prograde thrust:
-	probe.thrust_frame = JrBallisticOrbiter.ThrustFrame.ORBITAL;
-	probe.acceleration_unit = JrOrreryUnits.AccelerationUnit.METERS_PER_SECOND_SQUARED;
-	probe.external_acceleration = Vector3.FORWARD * 0.01;
+func engage_ion_drive() -> void:
+	# Apply continuous 0.02 m/s^2 prograde thrust:
+	ship.thrust_frame = JrBallisticOrbiter.ThrustFrame.ORBITAL;
+	ship.acceleration_unit = JrOrreryUnits.AccelerationUnit.METERS_PER_SECOND_SQUARED;
+	ship.external_acceleration = Vector3.FORWARD * 0.02;
 
-func focus_on_earth_synodic() -> void:
-	# Lock Earth at the system origin and co-rotate so Sun-Earth Lagrange points stay fixed:
+func center_view_on_earth_lagrange_frame() -> void:
+	# Keep Earth at (0, 0, 0) and co-rotate the view with Earth's orbit around the Sun:
 	driver.perspective_node = earth;
 	driver.perspective_rotation_mode = JrOrbitDriver.PerspectiveRotationMode.SYNODIC_ORBITAL;
 ```
 
-### 3. Batch Spawning & Flattening Ballistic Swarms
-When spawning large numbers of `JrBallisticOrbiter` bodies at runtime (such as an asteroid belt or debris cloud), wrap creation in `begin_batch_updates()` / `end_batch_updates()` and call `collect_ballistic_nodes()` to flatten them directly under the driver while preserving their initial parent-relative orbital states:
+### 3. Spawn Large Asteroid Belts or Debris Clouds
+When spawning hundreds of `JrBallisticOrbiter` nodes by script, wrap the loop in `begin_batch_updates()` / `end_batch_updates()` so all bodies initialize in a single GPU pass. Calling `collect_ballistic_nodes()` optionally flattens nested ballistic nodes directly under `JrOrbitDriver` while keeping their spawned orbits intact:
 
 ```gdscript
 driver.begin_batch_updates();
@@ -155,41 +180,41 @@ driver.end_batch_updates();
 
 ---
 
-## Viewport Gizmo Reference
+## Editor Viewport Gizmo Guide
 
-When simulation playback is stopped in the editor, selecting an orbiter or its visual follower exposes interactive handles:
+When simulation playback is paused in the editor, selecting an orbiter (or its 2D/3D visual node) displays interactive handles:
 
-| Handle | Color | Viewport | Behavior & Modifiers |
+| Handle | Color | Viewport | What It Adjusts |
 | :--- | :--- | :--- | :--- |
-| **Periapsis** | Orange | 2D & 3D | Adjusts `periapsis` and `argument_of_periapsis`. Hold `Ctrl` to lock `eccentricity`; hold `Alt` to lock `argument_of_periapsis`. |
-| **Apoapsis** | Cyan | 2D & 3D | Shown on bound orbits ($e < 1$). Adjusts `apoapsis` and `argument_of_periapsis` (auto-swaps with Periapsis if dragged closer than periapsis). |
-| **Semi-Parameter** | Green | 2D & 3D | Adjusts `eccentricity` via the semi-latus rectum without altering `periapsis`. |
-| **Mean Anomaly at Epoch** | Magenta | 2D & 3D | Adjusts `mean_anomaly_at_epoch` along the conic path. |
-| **Ascending Node (RAAN)** | Yellow | 3D | Rotates `longitude_of_the_ascending_node` around the ecliptic pole (hidden when `lock_to_ecliptic` is enabled). |
-| **Inclination** | Teal | 3D | Tilts `inclination` across $(-180^\circ, 180^\circ]$ around the line of nodes. |
-| **Axial Tilt & Longitude** | Red / Violet | 3D | Tilts the body's north spin pole (`axial_tilt`) and azimuthal tilt direction (`axial_tilt_longitude`). |
-| **Rotation at Epoch** | Lime | 3D | Rotates the prime meridian (`rotation_at_epoch`) around the body's equatorial ring. |
-| **Ballistic Position & Velocity** | Orange / Mint / Blue | 2D & 3D | Shown when `JrBallisticOrbiter` is in `STATE_VECTORS` mode; includes vertical elevation stems in 3D. |
+| **Periapsis** | Orange | 2D & 3D | Closest approach distance and orbit rotation (`argument_of_periapsis`). Hold `Ctrl` to lock `eccentricity`; hold `Alt` to lock rotation. |
+| **Apoapsis** | Cyan | 2D & 3D | Farthest distance on closed orbits (`eccentricity < 1`). Automatically swaps with Periapsis if dragged closer than periapsis. |
+| **Semi-Parameter** | Green | 2D & 3D | Orbit width / `eccentricity` without changing `periapsis`. |
+| **Mean Anomaly at Epoch** | Magenta | 2D & 3D | Starting position of the body along its orbit at `time = 0`. |
+| **Ascending Node (RAAN)** | Yellow | 3D | Rotates where the tilted orbit crosses the system plane (hidden when `lock_to_ecliptic` is on). |
+| **Inclination** | Teal | 3D | Tilts the orbital plane from `-180°` to `180°` (tilting past `±90°` creates a retrograde orbit). |
+| **Axial Tilt & Direction** | Red / Violet | 3D | Tilts the body's north spin pole (`axial_tilt`) and the direction it leans (`axial_tilt_longitude`). |
+| **Rotation at Epoch** | Lime | 3D | Sets the body's starting day/night spin angle (`rotation_at_epoch`) at `time = 0`. |
+| **Ballistic Position & Velocity** | Orange / Mint / Blue | 2D & 3D | Shown when `JrBallisticOrbiter` is in `STATE_VECTORS` mode; drags starting position, velocity arrow, and 3D vertical elevation. |
 
 ---
 
 ## Included Demo & Showcase Scenarios
 
-Open and run `res://addons/jr_orrery/demo/demo.tscn` to explore five interactive scenarios driven simultaneously in 2D and 3D from a single shared `JrOrbitDriver`:
+Open and run `res://addons/jr_orrery/demo/demo.tscn` to explore five interactive showcase scenes—each running a 3D view and a 2D map view simultaneously from a single `JrOrbitDriver`:
 
-1. **Planetary System & Submoons** (`demo_planetary_system.tscn`) — Hierarchical Keplerian system with planets, moons, a submoon, and GPU ballistic probes featuring live dashed trajectory forecasts and historical wake trails.
-2. **Real-Scale LEO (1 AU) & Low-Thrust Spiral** (`demo_real_scale_leo.tscn`) — Real-scale Sun–Earth–Moon system in Kilometers & Seconds (`1 AU = 149.6M km`), demonstrating drift-free 400 km Low Earth Orbit precision alongside an `ORBITAL`-frame prograde ion-thrust spiral at $600\times$ time warp.
-3. **Planet–Moon Lagrange Points (Stable L4 & L5)** (`demo_lagrange_points.tscn`) — Co-rotating Planet–Moon synodic frame (`PerspectiveRotationMode.SYNODIC_ORBITAL`) showcasing stable $L_4$ ($+60^\circ$ leading) and $L_5$ ($-60^\circ$ trailing) Trojan tadpole orbits.
-4. **Binary Stars & Circumbinary Planet** (`demo_binary_stars.tscn`) — Massless barycenter (`mass = 0`) with reciprocally coupled binary stars (`binary_partner`), a circumbinary planet, and a ballistic probe navigating the dual gravity wells.
-5. **GPU Asteroid Swarm (256 Ballistic Bodies)** (`demo_asteroid_swarm.tscn`) — Batched GLSL compute-shader N-body stepping of 256 `JrBallisticOrbiter` asteroids perturbed by a gas giant using `collect_ballistic_nodes()`.
+1. **Planetary System & Submoons** (`demo_planetary_system.tscn`) — Multi-layered planetary system with moons, a submoon, and ballistic probes displaying live dashed trajectory forecasts and wake trails.
+2. **Real-Scale LEO (1 AU) & Low-Thrust Spiral** (`demo_real_scale_leo.tscn`) — Real-scale Sun–Earth–Moon system in Kilometers and Seconds (`Earth at ~149.6M km`), demonstrating a rock-steady 400 km Low Earth Orbit satellite and a continuous prograde ion-drive spiral at `600x` time warp, scaled cleanly to `0.001` in 3D and `0.015` in 2D.
+3. **Planet–Moon Lagrange Points (Stable L4 & L5)** (`demo_lagrange_points.tscn`) — Co-rotating Planet–Moon view (`SYNODIC_ORBITAL`) showing probes orbiting around the leading (`+60°`) and trailing (`-60°`) Trojan Lagrange points.
+4. **Binary Stars & Circumbinary Planet** (`demo_binary_stars.tscn`) — Two stars coupled via `binary_partner` around a shared barycenter, orbited by a circumbinary planet and a free-flying ballistic probe.
+5. **GPU Asteroid Swarm (256 Ballistic Bodies)** (`demo_asteroid_swarm.tscn`) — 256 GPU-stepped asteroids orbiting a star while being gravitationally perturbed by a passing gas giant.
 
 ### Demo Controls
-- **Switch 2D / 3D View**: Click the HUD **Switch View** button or press `Tab` / `V`.
-- **Switch Showcase Scenario**: Select from the HUD dropdown or press `1`–`5`.
-- **Select Reference Perspective**: **Double-click** any planet, moon, probe, or the central star in 2D or 3D to lock the system origin to that body.
-- **Cycle Perspective Rotation Mode**: Press `R` to cycle between `INERTIAL`, `BODY_SPIN`, and `SYNODIC_ORBITAL`.
-- **Camera Navigation**: Mouse wheel to zoom; right-drag to orbit (3D) or pan (2D).
-- **HUD Toggle**: Press `H` to collapse or expand the instructions panel.
+- **Switch 2D / 3D View**: Click **Switch View** in the HUD or press `Tab` / `V`.
+- **Switch Scenario**: Choose from the HUD dropdown or press `1`–`5`.
+- **Change Reference Body**: **Double-click** any planet, moon, probe, or the central star in 2D or 3D to center the scene on that body.
+- **Cycle Rotation Mode**: Press `R` to cycle between `INERTIAL`, `BODY_SPIN`, and `SYNODIC_ORBITAL`.
+- **Camera Controls**: Scroll wheel to zoom; right-click drag to orbit (3D) or pan (2D).
+- **Show / Hide HUD**: Press `H`.
 
 ---
 
@@ -199,3 +224,4 @@ Open and run `res://addons/jr_orrery/demo/demo.tscn` to explore five interactive
 - **Version**: `1.0`
 - **Engine Compatibility**: Godot `4.7+` (Forward+ / Vulkan / D3D12 / Metal for GPU compute shaders; automatic CPU fallback on Compatibility / Headless)
 - **License**: Released under the [MIT License](LICENSE) — free for personal and commercial use, modification, and distribution with attribution (preserving the copyright and permission notice).
+- **Development Disclosure**: System architecture, feature design, and custom icons are human-authored; generative AI tools were used to assist with code implementation, debugging, and documentation. Contains no AI-generated art, audio, or runtime AI dependencies.
