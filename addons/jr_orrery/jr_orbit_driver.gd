@@ -86,24 +86,26 @@ var reference_rotation := Vector3.ZERO:
 @export var distance_unit := JrOrreryUnits.DistanceUnit.METERS:
 	set(value):
 		if distance_unit != value:
-			distance_unit = value
-			_propagate_units_and_parent_mu()
-			_invalidate_all_ballistic_forecasts()
+			distance_unit = value;
+			_units_and_mu_dirty = true;
+			_propagate_units_and_parent_mu();
+			_invalidate_all_ballistic_forecasts();
 			if is_inside_tree():
-				update_orbits()
-			orbit_visuals_changed.emit()
+				update_orbits();
+			orbit_visuals_changed.emit();
 
 ## Physical time unit represented by [code]1.0[/code] unit of [member time] across this driver's
 ## hierarchy.
 @export var time_unit := JrOrreryUnits.TimeUnit.SECONDS:
 	set(value):
 		if time_unit != value:
-			time_unit = value
-			_propagate_units_and_parent_mu()
-			_invalidate_all_ballistic_forecasts()
+			time_unit = value;
+			_units_and_mu_dirty = true;
+			_propagate_units_and_parent_mu();
+			_invalidate_all_ballistic_forecasts();
 			if is_inside_tree():
-				update_orbits()
-			orbit_visuals_changed.emit()
+				update_orbits();
+			orbit_visuals_changed.emit();
 
 @export_group("Gravity")
 ## Physical mass of the root focus at the origin of this [JrOrbitDriver] (for example,
@@ -112,26 +114,28 @@ var reference_rotation := Vector3.ZERO:
 @export_range(0.0, 1_000_000.0, 0.001, "or_greater")
 var mass: float = 0.0:
 	set(value):
-		var clamped: float = maxf(0.0, value)
+		var clamped: float = maxf(0.0, value);
 		if mass != clamped:
-			mass = clamped
-			_propagate_units_and_parent_mu()
-			_invalidate_all_ballistic_forecasts()
+			mass = clamped;
+			_units_and_mu_dirty = true;
+			_propagate_units_and_parent_mu();
+			_invalidate_all_ballistic_forecasts();
 			if is_inside_tree() and Engine.is_editor_hint():
-				update_orbits()
-			orbit_visuals_changed.emit()
+				update_orbits();
+			orbit_visuals_changed.emit();
 
 ## Unit in which [member mass] is specified. Combined with [member distance_unit] and
 ## [member time_unit] to compute the root gravitational parameter [code]mu = G * M[/code].
 @export var mass_unit := JrOrreryUnits.MassUnit.DRIVER_GM:
 	set(value):
 		if mass_unit != value:
-			mass_unit = value
-			_propagate_units_and_parent_mu()
-			_invalidate_all_ballistic_forecasts()
+			mass_unit = value;
+			_units_and_mu_dirty = true;
+			_propagate_units_and_parent_mu();
+			_invalidate_all_ballistic_forecasts();
 			if is_inside_tree() and Engine.is_editor_hint():
-				update_orbits()
-			orbit_visuals_changed.emit()
+				update_orbits();
+			orbit_visuals_changed.emit();
 
 ## Dimensionless tidal ratio threshold [code](|a_tidal| / |a_dominant|)[/code] below which
 ## distant third-body gravitational perturbations are culled. Bodies with zero thrust and
@@ -263,7 +267,16 @@ var _orbit_sequence: Array[JrRailOrbiter] = []
 
 ## Flattened list of all tracked descendant [JrBallisticOrbiter] nodes in parent-before-child
 ## order.
-var _ballistic_sequence: Array[JrBallisticOrbiter] = []
+var _ballistic_sequence: Array[JrBallisticOrbiter] = [];
+
+## Sparse list of [JrBallisticOrbiter] nodes not currently in the root-parent/root-anchor fast sync state.
+var _non_root_sync_ballistics: Array[JrBallisticOrbiter] = [];
+
+## Sparse list of tracked [JrBallisticOrbiter] nodes with [member JrBallisticOrbiter.runtime_forecast_enabled] set.
+var _forecast_enabled_ballistics: Array[JrBallisticOrbiter] = [];
+
+## Last broadcast value of [member JrBallisticOrbiter._direct_system_xf] across tracked ballistics.
+var _last_direct_system_xf_state: bool = true;
 
 ## Batched GPU compute-shader N-body solver for [JrBallisticOrbiter] descendants.
 var _ballistic_solver := JrBallisticComputeSolver.new()
@@ -295,6 +308,90 @@ var _last_forecast_well_list: Array[JrOrreryElement] = []
 ## Cached anchor-relative forecast points (`xyz = r_rel, w = anchor_idx`) from the most recent
 ## forecast pass.
 var _last_forecast_anchor_points: Dictionary[JrBallisticOrbiter, PackedVector4Array] = {}
+
+## Optional telemetry sink receiving microsecond phase timings when non-null.
+var _telemetry: JrOrreryTelemetry = null;
+
+## Dirty flag indicating that units or parent effective gravitational parameters need propagation.
+var _units_and_mu_dirty: bool = true;
+
+## Whether [member _last_synced_playing] has been broadcast across all current descendants.
+var _has_synced_playing: bool = false;
+
+## Last simulation-playing boolean broadcast to tracked descendants.
+var _last_synced_playing: bool = false;
+
+## Reusable ancestor element stack for allocation-free LCA queries.
+var _lca_b_elems: Array[JrOrreryElement] = [];
+
+## Reusable ancestor vector stack paired with [member _lca_b_elems] for allocation-free LCA queries.
+var _lca_b_vecs: PackedVector3Array = PackedVector3Array();
+
+## Per-frame LCA-exact position offsets relative to [member perspective_node] for tracked elements.
+var _persp_well_offsets: Dictionary[JrOrreryElement, Vector3] = {};
+
+## Cached flag indicating whether the active [member perspective_node] resolves to heliocentric root.
+var _persp_is_heliocentric: bool = true;
+
+## Reusable per-step map of parent elements to their massive direct child [JrRailOrbiter] nodes.
+var _hill_children_by_parent: Dictionary[JrOrreryElement, Array] = {};
+
+## Reusable per-step focus-relative position cache for massive [JrRailOrbiter] nodes.
+var _hill_orbiter_offset: Dictionary[JrRailOrbiter, Vector3] = {};
+
+## Reusable per-step squared Hill entry radii for massive [JrRailOrbiter] nodes.
+var _hill_orbiter_entry_sq: Dictionary[JrRailOrbiter, float] = {};
+
+## Reusable per-step squared Hill exit radii for massive [JrRailOrbiter] nodes.
+var _hill_orbiter_exit_sq: Dictionary[JrRailOrbiter, float] = {};
+
+## Reusable per-step eligibility flag for Hill-sphere exit checks per [JrRailOrbiter].
+var _hill_orbiter_can_exit: Dictionary[JrRailOrbiter, bool] = {};
+
+## Active `(count, step_dt)` key for the shared per-frame forecast perspective projection cache.
+var _fc_proj_grid_key: Vector2 = Vector2(-1.0, -1.0);
+
+## Cached synodic inverse rotation bases across the active forecast grid.
+var _fc_proj_synodic_bases: Array[Basis] = [];
+
+## Cached common ancestor gravity well per forecast well index.
+var _fc_proj_well_common: Array[JrOrreryElement] = [];
+
+## Cached current-time LCA offset from [member perspective_node] to each forecast well's common well.
+var _fc_proj_well_common_now: PackedVector3Array = PackedVector3Array();
+
+## Cached `system_basis * common_now` per forecast well index.
+var _fc_proj_well_sys_common_now: PackedVector3Array = PackedVector3Array();
+
+## Cached boolean byte (`1` or `0`) indicating synodic rotation per forecast well index.
+var _fc_proj_well_is_synodic: PackedByteArray = PackedByteArray();
+
+## Cached common ancestor instance ID per forecast well index.
+var _fc_proj_well_common_id: PackedInt64Array = PackedInt64Array();
+
+## Lazy readiness flags for [member _fc_proj_well_origins] per forecast well index.
+var _fc_proj_well_origins_ready: PackedByteArray = PackedByteArray();
+
+## Lazily evaluated inertial origins across forecast steps per forecast well index.
+var _fc_proj_well_origins: Array[PackedVector3Array] = [];
+
+## Lazy readiness flags for [member _fc_proj_well_offsets] per forecast well index.
+var _fc_proj_well_offsets_ready: PackedByteArray = PackedByteArray();
+
+## Lazily evaluated offsets from common ancestor well across forecast steps per forecast well index.
+var _fc_proj_well_offsets: Array[PackedVector3Array] = [];
+
+## Tracks whether any [JrBallisticOrbiter] currently holds non-empty runtime forecast polylines.
+var _any_ballistic_has_forecast_points: bool = false;
+
+## Coalesces multiple subtree removals within a single frame into one deferred orbital update.
+var _deferred_orbit_update_queued: bool = false;
+
+## Dirty flag indicating one or more [JrBallisticOrbiter] nodes require initial state setup.
+var _pending_ballistic_init: bool = true;
+
+## Dirty flag indicating one or more [JrBallisticOrbiter] nodes require pre-step anchor validation or pinning.
+var _ballistic_anchors_dirty: bool = true;
 
 
 ## Initializes the generated [JrReferenceDirection], connects subtree signals,
@@ -338,17 +435,26 @@ func _notification(what: int) -> void:
 ## Overrides [method JrOrreryElement.get_effective_parent_mu] so children of a massless
 ## binary barycenter driver inherit the combined gravitational parameter of its binary star pair.
 func get_effective_parent_mu() -> float:
-	_recompute_gravity_strength_from_mass()
-	var own_mu: float = _gravity_strength
+	_recompute_gravity_strength_from_mass();
+	var own_mu: float = _gravity_strength;
 	if own_mu > 0.0:
-		return own_mu
-	var binary_sum: float = 0.0
+		return own_mu;
+	var binary_sum: float = 0.0;
+	if not _orbit_sequence.is_empty():
+		for child_orb: JrRailOrbiter in _orbit_sequence:
+			if (
+					_children.get(child_orb, null) == self
+					and child_orb.binary_partner != null
+					and child_orb.binary_partner.get_parent() == self
+			):
+				binary_sum += child_orb.get_gravity_strength();
+		return binary_sum;
 	for child_node: Node in get_children():
 		if child_node is JrRailOrbiter:
-			var child_orb := child_node as JrRailOrbiter
+			var child_orb := child_node as JrRailOrbiter;
 			if child_orb.binary_partner != null and child_orb.binary_partner.get_parent() == self:
-				binary_sum += child_orb.get_gravity_strength()
-	return binary_sum
+				binary_sum += child_orb.get_gravity_strength();
+	return binary_sum;
 
 
 ## Overrides [method JrOrreryElement._recompute_gravity_strength_from_mass] using
@@ -373,10 +479,14 @@ func begin_batch_updates() -> void:
 ## Ends a batch hierarchy/parameter update started by [method begin_batch_updates] and
 ## performs a single consolidated [method update_orbits] pass when the outermost batch finishes.
 func end_batch_updates() -> void:
-	_batch_update_depth = maxi(0, _batch_update_depth - 1)
+	_batch_update_depth = maxi(0, _batch_update_depth - 1);
 	if _batch_update_depth == 0 and is_inside_tree():
-		_propagate_units_and_parent_mu()
-		update_orbits()
+		_units_and_mu_dirty = true;
+		_pending_ballistic_init = true;
+		_ballistic_anchors_dirty = true;
+		_ballistic_solver.invalidate_resident_step_buffer();
+		_propagate_units_and_parent_mu();
+		update_orbits();
 
 
 ## Reparents all descendant [JrBallisticOrbiter] nodes in this hierarchy to be direct
@@ -384,9 +494,10 @@ func end_batch_updates() -> void:
 ## or losing their original spawn focus reference.
 func collect_ballistic_nodes() -> void:
 	if _orbit_sequence.is_empty() and _ballistic_sequence.is_empty() and get_child_count() > 0:
-		_initialize_driver_hierarchy()
-	begin_batch_updates()
-	_propagate_units_and_parent_mu()
+		_initialize_driver_hierarchy();
+	begin_batch_updates();
+	_units_and_mu_dirty = true;
+	_propagate_units_and_parent_mu();
 	var eval_t: float = 0.0 if Engine.is_editor_hint() else time
 	_evaluate_all_orbiters_at(eval_t, _should_step_time())
 
@@ -457,8 +568,9 @@ func evaluate_trail_sample_relative_to_perspective(
 ## emits [signal JrOrreryElement.transform_updated].
 func update_orbits() -> void:
 	if _updating_orbits or _batch_update_depth > 0 or _reference_plane == null:
-		return
+		return;
 
+	_owning_driver = self;
 	if not child_element_added.is_connected(_on_subtree_element_added) or (
 			_orbit_sequence.is_empty() and _ballistic_sequence.is_empty() and get_child_count() > 0
 	):
@@ -467,55 +579,102 @@ func update_orbits() -> void:
 				euler_order,
 				positive_is_clockwise,
 				lock_to_ecliptic
-		)
+		);
 		if not child_element_added.is_connected(_on_subtree_element_added):
-			child_element_added.connect(_on_subtree_element_added)
+			child_element_added.connect(_on_subtree_element_added);
 		if not child_element_removed.is_connected(_on_subtree_element_removed):
-			child_element_removed.connect(_on_subtree_element_removed)
-		refresh_subtree_tracking()
+			child_element_removed.connect(_on_subtree_element_removed);
+		refresh_subtree_tracking();
+		_units_and_mu_dirty = true;
+		_has_synced_playing = false;
+		_pending_ballistic_init = true;
+		_ballistic_anchors_dirty = true;
 
-	_updating_orbits = true
-	_propagate_units_and_parent_mu()
-	var playing: bool = _should_step_time()
-	set_simulation_playing(playing)
+	if _telemetry != null:
+		_update_orbits_instrumented();
+		return;
 
-	_relative_velocity = Vector3.ZERO
-	_global_velocity = Vector3.ZERO
+	_updating_orbits = true;
+	if _units_and_mu_dirty:
+		_propagate_units_and_parent_mu();
+	var playing: bool = _should_step_time();
+	_sync_playing_if_changed(playing);
+
+	_relative_velocity = Vector3.ZERO;
+	_global_velocity = Vector3.ZERO;
 
 	if Engine.is_editor_hint():
-		_evaluate_editor_system_state(playing)
+		_evaluate_editor_system_state(playing);
 	else:
-		_evaluate_runtime_system_state(playing)
+		_evaluate_runtime_system_state(playing);
 
-	var persp_basis: Basis = _compute_perspective_basis()
-	var driver_origin: Vector3 = persp_basis * _compute_lca_position_difference(
-			self,
-			perspective_node
-	)
-	var driver_system_transform := Transform3D(persp_basis, driver_origin)
-	_local_orbital_transform = driver_system_transform
-	_driver_relative_transform = Transform3D.IDENTITY
-	set_system_transform(driver_system_transform)
+	var persp_basis: Basis = _compute_perspective_basis();
+	var is_identity_basis: bool = (persp_basis == Basis.IDENTITY);
+	_build_perspective_offset_table();
 
-	for orbiter: JrRailOrbiter in _orbit_sequence:
-		var rel_pos: Vector3 = _compute_lca_position_difference(orbiter, perspective_node)
-		var sys_origin: Vector3 = persp_basis * rel_pos
-		var sys_basis: Basis = persp_basis * orbiter.get_driver_relative_transform().basis
-		orbiter.set_system_transform(Transform3D(sys_basis, sys_origin))
+	var root_rel_pos: Vector3 = (
+			Vector3.ZERO
+			if _persp_is_heliocentric
+			else _persp_well_offsets.get(self, Vector3.ZERO)
+	);
+	var driver_origin: Vector3 = (
+			root_rel_pos if is_identity_basis else (persp_basis * root_rel_pos)
+	);
+	var driver_system_transform := Transform3D(persp_basis, driver_origin);
+	_local_orbital_transform = driver_system_transform;
+	_driver_relative_transform = Transform3D.IDENTITY;
+	_system_transform = driver_system_transform;
+	emit_signal(&"transform_updated");
+
+	if _persp_is_heliocentric and is_identity_basis:
+		for orbiter: JrRailOrbiter in _orbit_sequence:
+			orbiter._system_transform = orbiter._driver_relative_transform;
+			orbiter.emit_signal(&"transform_updated");
+	else:
+		for orbiter: JrRailOrbiter in _orbit_sequence:
+			var drv_xf: Transform3D = orbiter._driver_relative_transform;
+			var rel_pos: Vector3 = (
+					drv_xf.origin
+					if _persp_is_heliocentric
+					else _persp_well_offsets.get(orbiter, Vector3.ZERO)
+			);
+			if is_identity_basis:
+				orbiter._system_transform = Transform3D(drv_xf.basis, rel_pos);
+			else:
+				orbiter._system_transform = Transform3D(
+						persp_basis * drv_xf.basis,
+						persp_basis * rel_pos
+				);
+			orbiter.emit_signal(&"transform_updated");
 
 	if not Engine.is_editor_hint():
-		_update_runtime_ballistic_forecasts(persp_basis)
+		_update_runtime_ballistic_forecasts(persp_basis);
 
-	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
-		var rel_pos: Vector3 = _compute_lca_position_difference(ballistic, perspective_node)
-		var sys_origin: Vector3 = persp_basis * rel_pos
-		var sys_basis: Basis = persp_basis * ballistic.get_driver_relative_transform().basis
-		ballistic.set_system_transform(Transform3D(sys_basis, sys_origin))
+	var use_direct_ballistic_xf: bool = _persp_is_heliocentric and is_identity_basis;
+	_sync_ballistic_direct_system_xf_flag(use_direct_ballistic_xf);
+	if use_direct_ballistic_xf:
+		for nr_idx: int in range(_non_root_sync_ballistics.size()):
+			var nr_b: JrBallisticOrbiter = _non_root_sync_ballistics[nr_idx];
+			nr_b._system_transform = nr_b._driver_relative_transform;
+		for i: int in range(_ballistic_sequence.size()):
+			_ballistic_sequence[i].emit_signal(&"transform_updated");
+	else:
+		for ballistic: JrBallisticOrbiter in _ballistic_sequence:
+			var rel_pos: Vector3 = _lookup_ballistic_perspective_offset(ballistic);
+			var drv_basis: Basis = ballistic._driver_relative_basis;
+			if is_identity_basis:
+				ballistic._system_transform = Transform3D(drv_basis, rel_pos);
+			else:
+				ballistic._system_transform = Transform3D(
+						persp_basis * drv_basis,
+						persp_basis * rel_pos
+				);
+			ballistic.emit_signal(&"transform_updated");
 
 	if Engine.is_editor_hint():
-		_update_editor_ghosts()
+		_update_editor_ghosts();
 
-	_updating_orbits = false
+	_updating_orbits = false;
 
 
 ## Evaluates the exact analytical inertial driver origin of a tracked [param element]
@@ -582,22 +741,51 @@ func is_ballistic_forecast_gpu_active() -> bool:
 	return _ballistic_solver.is_forecast_gpu_active()
 
 
+## Attaches or detaches a [JrOrreryTelemetry] collector for microsecond profiling of this driver
+## and its [JrBallisticComputeSolver].
+func set_telemetry(telemetry: JrOrreryTelemetry) -> void:
+	_telemetry = telemetry;
+	_ballistic_solver.set_telemetry(telemetry);
+
+
+## Returns the currently attached [JrOrreryTelemetry] collector, or [code]null[/code] if disabled.
+func get_telemetry() -> JrOrreryTelemetry:
+	return _telemetry;
+
+
+## Forces [member _ballistic_solver] to execute CPU fallback stepping and forecasting when
+## [param force_cpu] is [code]true[/code].
+func set_force_cpu_solver(force_cpu: bool) -> void:
+	_ballistic_solver.set_force_cpu(force_cpu);
+
+
+## Returns [code]true[/code] when [member _ballistic_solver] is forced onto its CPU fallback path.
+func is_force_cpu_solver() -> bool:
+	return _ballistic_solver.is_force_cpu();
+
+
 ## Connects subtree signals, configures [member _reference_plane], scans all
 ## descendant elements, and evaluates initial orbital and ballistic transforms.
 func _initialize_driver_hierarchy() -> void:
+	_owning_driver = self;
 	_reference_plane.configure(
 			reference_rotation,
 			euler_order,
 			positive_is_clockwise,
 			lock_to_ecliptic
-	)
+	);
 	if not child_element_added.is_connected(_on_subtree_element_added):
-		child_element_added.connect(_on_subtree_element_added)
+		child_element_added.connect(_on_subtree_element_added);
 	if not child_element_removed.is_connected(_on_subtree_element_removed):
-		child_element_removed.connect(_on_subtree_element_removed)
-	refresh_subtree_tracking()
-	_propagate_units_and_parent_mu()
-	update_orbits()
+		child_element_removed.connect(_on_subtree_element_removed);
+	refresh_subtree_tracking();
+	_units_and_mu_dirty = true;
+	_has_synced_playing = false;
+	_pending_ballistic_init = true;
+	_ballistic_anchors_dirty = true;
+	_ballistic_solver.invalidate_resident_step_buffer();
+	_propagate_units_and_parent_mu();
+	update_orbits();
 
 
 ## Advances the editor-only ghost preview clock by [code]delta * editor_play_speed[/code]
@@ -630,18 +818,28 @@ func _update_editor_ghosts() -> void:
 ## Propagates [member distance_unit], [member time_unit], and parent effective gravitational
 ## parameters downward to all tracked [JrRailOrbiter] and [JrBallisticOrbiter] nodes.
 func _propagate_units_and_parent_mu() -> void:
-	set_driver_units(distance_unit, time_unit)
+	set_driver_units(distance_unit, time_unit);
 	for orbiter: JrRailOrbiter in _orbit_sequence:
-		orbiter.set_driver_units(distance_unit, time_unit)
+		orbiter.set_driver_units(distance_unit, time_unit);
+	var eff_mu_cache: Dictionary[JrOrreryElement, float] = {};
 	for orbiter: JrRailOrbiter in _orbit_sequence:
-		var parent_elem: JrOrreryElement = _children.get(orbiter, self)
-		var eff_mu: float = parent_elem.get_effective_parent_mu() if parent_elem != null else 0.0
-		orbiter.set_parent_effective_mu(eff_mu)
+		var parent_elem: JrOrreryElement = _children.get(orbiter, self);
+		var eff_mu: float = 0.0;
+		if parent_elem != null:
+			if not eff_mu_cache.has(parent_elem):
+				eff_mu_cache[parent_elem] = parent_elem.get_effective_parent_mu();
+			eff_mu = eff_mu_cache[parent_elem];
+		orbiter.set_parent_effective_mu(eff_mu);
 	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
-		ballistic.set_driver_units(distance_unit, time_unit)
-		var spawn_parent: JrOrreryElement = _resolve_ballistic_spawn_parent(ballistic)
-		var eff_mu: float = spawn_parent.get_effective_parent_mu() if spawn_parent != null else 0.0
-		ballistic.set_parent_effective_mu(eff_mu)
+		ballistic.set_driver_units(distance_unit, time_unit);
+		var spawn_parent: JrOrreryElement = _resolve_ballistic_spawn_parent(ballistic);
+		var eff_mu: float = 0.0;
+		if spawn_parent != null:
+			if not eff_mu_cache.has(spawn_parent):
+				eff_mu_cache[spawn_parent] = spawn_parent.get_effective_parent_mu();
+			eff_mu = eff_mu_cache[spawn_parent];
+		ballistic.set_parent_effective_mu(eff_mu);
+	_units_and_mu_dirty = false;
 
 
 ## Marks all tracked [JrBallisticOrbiter] forecasts as dirty when system gravity or units change.
@@ -689,255 +887,797 @@ func _evaluate_editor_system_state(playing: bool) -> void:
 ## Evaluates runtime Keplerian states and dispatches GPU Hybrid Universal-Variable
 ## Kick-Drift-Kick integration across all tracked [JrBallisticOrbiter] bodies.
 func _evaluate_runtime_system_state(playing: bool) -> void:
-	var dt: float = time - _last_stepped_time if _runtime_initialized else 0.0
-	var prev_local_positions: Dictionary[JrRailOrbiter, Vector3] = {}
+	var dt: float = time - _last_stepped_time if _runtime_initialized else 0.0;
+	var prev_local_positions: Dictionary[JrRailOrbiter, Vector3] = {};
 
 	if not _runtime_initialized:
-		_evaluate_all_orbiters_at(time, playing)
-		_initialize_pending_ballistics(playing)
-		_sync_all_ballistics_transforms(playing)
-		_runtime_initialized = true
-		_last_stepped_time = time
-		return
+		_evaluate_all_orbiters_at(time, playing);
+		if _pending_ballistic_init:
+			_initialize_pending_ballistics(playing);
+		_sync_all_ballistics_transforms(playing);
+		_runtime_initialized = true;
+		_last_stepped_time = time;
+		return;
 
-	_initialize_pending_ballistics(playing)
+	if _pending_ballistic_init:
+		_initialize_pending_ballistics(playing);
 	if not _ballistic_sequence.is_empty() and not is_zero_approx(dt):
-		prev_local_positions = _capture_orbiter_local_positions()
+		prev_local_positions = _capture_orbiter_local_positions();
 
-	_evaluate_all_orbiters_at(time, playing)
+	_evaluate_all_orbiters_at(time, playing);
 
 	if not _ballistic_sequence.is_empty() and not is_zero_approx(dt):
-		_update_ballistic_anchors_before_step()
-		var well_elements: Array[JrOrreryElement] = _build_runtime_well_elements()
+		if _ballistic_anchors_dirty:
+			_update_ballistic_anchors_before_step();
+		var well_elements: Array[JrOrreryElement] = _build_runtime_well_elements();
 		var packed_wells: PackedFloat32Array = _pack_runtime_gravity_wells(
 				well_elements,
 				prev_local_positions
-		)
-		_ballistic_solver.configure_step_context(time, tidal_cull_threshold, well_elements)
-		_ballistic_solver.step_bodies(_ballistic_sequence, packed_wells, dt, ballistic_substeps)
-		_update_ballistic_anchors_after_step()
+		);
+		_ballistic_solver.configure_step_context(time, tidal_cull_threshold, well_elements);
+		_ballistic_solver.step_bodies(_ballistic_sequence, packed_wells, dt, ballistic_substeps);
+		for f_idx: int in range(_forecast_enabled_ballistics.size()):
+			_forecast_enabled_ballistics[f_idx]._forecast_dirty = true;
+		_update_ballistic_anchors_after_step(well_elements);
 
-	_last_stepped_time = time
-	_sync_all_ballistics_transforms(playing)
+	_last_stepped_time = time;
+	_sync_all_ballistics_transforms(playing);
+
+
+## Executes [method update_orbits] while recording microsecond sub-phase timings into
+## [member _telemetry] and isolating LCA coordinate math from follower signal emission.
+func _update_orbits_instrumented() -> void:
+	var frame_t0: int = Time.get_ticks_usec();
+	_telemetry.begin_frame();
+	_updating_orbits = true;
+
+	var t_units: int = Time.get_ticks_usec();
+	if _units_and_mu_dirty:
+		_propagate_units_and_parent_mu();
+	_telemetry.add_phase_usec(
+			JrOrreryTelemetry.PHASE_UNITS_AND_MU,
+			Time.get_ticks_usec() - t_units
+	);
+
+	var playing: bool = _should_step_time();
+	_sync_playing_if_changed(playing);
+	_relative_velocity = Vector3.ZERO;
+	_global_velocity = Vector3.ZERO;
+
+	if Engine.is_editor_hint():
+		_evaluate_editor_system_state(playing);
+	else:
+		_evaluate_runtime_system_state_instrumented(playing);
+
+	var persp_basis: Basis = _apply_driver_and_rail_system_transforms_instrumented();
+
+	if not Engine.is_editor_hint():
+		_update_runtime_ballistic_forecasts_instrumented(persp_basis);
+
+	_apply_ballistic_system_transforms_instrumented(persp_basis);
+
+	if Engine.is_editor_hint():
+		_update_editor_ghosts();
+
+	_updating_orbits = false;
+	_telemetry.end_frame(Time.get_ticks_usec() - frame_t0);
+	_record_telemetry_snapshot();
+
+
+## Computes driver and [JrRailOrbiter] system transforms, recording LCA math separately from
+## [method JrOrreryElement.set_system_transform] follower signal emission.
+func _apply_driver_and_rail_system_transforms_instrumented() -> Basis:
+	var t_math0: int = Time.get_ticks_usec();
+	var persp_basis: Basis = _compute_perspective_basis();
+	var is_identity_basis: bool = (persp_basis == Basis.IDENTITY);
+	_build_perspective_offset_table();
+
+	var root_rel_pos: Vector3 = (
+			Vector3.ZERO
+			if _persp_is_heliocentric
+			else _persp_well_offsets.get(self, Vector3.ZERO)
+	);
+	var driver_origin: Vector3 = (
+			root_rel_pos if is_identity_basis else (persp_basis * root_rel_pos)
+	);
+	var driver_system_transform := Transform3D(persp_basis, driver_origin);
+	_local_orbital_transform = driver_system_transform;
+	_driver_relative_transform = Transform3D.IDENTITY;
+
+	var rail_count: int = _orbit_sequence.size();
+	var use_direct_driver_xf: bool = _persp_is_heliocentric and is_identity_basis;
+	var rail_transforms: Array[Transform3D] = [];
+	if not use_direct_driver_xf:
+		rail_transforms.resize(rail_count);
+		for i: int in range(rail_count):
+			var orbiter: JrRailOrbiter = _orbit_sequence[i];
+			var drv_xf: Transform3D = orbiter.get_driver_relative_transform();
+			var rel_pos: Vector3 = (
+					drv_xf.origin
+					if _persp_is_heliocentric
+					else _persp_well_offsets.get(orbiter, Vector3.ZERO)
+			);
+			if is_identity_basis:
+				rail_transforms[i] = Transform3D(drv_xf.basis, rel_pos);
+			else:
+				rail_transforms[i] = Transform3D(
+						persp_basis * drv_xf.basis,
+						persp_basis * rel_pos
+				);
+	var t_math1: int = Time.get_ticks_usec();
+
+	_system_transform = driver_system_transform;
+	emit_signal(&"transform_updated");
+	if use_direct_driver_xf:
+		for i: int in range(rail_count):
+			var orbiter: JrRailOrbiter = _orbit_sequence[i];
+			orbiter._system_transform = orbiter._driver_relative_transform;
+			orbiter.emit_signal(&"transform_updated");
+	else:
+		for i: int in range(rail_count):
+			var orbiter: JrRailOrbiter = _orbit_sequence[i];
+			orbiter._system_transform = rail_transforms[i];
+			orbiter.emit_signal(&"transform_updated");
+	var t_sig1: int = Time.get_ticks_usec();
+
+	_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_SYSTEM_LCA_MATH, t_math1 - t_math0);
+	_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_TRANSFORM_SIGNAL_EMIT, t_sig1 - t_math1);
+	return persp_basis;
+
+
+## Computes [JrBallisticOrbiter] system transforms, recording LCA math separately from
+## [method JrOrreryElement.set_system_transform] follower signal emission.
+func _apply_ballistic_system_transforms_instrumented(persp_basis: Basis) -> void:
+	var b_seq: Array[JrBallisticOrbiter] = _ballistic_sequence;
+	var b_count: int = b_seq.size();
+	if b_count == 0:
+		return;
+
+	var t_math0: int = Time.get_ticks_usec();
+	var is_identity_basis: bool = (persp_basis == Basis.IDENTITY);
+	var use_direct_driver_xf: bool = _persp_is_heliocentric and is_identity_basis;
+	_sync_ballistic_direct_system_xf_flag(use_direct_driver_xf);
+	var ballistic_transforms: Array[Transform3D] = [];
+	if use_direct_driver_xf:
+		for nr_idx: int in range(_non_root_sync_ballistics.size()):
+			var nr_b: JrBallisticOrbiter = _non_root_sync_ballistics[nr_idx];
+			nr_b._system_transform = nr_b._driver_relative_transform;
+	else:
+		ballistic_transforms.resize(b_count);
+		for i: int in range(b_count):
+			var ballistic: JrBallisticOrbiter = b_seq[i];
+			var rel_pos: Vector3 = _lookup_ballistic_perspective_offset(ballistic);
+			var drv_basis: Basis = ballistic._driver_relative_basis;
+			if is_identity_basis:
+				ballistic_transforms[i] = Transform3D(drv_basis, rel_pos);
+			else:
+				ballistic_transforms[i] = Transform3D(
+						persp_basis * drv_basis,
+						persp_basis * rel_pos
+				);
+	var t_math1: int = Time.get_ticks_usec();
+
+	if use_direct_driver_xf:
+		for i: int in range(b_count):
+			b_seq[i].emit_signal(&"transform_updated");
+	else:
+		for i: int in range(b_count):
+			var ballistic: JrBallisticOrbiter = b_seq[i];
+			ballistic._system_transform = ballistic_transforms[i];
+			ballistic.emit_signal(&"transform_updated");
+	var t_sig1: int = Time.get_ticks_usec();
+
+	_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_SYSTEM_LCA_MATH, t_math1 - t_math0);
+	_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_TRANSFORM_SIGNAL_EMIT, t_sig1 - t_math1);
+
+
+## Broadcasts [param use_direct_xf] downward to tracked ballistics only when perspective mode changes.
+func _sync_ballistic_direct_system_xf_flag(use_direct_xf: bool) -> void:
+	if use_direct_xf == _last_direct_system_xf_state:
+		return;
+	_last_direct_system_xf_state = use_direct_xf;
+	for i: int in range(_ballistic_sequence.size()):
+		_ballistic_sequence[i]._direct_system_xf = use_direct_xf;
+
+
+## Precomputes cancellation-free LCA offsets from [member perspective_node] for all gravity wells
+## in a single top-down pass so per-orbiter and per-ballistic lookups run in `O(1)`.
+func _build_perspective_offset_table() -> void:
+	_persp_well_offsets.clear();
+	_persp_is_heliocentric = (
+			perspective_node == null
+			or perspective_node == self
+			or not _element_parents.has(perspective_node)
+	);
+	if _persp_is_heliocentric:
+		return;
+
+	var curr_p: JrOrreryElement = perspective_node;
+	var accum_p := Vector3.ZERO;
+	while curr_p != null:
+		_persp_well_offsets[curr_p] = -accum_p;
+		if curr_p == self:
+			break;
+		accum_p += _get_element_kinematic_local_offset(curr_p);
+		curr_p = _get_element_kinematic_parent(curr_p);
+
+	var self_elem: JrOrreryElement = self;
+	var root_offset: Vector3 = _persp_well_offsets.get(self_elem, -accum_p);
+	_persp_well_offsets[self_elem] = root_offset;
+
+	for orbiter: JrRailOrbiter in _orbit_sequence:
+		var orb_elem: JrOrreryElement = orbiter;
+		if _persp_well_offsets.has(orb_elem):
+			continue;
+		var parent_elem: JrOrreryElement = _children.get(orbiter, self_elem);
+		var parent_offset: Vector3 = _persp_well_offsets.get(parent_elem, root_offset);
+		_persp_well_offsets[orb_elem] = parent_offset + orbiter.get_focus_relative_position();
+
+
+## Returns the cancellation-free LCA offset of [param ballistic] from [member perspective_node]
+## in `O(1)` using [member _persp_well_offsets].
+func _lookup_ballistic_perspective_offset(ballistic: JrBallisticOrbiter) -> Vector3:
+	if _persp_is_heliocentric:
+		return ballistic.get_driver_position();
+	if _persp_well_offsets.has(ballistic):
+		return Vector3.ZERO;
+	var kin_parent: JrOrreryElement = _get_element_kinematic_parent(ballistic);
+	var root_offset: Vector3 = _persp_well_offsets.get(self, Vector3.ZERO);
+	var parent_offset: Vector3 = _persp_well_offsets.get(kin_parent, root_offset);
+	return parent_offset + ballistic.get_anchor_relative_position();
+
+
+## Executes [method _evaluate_runtime_system_state] while recording microsecond sub-phase timings
+## into [member _telemetry].
+func _evaluate_runtime_system_state_instrumented(playing: bool) -> void:
+	var dt: float = time - _last_stepped_time if _runtime_initialized else 0.0;
+	var prev_local_positions: Dictionary[JrRailOrbiter, Vector3] = {};
+
+	if not _runtime_initialized:
+		var t_init_rail: int = Time.get_ticks_usec();
+		_evaluate_all_orbiters_at(time, playing);
+		var t_init_b: int = Time.get_ticks_usec();
+		if _pending_ballistic_init:
+			_initialize_pending_ballistics(playing);
+		var t_init_sync: int = Time.get_ticks_usec();
+		_sync_all_ballistics_transforms(playing);
+		var t_init_done: int = Time.get_ticks_usec();
+		_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_RAIL_EVAL, t_init_b - t_init_rail);
+		_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_BALLISTIC_INIT, t_init_sync - t_init_b);
+		_telemetry.add_phase_usec(
+				JrOrreryTelemetry.PHASE_BALLISTIC_TRANSFORM_SYNC,
+				t_init_done - t_init_sync
+		);
+		_runtime_initialized = true;
+		_last_stepped_time = time;
+		return;
+
+	var t0: int = Time.get_ticks_usec();
+	if _pending_ballistic_init:
+		_initialize_pending_ballistics(playing);
+	if not _ballistic_sequence.is_empty() and not is_zero_approx(dt):
+		prev_local_positions = _capture_orbiter_local_positions();
+	var t1: int = Time.get_ticks_usec();
+
+	_evaluate_all_orbiters_at(time, playing);
+	var t2: int = Time.get_ticks_usec();
+
+	_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_BALLISTIC_INIT, t1 - t0);
+	_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_RAIL_EVAL, t2 - t1);
+
+	if not _ballistic_sequence.is_empty() and not is_zero_approx(dt):
+		var t_pre0: int = Time.get_ticks_usec();
+		if _ballistic_anchors_dirty:
+			_update_ballistic_anchors_before_step();
+		var t_pack0: int = Time.get_ticks_usec();
+
+		var well_elements: Array[JrOrreryElement] = _build_runtime_well_elements();
+		var packed_wells: PackedFloat32Array = _pack_runtime_gravity_wells(
+				well_elements,
+				prev_local_positions
+		);
+		_ballistic_solver.configure_step_context(time, tidal_cull_threshold, well_elements);
+		var t_step0: int = Time.get_ticks_usec();
+
+		_ballistic_solver.step_bodies(_ballistic_sequence, packed_wells, dt, ballistic_substeps);
+		for f_idx: int in range(_forecast_enabled_ballistics.size()):
+			_forecast_enabled_ballistics[f_idx]._forecast_dirty = true;
+		var t_post0: int = Time.get_ticks_usec();
+
+		_update_ballistic_anchors_after_step(well_elements);
+		var t_post1: int = Time.get_ticks_usec();
+
+		_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_BALLISTIC_ANCHOR_PRE, t_pack0 - t_pre0);
+		_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_BALLISTIC_WELL_PACK, t_step0 - t_pack0);
+		_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_BALLISTIC_ANCHOR_POST, t_post1 - t_post0);
+
+	_last_stepped_time = time;
+	var t_sync0: int = Time.get_ticks_usec();
+	_sync_all_ballistics_transforms(playing);
+	_telemetry.add_phase_usec(
+			JrOrreryTelemetry.PHASE_BALLISTIC_TRANSFORM_SYNC,
+			Time.get_ticks_usec() - t_sync0
+	);
+
+
+## Populates diagnostic entity counts and GPU flags on [member _telemetry] outside frame timing.
+func _record_telemetry_snapshot() -> void:
+	var on_rails_count: int = 0;
+	var unpinned_count: int = 0;
+	var forecast_targets: Array[JrBallisticOrbiter] = [];
+	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
+		if ballistic.is_on_rails():
+			on_rails_count += 1;
+		if ballistic.pinned_anchor == null:
+			unpinned_count += 1;
+		if enable_ballistic_forecasts and ballistic.runtime_forecast_enabled:
+			forecast_targets.append(ballistic);
+
+	var valid_well_count: int = 1;
+	for orbiter: JrRailOrbiter in _orbit_sequence:
+		if orbiter.is_orbit_valid():
+			valid_well_count += 1;
+
+	var step_uses_gpu: bool = (
+			_ballistic_solver.is_gpu_active()
+			and _ballistic_sequence.size() >= JrBallisticComputeSolver.MIN_GPU_STEP_BODIES
+	);
+	var forecast_uses_gpu: bool = _ballistic_solver.should_use_gpu_for_forecast(
+			forecast_targets,
+			valid_well_count
+	);
+	_telemetry.record_body_counts(
+			_orbit_sequence.size(),
+			_ballistic_sequence.size(),
+			on_rails_count,
+			unpinned_count
+	);
+	_telemetry.record_solver_state(
+			valid_well_count,
+			forecast_targets.size(),
+			step_uses_gpu,
+			forecast_uses_gpu
+	);
+
+
+## Broadcasts [param playing] to tracked descendants only when the playing state or hierarchy changed.
+func _sync_playing_if_changed(playing: bool) -> void:
+	set_simulation_playing(playing);
+	if _has_synced_playing and _last_synced_playing == playing:
+		return;
+	for orbiter: JrRailOrbiter in _orbit_sequence:
+		orbiter.set_simulation_playing(playing);
+	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
+		ballistic.set_simulation_playing(playing);
+	_last_synced_playing = playing;
+	_has_synced_playing = true;
 
 
 ## Evaluates all tracked [JrRailOrbiter] nodes in [member _orbit_sequence] at [param eval_time].
-func _evaluate_all_orbiters_at(eval_time: float, playing: bool) -> void:
+func _evaluate_all_orbiters_at(eval_time: float, _playing: bool) -> void:
 	for orbiter: JrRailOrbiter in _orbit_sequence:
-		var parent_xf: Transform3D = _get_parent_driver_transform_for(orbiter)
-		var parent_vel: Vector3 = _get_parent_global_velocity_for(orbiter)
-		orbiter.set_simulation_playing(playing)
-		orbiter.evaluate_orbital_state(eval_time, _reference_plane, parent_xf, parent_vel)
+		var parent_elem: JrOrreryElement = _children.get(orbiter, self);
+		if parent_elem == null or parent_elem == self:
+			orbiter.evaluate_orbital_state(
+					eval_time,
+					_reference_plane,
+					Transform3D.IDENTITY,
+					Vector3.ZERO
+			);
+		else:
+			orbiter.evaluate_orbital_state(
+					eval_time,
+					_reference_plane,
+					parent_elem.get_driver_relative_transform(),
+					parent_elem.get_global_velocity()
+			);
 
 
 ## Initializes any [JrBallisticOrbiter] nodes that were newly added or requested a state reset.
 func _initialize_pending_ballistics(playing: bool) -> void:
 	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
-		ballistic.set_simulation_playing(playing)
 		if not ballistic.is_runtime_state_ready():
-			_initialize_single_ballistic(ballistic, playing)
+			_initialize_single_ballistic(ballistic, playing);
+	_pending_ballistic_init = false;
 
 
 ## Initializes a single [param ballistic] body relative to its spawn parent and initial anchor.
 func _initialize_single_ballistic(ballistic: JrBallisticOrbiter, playing: bool) -> void:
-	ballistic.set_simulation_playing(playing)
-	var spawn_parent: JrOrreryElement = _resolve_ballistic_spawn_parent(ballistic)
-	var spawn_xf: Transform3D = _get_element_driver_transform(spawn_parent)
-	var spawn_vel: Vector3 = _get_element_global_velocity(spawn_parent)
-	var init_anchor: JrOrreryElement = spawn_parent
+	ballistic.set_simulation_playing(playing);
+	var spawn_parent: JrOrreryElement = _resolve_ballistic_spawn_parent(ballistic);
+	var spawn_xf: Transform3D = _get_element_driver_transform(spawn_parent);
+	var spawn_vel: Vector3 = _get_element_global_velocity(spawn_parent);
+	var init_anchor: JrOrreryElement = spawn_parent;
 	if ballistic.pinned_anchor != null and _is_tracked_or_self(ballistic.pinned_anchor):
-		init_anchor = ballistic.pinned_anchor
-	ballistic.initialize_from_parent(spawn_xf, spawn_vel, _reference_plane, init_anchor)
+		init_anchor = ballistic.pinned_anchor;
+	ballistic.initialize_from_parent(spawn_xf, spawn_vel, _reference_plane, init_anchor);
 	if init_anchor != spawn_parent:
 		var spawn_to_anchor_pos: Vector3 = _compute_lca_position_difference(
 				init_anchor,
 				spawn_parent
-		)
+		);
 		var spawn_to_anchor_vel: Vector3 = _compute_lca_velocity_difference(
 				init_anchor,
 				spawn_parent
-		)
+		);
 		ballistic.apply_integrated_anchor_state(
 				ballistic.get_anchor_relative_position() - spawn_to_anchor_pos,
 				ballistic.get_anchor_relative_velocity() - spawn_to_anchor_vel
-		)
+		);
 
 
-## Synchronizes transforms on all tracked [JrBallisticOrbiter] nodes using LCA offsets.
-func _sync_all_ballistics_transforms(playing: bool) -> void:
-	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
-		ballistic.set_simulation_playing(playing)
-		_sync_single_ballistic_transforms(ballistic)
+## Synchronizes transforms on all non-root-fast [JrBallisticOrbiter] nodes in `O(K)` and
+## graduates root-parent/root-anchor bodies to lazy [member JrBallisticOrbiter._fast_root_sync_ready].
+func _sync_all_ballistics_transforms(_playing: bool) -> void:
+	var nr_count: int = _non_root_sync_ballistics.size();
+	if nr_count == 0:
+		return;
+
+	var self_elem: JrOrreryElement = self;
+	var write_idx: int = 0;
+
+	for r: int in range(nr_count):
+		var ballistic: JrBallisticOrbiter = _non_root_sync_ballistics[r];
+		if not is_instance_valid(ballistic) or ballistic._owning_driver != self_elem:
+			if is_instance_valid(ballistic):
+				ballistic._in_non_root_sync_list = false;
+			continue;
+
+		var scene_parent: JrOrreryElement = ballistic._tracked_scene_parent;
+		if (
+				(scene_parent != self_elem and scene_parent != null)
+				or ballistic._driver_basis_dirty
+				or not ballistic._parent_basis_is_identity
+		):
+			_sync_single_ballistic_transforms(ballistic);
+			ballistic._in_non_root_sync_list = true;
+			_non_root_sync_ballistics[write_idx] = ballistic;
+			write_idx += 1;
+			continue;
+
+		var anchor: JrOrreryElement = ballistic._anchor_element;
+		if anchor != null and anchor != self_elem and anchor._owning_driver == self_elem:
+			var anchor_pos: Vector3 = anchor.get_driver_relative_transform().origin;
+			var anchor_vel: Vector3 = anchor.get_global_velocity();
+			var pos: Vector3 = anchor_pos + ballistic._anchor_relative_position;
+			var vel: Vector3 = anchor_vel + ballistic._anchor_relative_velocity;
+			ballistic._last_parent_origin = Vector3.ZERO;
+			ballistic._last_parent_velocity = Vector3.ZERO;
+			ballistic._anchor_to_parent_offset = anchor_pos;
+			ballistic._anchor_to_parent_velocity = anchor_vel;
+			ballistic._last_anchor_origin = anchor_pos;
+			ballistic._last_anchor_velocity = anchor_vel;
+			ballistic._root_zero_offsets_cached = false;
+			var xf := Transform3D(ballistic._driver_relative_basis, pos);
+			ballistic._focus_relative_position = pos;
+			ballistic._relative_velocity = vel;
+			ballistic._global_velocity = vel;
+			ballistic._local_orbital_transform = xf;
+			ballistic._driver_relative_transform = xf;
+			ballistic._in_non_root_sync_list = true;
+			_non_root_sync_ballistics[write_idx] = ballistic;
+			write_idx += 1;
+		else:
+			if not ballistic._root_zero_offsets_cached:
+				ballistic._last_parent_origin = Vector3.ZERO;
+				ballistic._last_parent_velocity = Vector3.ZERO;
+				ballistic._anchor_to_parent_offset = Vector3.ZERO;
+				ballistic._anchor_to_parent_velocity = Vector3.ZERO;
+				ballistic._last_anchor_origin = Vector3.ZERO;
+				ballistic._last_anchor_velocity = Vector3.ZERO;
+				ballistic._root_zero_offsets_cached = true;
+			ballistic._in_non_root_sync_list = false;
+			ballistic._fast_root_sync_ready = true;
+
+	if write_idx != nr_count:
+		_non_root_sync_ballistics.resize(write_idx);
 
 
 ## Synchronizes a single [param ballistic] node's transforms with its anchor and scene parent.
 func _sync_single_ballistic_transforms(ballistic: JrBallisticOrbiter) -> void:
-	var scene_parent: JrOrreryElement = _element_parents.get(ballistic, self)
-	var parent_xf: Transform3D = _get_element_driver_transform(scene_parent)
-	var parent_vel: Vector3 = _get_element_global_velocity(scene_parent)
-	var anchor: JrOrreryElement = ballistic.get_anchor_element()
-	if anchor == null or not _is_tracked_or_self(anchor):
-		anchor = scene_parent
-	var anchor_to_parent_pos: Vector3 = _compute_lca_position_difference(anchor, scene_parent)
-	var anchor_to_parent_vel: Vector3 = _compute_lca_velocity_difference(anchor, scene_parent)
+	var scene_parent: JrOrreryElement = ballistic._tracked_scene_parent;
+	if scene_parent == null or scene_parent._owning_driver != self:
+		scene_parent = self;
+	var anchor: JrOrreryElement = ballistic._anchor_element;
+	if anchor == null or anchor._owning_driver != self:
+		anchor = scene_parent;
+
+	if scene_parent == null or scene_parent == self:
+		if anchor == null or anchor == self:
+			ballistic.sync_transforms_with_anchor_and_parent(
+					Transform3D.IDENTITY,
+					Vector3.ZERO,
+					Vector3.ZERO,
+					Vector3.ZERO
+			);
+		else:
+			ballistic.sync_transforms_with_anchor_and_parent(
+					Transform3D.IDENTITY,
+					Vector3.ZERO,
+					anchor.get_driver_relative_transform().origin,
+					anchor.get_global_velocity()
+			);
+		return;
+
+	var parent_xf: Transform3D = scene_parent.get_driver_relative_transform();
+	var parent_vel: Vector3 = scene_parent.get_global_velocity();
+	if anchor == scene_parent:
+		ballistic.sync_transforms_with_anchor_and_parent(
+				parent_xf,
+				parent_vel,
+				Vector3.ZERO,
+				Vector3.ZERO
+		);
+		return;
+
+	var anchor_to_parent_pos: Vector3 = _compute_lca_position_difference(anchor, scene_parent);
+	var anchor_to_parent_vel: Vector3 = _compute_lca_velocity_difference(anchor, scene_parent);
 	ballistic.sync_transforms_with_anchor_and_parent(
 			parent_xf,
 			parent_vel,
 			anchor_to_parent_pos,
 			anchor_to_parent_vel
-	)
+	);
 
 
 ## Records the current parent-local orbital offset of each [JrRailOrbiter] prior to stepping.
 func _capture_orbiter_local_positions() -> Dictionary[JrRailOrbiter, Vector3]:
-	var positions: Dictionary[JrRailOrbiter, Vector3] = {}
+	var positions: Dictionary[JrRailOrbiter, Vector3] = {};
 	for orbiter: JrRailOrbiter in _orbit_sequence:
 		if orbiter.is_orbit_valid():
-			positions[orbiter] = orbiter.get_focus_relative_position()
-	return positions
+			positions[orbiter] = orbiter.get_focus_relative_position();
+	return positions;
 
 
 ## Builds the ordered list of gravity-well [JrOrreryElement] nodes (index 0 = driver,
 ## followed by all valid [JrRailOrbiter] nodes in topological parent-before-child order).
 func _build_runtime_well_elements() -> Array[JrOrreryElement]:
-	var wells: Array[JrOrreryElement] = [self]
+	_runtime_well_index = 0;
+	var wells: Array[JrOrreryElement] = [self];
 	for orbiter: JrRailOrbiter in _orbit_sequence:
 		if orbiter.is_orbit_valid():
-			wells.append(orbiter)
-	return wells
+			orbiter._runtime_well_index = wells.size();
+			wells.append(orbiter);
+		else:
+			orbiter._runtime_well_index = -1;
+	return wells;
 
 
 ## Packs start-of-step and end-of-step parent-local positions, gravitational parameters,
-## and parent well indices for all elements in [param well_elements].
+## parent well indices, and Hill-sphere entry/exit squared radii for all [param well_elements].
 func _pack_runtime_gravity_wells(
 		well_elements: Array[JrOrreryElement],
 		prev_local_positions: Dictionary[JrRailOrbiter, Vector3]
 ) -> PackedFloat32Array:
-	var packed: PackedFloat32Array = []
-	var well_index_map: Dictionary[JrOrreryElement, int] = {}
-	for i: int in range(well_elements.size()):
-		well_index_map[well_elements[i]] = i
+	var w_count: int = well_elements.size();
+	var packed := PackedFloat32Array();
+	packed.resize(w_count * JrBallisticComputeSolver.FLOATS_PER_WELL);
 
-	_append_well_floats(packed, Vector3.ZERO, Vector3.ZERO, Vector2(_gravity_strength, -1.0))
+	var eff_mu_by_idx := PackedFloat32Array();
+	eff_mu_by_idx.resize(w_count);
+	eff_mu_by_idx[0] = get_effective_parent_mu();
 
-	for i: int in range(1, well_elements.size()):
-		var orbiter := well_elements[i] as JrRailOrbiter
-		var mu: float = orbiter.get_gravity_strength()
-		var end_local: Vector3 = orbiter.get_focus_relative_position()
-		var start_local: Vector3 = prev_local_positions.get(orbiter, end_local)
-		var parent_elem: JrOrreryElement = _children.get(orbiter, self)
-		var parent_idx: int = well_index_map.get(parent_elem, 0)
-		_append_well_floats(packed, start_local, end_local, Vector2(mu, float(parent_idx)))
+	packed[3] = _gravity_strength;
+	packed[7] = -1.0;
 
-	return packed
+	var self_elem: JrOrreryElement = self;
+	for i: int in range(1, w_count):
+		var orbiter := well_elements[i] as JrRailOrbiter;
+		eff_mu_by_idx[i] = orbiter.get_effective_parent_mu();
+		var mu: float = orbiter.get_gravity_strength();
+		var end_local: Vector3 = orbiter.get_focus_relative_position();
+		var start_local: Vector3 = prev_local_positions.get(orbiter, end_local);
+		var parent_elem: JrOrreryElement = _children.get(orbiter, self_elem);
+		var parent_idx: int = (
+				parent_elem._runtime_well_index
+				if (parent_elem != null and parent_elem._runtime_well_index >= 0)
+				else 0
+		);
 
+		var entry_sq: float = 0.0;
+		var exit_sq: float = 0.0;
+		var can_exit: float = 0.0;
+		var mu_parent: float = eff_mu_by_idx[parent_idx];
+		if mu > 0.0 and mu_parent > 0.0:
+			var d_len: float = end_local.length();
+			var r_hill: float = d_len * pow(mu / (3.0 * mu_parent), 1.0 / 3.0);
+			var exit_r: float = HILL_EXIT_MULTIPLIER * r_hill;
+			exit_sq = exit_r * exit_r;
+			can_exit = 1.0;
+			if d_len > 1e-6:
+				var entry_r: float = HILL_ENTRY_MULTIPLIER * r_hill;
+				entry_sq = entry_r * entry_r;
 
-## Appends a single 8-float tree-relative [code]GravityWell[/code] record into [param packed].
-func _append_well_floats(
-		packed: PackedFloat32Array,
-		start_local: Vector3,
-		end_local: Vector3,
-		mu_and_parent: Vector2
-) -> void:
-	packed.append(start_local.x)
-	packed.append(start_local.y)
-	packed.append(start_local.z)
-	packed.append(mu_and_parent.x)
-	packed.append(end_local.x)
-	packed.append(end_local.y)
-	packed.append(end_local.z)
-	packed.append(mu_and_parent.y)
+		var base: int = i * JrBallisticComputeSolver.FLOATS_PER_WELL;
+		packed[base + 0] = start_local.x;
+		packed[base + 1] = start_local.y;
+		packed[base + 2] = start_local.z;
+		packed[base + 3] = mu;
+		packed[base + 4] = end_local.x;
+		packed[base + 5] = end_local.y;
+		packed[base + 6] = end_local.z;
+		packed[base + 7] = float(parent_idx);
+		packed[base + 8] = entry_sq;
+		packed[base + 9] = exit_sq;
+		packed[base + 10] = can_exit;
+		packed[base + 11] = 0.0;
+
+	return packed;
 
 
 ## Synchronizes any pinned anchor assignments before stepping [member _ballistic_sequence].
 func _update_ballistic_anchors_before_step() -> void:
+	var self_elem: JrOrreryElement = self;
 	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
-		var curr_anchor: JrOrreryElement = ballistic.get_anchor_element()
-		if curr_anchor == null or not _is_tracked_or_self(curr_anchor):
-			curr_anchor = _resolve_ballistic_spawn_parent(ballistic)
-			var spawn_p: JrOrreryElement = _element_parents.get(ballistic, self)
-			var diff_pos: Vector3 = _compute_lca_position_difference(curr_anchor, spawn_p)
-			var diff_vel: Vector3 = _compute_lca_velocity_difference(curr_anchor, spawn_p)
-			ballistic.switch_anchor_element(curr_anchor, diff_pos, diff_vel)
+		var curr_anchor: JrOrreryElement = ballistic._anchor_element;
+		var anchor_valid: bool = curr_anchor != null and curr_anchor._owning_driver == self_elem;
+		if not anchor_valid:
+			curr_anchor = _resolve_ballistic_spawn_parent(ballistic);
+			var spawn_p: JrOrreryElement = ballistic._tracked_scene_parent;
+			if spawn_p == null or spawn_p._owning_driver != self_elem:
+				spawn_p = self_elem;
+			var diff_pos: Vector3 = _compute_lca_position_difference(curr_anchor, spawn_p);
+			var diff_vel: Vector3 = _compute_lca_velocity_difference(curr_anchor, spawn_p);
+			ballistic.switch_anchor_element(curr_anchor, diff_pos, diff_vel);
 
-		if ballistic.pinned_anchor != null and _is_tracked_or_self(ballistic.pinned_anchor):
-			if ballistic.get_anchor_element() != ballistic.pinned_anchor:
-				var old_anchor: JrOrreryElement = ballistic.get_anchor_element()
-				var old_to_new_pos: Vector3 = _compute_lca_position_difference(
-						ballistic.pinned_anchor,
-						old_anchor
-				)
-				var old_to_new_vel: Vector3 = _compute_lca_velocity_difference(
-						ballistic.pinned_anchor,
-						old_anchor
-				)
-				ballistic.switch_anchor_element(
-						ballistic.pinned_anchor,
-						old_to_new_pos,
-						old_to_new_vel
-				)
+		var pinned: JrOrreryElement = ballistic.pinned_anchor;
+		if pinned == null or pinned == curr_anchor:
+			continue;
+		if pinned._owning_driver == self_elem:
+			var old_to_new_pos: Vector3 = _compute_lca_position_difference(pinned, curr_anchor);
+			var old_to_new_vel: Vector3 = _compute_lca_velocity_difference(pinned, curr_anchor);
+			ballistic.switch_anchor_element(pinned, old_to_new_pos, old_to_new_vel);
+	_ballistic_anchors_dirty = false;
 
 
-## Evaluates Hill-sphere hysteresis (`2.4x` entry / `2.6x` exit) after stepping
+## Evaluates Hill-sphere hysteresis (`0.98x` entry / `1.05x` exit) after stepping
 ## for all unpinned [JrBallisticOrbiter] nodes.
-func _update_ballistic_anchors_after_step() -> void:
+func _update_ballistic_anchors_after_step(well_elements: Array[JrOrreryElement]) -> void:
+	if _orbit_sequence.is_empty() or _ballistic_sequence.is_empty():
+		return;
+	if (
+			_ballistic_solver.has_gpu_step_handoffs()
+			and well_elements.size() == _orbit_sequence.size() + 1
+	):
+		_apply_gpu_step_handoffs(well_elements);
+		return;
+
+	var tables_built: bool = false;
 	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
 		if ballistic.pinned_anchor != null:
-			continue
-		_evaluate_hill_sphere_handoff_for(ballistic)
+			continue;
+		if not tables_built:
+			_build_step_hill_handoff_tables();
+			tables_built = true;
+		_evaluate_hill_sphere_handoff_fast(ballistic);
 
 
-## Evaluates whether [param ballistic] should enter a direct child well of its current
-## anchor (`< 2.4 * r_Hill`) or exit to its current anchor's parent well (`> 2.6 * r_Hill`).
-func _evaluate_hill_sphere_handoff_for(ballistic: JrBallisticOrbiter) -> void:
-	var curr_anchor: JrOrreryElement = ballistic.get_anchor_element()
+## Applies only the sparse Hill-sphere anchor transitions reported by the GPU stepping shader.
+func _apply_gpu_step_handoffs(well_elements: Array[JrOrreryElement]) -> void:
+	var body_indices: PackedInt32Array = _ballistic_solver.get_gpu_handoff_body_indices();
+	if body_indices.is_empty():
+		return;
+	var target_wells: PackedInt32Array = _ballistic_solver.get_gpu_handoff_target_wells();
+	var well_count: int = well_elements.size();
+	var b_count: int = _ballistic_sequence.size();
+	var self_elem: JrOrreryElement = self;
+
+	for h: int in range(body_indices.size()):
+		var b_idx: int = body_indices[h];
+		var w_idx: int = target_wells[h];
+		if b_idx < 0 or b_idx >= b_count or w_idx < 0 or w_idx >= well_count:
+			continue;
+		var ballistic: JrBallisticOrbiter = _ballistic_sequence[b_idx];
+		if ballistic.pinned_anchor != null:
+			continue;
+		var curr_anchor: JrOrreryElement = ballistic.get_anchor_element();
+		var target_anchor: JrOrreryElement = well_elements[w_idx];
+		if curr_anchor == null or target_anchor == null or curr_anchor == target_anchor:
+			continue;
+
+		if target_anchor is JrRailOrbiter and _children.get(target_anchor as JrRailOrbiter, self_elem) == curr_anchor:
+			var child_orb := target_anchor as JrRailOrbiter;
+			ballistic.switch_anchor_element(
+					child_orb,
+					child_orb.get_focus_relative_position(),
+					child_orb.get_relative_velocity()
+			);
+		elif curr_anchor is JrRailOrbiter and _children.get(curr_anchor as JrRailOrbiter, self_elem) == target_anchor:
+			var parent_orb := curr_anchor as JrRailOrbiter;
+			ballistic.switch_anchor_element(
+					target_anchor,
+					-parent_orb.get_focus_relative_position(),
+					-parent_orb.get_relative_velocity()
+			);
+		else:
+			ballistic.switch_anchor_element(
+					target_anchor,
+					_compute_lca_position_difference(target_anchor, curr_anchor),
+					_compute_lca_velocity_difference(target_anchor, curr_anchor)
+			);
+
+
+## Precomputes squared Hill-sphere entry/exit radii and massive child lookup lists once per step.
+func _build_step_hill_handoff_tables() -> void:
+	_hill_children_by_parent.clear();
+	_hill_orbiter_offset.clear();
+	_hill_orbiter_entry_sq.clear();
+	_hill_orbiter_exit_sq.clear();
+	_hill_orbiter_can_exit.clear();
+
+	var eff_mu_map: Dictionary[JrOrreryElement, float] = {};
+	var self_elem: JrOrreryElement = self;
+	eff_mu_map[self_elem] = get_effective_parent_mu();
+
+	for orbiter: JrRailOrbiter in _orbit_sequence:
+		var mu_orb: float = orbiter.get_gravity_strength();
+		if mu_orb <= 0.0:
+			continue;
+		var parent_elem: JrOrreryElement = _children.get(orbiter, self);
+		if parent_elem == null:
+			continue;
+		if not eff_mu_map.has(parent_elem):
+			eff_mu_map[parent_elem] = parent_elem.get_effective_parent_mu();
+		var mu_parent: float = eff_mu_map[parent_elem];
+		if mu_parent <= 0.0:
+			continue;
+
+		var offset: Vector3 = orbiter.get_focus_relative_position();
+		var d_len: float = offset.length();
+		var r_hill: float = d_len * pow(mu_orb / (3.0 * mu_parent), 1.0 / 3.0);
+		var exit_r: float = HILL_EXIT_MULTIPLIER * r_hill;
+		_hill_orbiter_offset[orbiter] = offset;
+		_hill_orbiter_exit_sq[orbiter] = exit_r * exit_r;
+		_hill_orbiter_can_exit[orbiter] = true;
+
+		if not orbiter.is_orbit_valid() or d_len <= 1e-6:
+			continue;
+		var entry_r: float = HILL_ENTRY_MULTIPLIER * r_hill;
+		_hill_orbiter_entry_sq[orbiter] = entry_r * entry_r;
+		if not _hill_children_by_parent.has(parent_elem):
+			var child_arr: Array[JrRailOrbiter] = [];
+			_hill_children_by_parent[parent_elem] = child_arr;
+		var children_list: Array = _hill_children_by_parent[parent_elem];
+		children_list.append(orbiter);
+
+
+## Evaluates whether [param ballistic] should enter a direct massive child well of its current
+## anchor (`< 2.4 * r_Hill`) or exit to its current anchor's parent well (`> 2.6 * r_Hill`)
+## using precomputed squared radii.
+func _evaluate_hill_sphere_handoff_fast(ballistic: JrBallisticOrbiter) -> void:
+	var curr_anchor: JrOrreryElement = ballistic.get_anchor_element();
 	if curr_anchor == null or not _is_tracked_or_self(curr_anchor):
-		return
+		return;
 
-	var r_rel: Vector3 = ballistic.get_anchor_relative_position()
-	var mu_curr_effective: float = curr_anchor.get_effective_parent_mu()
-
-	if mu_curr_effective > 0.0:
-		var best_child: JrRailOrbiter = null
-		var best_dist: float = INF
-		for orbiter: JrRailOrbiter in _orbit_sequence:
-			if _children.get(orbiter, self) != curr_anchor:
-				continue
-			var mu_child: float = orbiter.get_gravity_strength()
-			if mu_child <= 0.0 or not orbiter.is_orbit_valid():
-				continue
-			var child_offset: Vector3 = orbiter.get_focus_relative_position()
-			var d_len: float = child_offset.length()
-			if d_len <= 1e-6:
-				continue
-			var r_hill: float = d_len * pow(mu_child / (3.0 * mu_curr_effective), 1.0 / 3.0)
-			var dist_to_child: float = (r_rel - child_offset).length()
-			if dist_to_child < HILL_ENTRY_MULTIPLIER * r_hill and dist_to_child < best_dist:
-				best_dist = dist_to_child
-				best_child = orbiter
-
+	var r_rel: Vector3 = ballistic.get_anchor_relative_position();
+	if _hill_children_by_parent.has(curr_anchor):
+		var child_list: Array = _hill_children_by_parent[curr_anchor];
+		var best_child: JrRailOrbiter = null;
+		var best_dist_sq: float = INF;
+		for i: int in range(child_list.size()):
+			var orbiter := child_list[i] as JrRailOrbiter;
+			var child_offset: Vector3 = _hill_orbiter_offset[orbiter];
+			var dist_sq: float = (r_rel - child_offset).length_squared();
+			if dist_sq < _hill_orbiter_entry_sq[orbiter] and dist_sq < best_dist_sq:
+				best_dist_sq = dist_sq;
+				best_child = orbiter;
 		if best_child != null:
-			var old_to_new_pos: Vector3 = best_child.get_focus_relative_position()
-			var old_to_new_vel: Vector3 = best_child.get_relative_velocity()
-			ballistic.switch_anchor_element(best_child, old_to_new_pos, old_to_new_vel)
-			return
+			var old_to_new_pos: Vector3 = _hill_orbiter_offset[best_child];
+			var old_to_new_vel: Vector3 = best_child.get_relative_velocity();
+			ballistic.switch_anchor_element(best_child, old_to_new_pos, old_to_new_vel);
+			return;
 
 	if curr_anchor is JrRailOrbiter:
-		var anchor_orb := curr_anchor as JrRailOrbiter
-		var parent_anchor: JrOrreryElement = _children.get(anchor_orb, self)
-		if parent_anchor == null:
-			return
-		var mu_parent: float = parent_anchor.get_effective_parent_mu()
-		var mu_curr: float = anchor_orb.get_gravity_strength()
-		if mu_parent <= 0.0 or mu_curr <= 0.0:
-			return
-		var anchor_offset: Vector3 = anchor_orb.get_focus_relative_position()
-		var d_len: float = anchor_offset.length()
-		var r_hill: float = d_len * pow(mu_curr / (3.0 * mu_parent), 1.0 / 3.0)
-		if r_rel.length() > HILL_EXIT_MULTIPLIER * r_hill:
-			var old_to_new_pos: Vector3 = -anchor_offset
-			var old_to_new_vel: Vector3 = -anchor_orb.get_relative_velocity()
-			ballistic.switch_anchor_element(parent_anchor, old_to_new_pos, old_to_new_vel)
+		var anchor_orb := curr_anchor as JrRailOrbiter;
+		if not _hill_orbiter_can_exit.get(anchor_orb, false):
+			return;
+		if r_rel.length_squared() > _hill_orbiter_exit_sq[anchor_orb]:
+			var parent_anchor: JrOrreryElement = _children.get(anchor_orb, self);
+			if parent_anchor == null:
+				return;
+			var anchor_offset: Vector3 = _hill_orbiter_offset[anchor_orb];
+			var old_to_new_vel: Vector3 = -anchor_orb.get_relative_velocity();
+			ballistic.switch_anchor_element(parent_anchor, -anchor_offset, old_to_new_vel);
 
 
 ## Computes the exact position difference [code]r_a - r_b[/code] between [param elem_a]
@@ -948,36 +1688,55 @@ func _compute_lca_position_difference(elem_a: JrOrreryElement, elem_b: JrOrreryE
 			elem_a
 			if (elem_a != null and _is_tracked_or_self(elem_a))
 			else self
-	)
+	);
 	var target_b: JrOrreryElement = (
 			elem_b
 			if (elem_b != null and _is_tracked_or_self(elem_b))
 			else self
-	)
+	);
 	if target_a == target_b:
-		return Vector3.ZERO
+		return Vector3.ZERO;
 
-	var b_ancestors: Dictionary[JrOrreryElement, Vector3] = {}
-	var curr_b: JrOrreryElement = target_b
-	var accum_b := Vector3.ZERO
+	if target_b == self:
+		var curr_only_a: JrOrreryElement = target_a;
+		var accum_only_a := Vector3.ZERO;
+		while curr_only_a != null and curr_only_a != self:
+			accum_only_a += _get_element_kinematic_local_offset(curr_only_a);
+			curr_only_a = _get_element_kinematic_parent(curr_only_a);
+		return accum_only_a;
+
+	if target_a == self:
+		var curr_only_b: JrOrreryElement = target_b;
+		var accum_only_b := Vector3.ZERO;
+		while curr_only_b != null and curr_only_b != self:
+			accum_only_b += _get_element_kinematic_local_offset(curr_only_b);
+			curr_only_b = _get_element_kinematic_parent(curr_only_b);
+		return -accum_only_b;
+
+	_lca_b_elems.clear();
+	_lca_b_vecs.clear();
+	var curr_b: JrOrreryElement = target_b;
+	var accum_b := Vector3.ZERO;
 	while curr_b != null:
-		b_ancestors[curr_b] = accum_b
+		_lca_b_elems.append(curr_b);
+		_lca_b_vecs.append(accum_b);
 		if curr_b == self:
-			break
-		accum_b += _get_element_kinematic_local_offset(curr_b)
-		curr_b = _get_element_kinematic_parent(curr_b)
+			break;
+		accum_b += _get_element_kinematic_local_offset(curr_b);
+		curr_b = _get_element_kinematic_parent(curr_b);
 
-	var curr_a: JrOrreryElement = target_a
-	var accum_a := Vector3.ZERO
+	var curr_a: JrOrreryElement = target_a;
+	var accum_a := Vector3.ZERO;
 	while curr_a != null:
-		if b_ancestors.has(curr_a):
-			return accum_a - b_ancestors[curr_a]
+		var match_idx: int = _lca_b_elems.find(curr_a);
+		if match_idx >= 0:
+			return accum_a - _lca_b_vecs[match_idx];
 		if curr_a == self:
-			break
-		accum_a += _get_element_kinematic_local_offset(curr_a)
-		curr_a = _get_element_kinematic_parent(curr_a)
+			break;
+		accum_a += _get_element_kinematic_local_offset(curr_a);
+		curr_a = _get_element_kinematic_parent(curr_a);
 
-	return accum_a - accum_b
+	return accum_a - accum_b;
 
 
 ## Computes the exact velocity difference [code]v_a - v_b[/code] between [param elem_a]
@@ -987,36 +1746,55 @@ func _compute_lca_velocity_difference(elem_a: JrOrreryElement, elem_b: JrOrreryE
 			elem_a
 			if (elem_a != null and _is_tracked_or_self(elem_a))
 			else self
-	)
+	);
 	var target_b: JrOrreryElement = (
 			elem_b
 			if (elem_b != null and _is_tracked_or_self(elem_b))
 			else self
-	)
+	);
 	if target_a == target_b:
-		return Vector3.ZERO
+		return Vector3.ZERO;
 
-	var b_ancestors: Dictionary[JrOrreryElement, Vector3] = {}
-	var curr_b: JrOrreryElement = target_b
-	var accum_b := Vector3.ZERO
+	if target_b == self:
+		var curr_only_a: JrOrreryElement = target_a;
+		var accum_only_a := Vector3.ZERO;
+		while curr_only_a != null and curr_only_a != self:
+			accum_only_a += _get_element_kinematic_local_velocity(curr_only_a);
+			curr_only_a = _get_element_kinematic_parent(curr_only_a);
+		return accum_only_a;
+
+	if target_a == self:
+		var curr_only_b: JrOrreryElement = target_b;
+		var accum_only_b := Vector3.ZERO;
+		while curr_only_b != null and curr_only_b != self:
+			accum_only_b += _get_element_kinematic_local_velocity(curr_only_b);
+			curr_only_b = _get_element_kinematic_parent(curr_only_b);
+		return -accum_only_b;
+
+	_lca_b_elems.clear();
+	_lca_b_vecs.clear();
+	var curr_b: JrOrreryElement = target_b;
+	var accum_b := Vector3.ZERO;
 	while curr_b != null:
-		b_ancestors[curr_b] = accum_b
+		_lca_b_elems.append(curr_b);
+		_lca_b_vecs.append(accum_b);
 		if curr_b == self:
-			break
-		accum_b += _get_element_kinematic_local_velocity(curr_b)
-		curr_b = _get_element_kinematic_parent(curr_b)
+			break;
+		accum_b += _get_element_kinematic_local_velocity(curr_b);
+		curr_b = _get_element_kinematic_parent(curr_b);
 
-	var curr_a: JrOrreryElement = target_a
-	var accum_a := Vector3.ZERO
+	var curr_a: JrOrreryElement = target_a;
+	var accum_a := Vector3.ZERO;
 	while curr_a != null:
-		if b_ancestors.has(curr_a):
-			return accum_a - b_ancestors[curr_a]
+		var match_idx: int = _lca_b_elems.find(curr_a);
+		if match_idx >= 0:
+			return accum_a - _lca_b_vecs[match_idx];
 		if curr_a == self:
-			break
-		accum_a += _get_element_kinematic_local_velocity(curr_a)
-		curr_a = _get_element_kinematic_parent(curr_a)
+			break;
+		accum_a += _get_element_kinematic_local_velocity(curr_a);
+		curr_a = _get_element_kinematic_parent(curr_a);
 
-	return accum_a - accum_b
+	return accum_a - accum_b;
 
 
 ## Computes the analytical position difference [code]r_a(eval_time) - r_b(eval_time)[/code]
@@ -1030,46 +1808,54 @@ func _compute_lca_well_position_difference_at(
 			well_a
 			if (well_a != null and _is_tracked_or_self(well_a))
 			else self
-	)
+	);
 	var target_b: JrOrreryElement = (
 			well_b
 			if (well_b != null and _is_tracked_or_self(well_b))
 			else self
-	)
+	);
 	if target_a == target_b:
-		return Vector3.ZERO
+		return Vector3.ZERO;
 
-	var b_ancestors: Dictionary[JrOrreryElement, Vector3] = {}
-	var curr_b: JrOrreryElement = target_b
-	var accum_b := Vector3.ZERO
+	if target_b == self:
+		return evaluate_element_driver_origin_at(target_a, eval_time);
+	if target_a == self:
+		return -evaluate_element_driver_origin_at(target_b, eval_time);
+
+	_lca_b_elems.clear();
+	_lca_b_vecs.clear();
+	var curr_b: JrOrreryElement = target_b;
+	var accum_b := Vector3.ZERO;
 	while curr_b != null:
-		b_ancestors[curr_b] = accum_b
+		_lca_b_elems.append(curr_b);
+		_lca_b_vecs.append(accum_b);
 		if curr_b == self:
-			break
+			break;
 		if curr_b is JrRailOrbiter:
-			var orb_b := curr_b as JrRailOrbiter
+			var orb_b := curr_b as JrRailOrbiter;
 			if orb_b.is_orbit_valid():
-				accum_b += orb_b.get_relative_position(eval_time, _reference_plane)
-			curr_b = _children.get(orb_b, self)
+				accum_b += orb_b.get_relative_position(eval_time, _reference_plane);
+			curr_b = _children.get(orb_b, self);
 		else:
-			curr_b = _element_parents.get(curr_b, self)
+			curr_b = _element_parents.get(curr_b, self);
 
-	var curr_a: JrOrreryElement = target_a
-	var accum_a := Vector3.ZERO
+	var curr_a: JrOrreryElement = target_a;
+	var accum_a := Vector3.ZERO;
 	while curr_a != null:
-		if b_ancestors.has(curr_a):
-			return accum_a - b_ancestors[curr_a]
+		var match_idx: int = _lca_b_elems.find(curr_a);
+		if match_idx >= 0:
+			return accum_a - _lca_b_vecs[match_idx];
 		if curr_a == self:
-			break
+			break;
 		if curr_a is JrRailOrbiter:
-			var orb_a := curr_a as JrRailOrbiter
+			var orb_a := curr_a as JrRailOrbiter;
 			if orb_a.is_orbit_valid():
-				accum_a += orb_a.get_relative_position(eval_time, _reference_plane)
-			curr_a = _children.get(orb_a, self)
+				accum_a += orb_a.get_relative_position(eval_time, _reference_plane);
+			curr_a = _children.get(orb_a, self);
 		else:
-			curr_a = _element_parents.get(curr_a, self)
+			curr_a = _element_parents.get(curr_a, self);
 
-	return accum_a - accum_b
+	return accum_a - accum_b;
 
 
 ## Returns the immediate kinematic parent of [param element] in the gravity-well tree
@@ -1167,37 +1953,100 @@ func _convert_anchor_forecast_to_element_relative(
 ## the active [member perspective_node] frame for all tracked [JrBallisticOrbiter] bodies.
 func _update_runtime_ballistic_forecasts(system_basis: Basis) -> void:
 	if _ballistic_sequence.is_empty():
-		return
+		return;
 
 	if not enable_ballistic_forecasts:
-		for ballistic: JrBallisticOrbiter in _ballistic_sequence:
-			ballistic.set_runtime_forecast_points([], [], [])
-		return
+		if _any_ballistic_has_forecast_points:
+			for ballistic: JrBallisticOrbiter in _ballistic_sequence:
+				if ballistic.has_runtime_forecast_points():
+					ballistic.set_runtime_forecast_points(
+							PackedVector3Array(),
+							PackedVector3Array(),
+							PackedVector3Array()
+					);
+			_any_ballistic_has_forecast_points = false;
+		return;
 
-	var targets: Array[JrBallisticOrbiter] = _collect_forecast_targets()
+	var targets: Array[JrBallisticOrbiter] = _collect_forecast_targets();
 	if targets.is_empty():
-		for ballistic: JrBallisticOrbiter in _ballistic_sequence:
-			ballistic.set_runtime_forecast_points([], [], [])
-		return
+		if _any_ballistic_has_forecast_points:
+			for ballistic: JrBallisticOrbiter in _ballistic_sequence:
+				if ballistic.has_runtime_forecast_points():
+					ballistic.set_runtime_forecast_points(
+							PackedVector3Array(),
+							PackedVector3Array(),
+							PackedVector3Array()
+					);
+			_any_ballistic_has_forecast_points = false;
+		return;
 
 	var anchor_map: Dictionary[JrBallisticOrbiter, PackedVector4Array] = (
 			_resolve_anchor_relative_forecasts(targets)
-	)
-	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
-		if not ballistic.runtime_forecast_enabled:
-			ballistic.set_runtime_forecast_points([], [], [])
-			continue
-		var pts4: PackedVector4Array = anchor_map.get(ballistic, PackedVector4Array())
-		_project_forecast_to_perspective(ballistic, pts4, system_basis)
+	);
+	_begin_forecast_projection_pass(system_basis);
+	for target: JrBallisticOrbiter in targets:
+		var pts4: PackedVector4Array = anchor_map.get(target, PackedVector4Array());
+		_project_forecast_to_perspective(target, pts4, system_basis);
 
 
-## Collects all [JrBallisticOrbiter] nodes requiring forecast evaluation.
+## Executes [method _update_runtime_ballistic_forecasts] while recording perspective projection
+## microsecond durations into [member _telemetry].
+func _update_runtime_ballistic_forecasts_instrumented(system_basis: Basis) -> void:
+	if _ballistic_sequence.is_empty():
+		return;
+
+	if not enable_ballistic_forecasts:
+		if _any_ballistic_has_forecast_points:
+			var t_clear0: int = Time.get_ticks_usec();
+			for ballistic: JrBallisticOrbiter in _ballistic_sequence:
+				if ballistic.has_runtime_forecast_points():
+					ballistic.set_runtime_forecast_points(
+							PackedVector3Array(),
+							PackedVector3Array(),
+							PackedVector3Array()
+					);
+			_any_ballistic_has_forecast_points = false;
+			_telemetry.add_phase_usec(
+					JrOrreryTelemetry.PHASE_FORECAST_PERSPECTIVE_PROJECT,
+					Time.get_ticks_usec() - t_clear0
+			);
+		return;
+
+	var targets: Array[JrBallisticOrbiter] = _collect_forecast_targets();
+	if targets.is_empty():
+		if _any_ballistic_has_forecast_points:
+			var t_empty0: int = Time.get_ticks_usec();
+			for ballistic: JrBallisticOrbiter in _ballistic_sequence:
+				if ballistic.has_runtime_forecast_points():
+					ballistic.set_runtime_forecast_points(
+							PackedVector3Array(),
+							PackedVector3Array(),
+							PackedVector3Array()
+					);
+			_any_ballistic_has_forecast_points = false;
+			_telemetry.add_phase_usec(
+					JrOrreryTelemetry.PHASE_FORECAST_PERSPECTIVE_PROJECT,
+					Time.get_ticks_usec() - t_empty0
+			);
+		return;
+
+	var anchor_map: Dictionary[JrBallisticOrbiter, PackedVector4Array] = (
+			_resolve_anchor_relative_forecasts(targets)
+	);
+	var t_proj0: int = Time.get_ticks_usec();
+	_begin_forecast_projection_pass(system_basis);
+	for target: JrBallisticOrbiter in targets:
+		var pts4: PackedVector4Array = anchor_map.get(target, PackedVector4Array());
+		_project_forecast_to_perspective(target, pts4, system_basis);
+	_telemetry.add_phase_usec(
+			JrOrreryTelemetry.PHASE_FORECAST_PERSPECTIVE_PROJECT,
+			Time.get_ticks_usec() - t_proj0
+	);
+
+
+## Collects all [JrBallisticOrbiter] nodes requiring forecast evaluation in `O(K_forecast)`.
 func _collect_forecast_targets() -> Array[JrBallisticOrbiter]:
-	var targets: Array[JrBallisticOrbiter] = []
-	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
-		if ballistic.runtime_forecast_enabled:
-			targets.append(ballistic)
-	return targets
+	return _forecast_enabled_ballistics;
 
 
 ## Re-integrates anchor-relative forecasts on the GPU/CPU when any target is dirty, or
@@ -1205,19 +2054,118 @@ func _collect_forecast_targets() -> Array[JrBallisticOrbiter]:
 func _resolve_anchor_relative_forecasts(
 		targets: Array[JrBallisticOrbiter]
 ) -> Dictionary[JrBallisticOrbiter, PackedVector4Array]:
-	var any_dirty: bool = _last_forecast_well_list.is_empty()
+	var any_dirty: bool = _last_forecast_well_list.is_empty();
 	if not any_dirty:
 		for target: JrBallisticOrbiter in targets:
 			if target.is_forecast_dirty() or not _last_forecast_anchor_points.has(target):
-				any_dirty = true
-				break
+				any_dirty = true;
+				break;
 
 	if any_dirty:
-		var cfg: JrBallisticForecastConfig = _build_forecast_config(targets, time)
-		_last_forecast_well_list = _ballistic_solver.get_forecast_well_elements(cfg)
-		_last_forecast_anchor_points = _ballistic_solver.compute_forecasts_anchor_relative(cfg)
+		var cfg: JrBallisticForecastConfig = _build_forecast_config(targets, time);
+		_last_forecast_well_list = _ballistic_solver.get_forecast_well_elements(cfg);
+		_last_forecast_anchor_points = _ballistic_solver.compute_forecasts_anchor_relative(cfg);
 
-	return _last_forecast_anchor_points
+	return _last_forecast_anchor_points;
+
+
+## Initializes per-frame common-ancestor metadata for all forecast gravity wells so
+## [method _project_forecast_to_perspective] can share timeline evaluations across bodies.
+func _begin_forecast_projection_pass(system_basis: Basis) -> void:
+	_fc_proj_grid_key = Vector2(-1.0, -1.0);
+	_fc_proj_synodic_bases.clear();
+
+	var well_count: int = maxi(1, _last_forecast_well_list.size());
+	_fc_proj_well_common.resize(well_count);
+	_fc_proj_well_common_now.resize(well_count);
+	_fc_proj_well_sys_common_now.resize(well_count);
+	_fc_proj_well_is_synodic.resize(well_count);
+	_fc_proj_well_common_id.resize(well_count);
+	_fc_proj_well_origins.resize(well_count);
+	_fc_proj_well_offsets.resize(well_count);
+	_fc_proj_well_origins_ready.resize(well_count);
+	_fc_proj_well_origins_ready.fill(0);
+	_fc_proj_well_offsets_ready.resize(well_count);
+	_fc_proj_well_offsets_ready.fill(0);
+
+	var selected_well: JrOrreryElement = _get_perspective_gravity_well();
+	var is_heliocentric: bool = (
+			perspective_node == null
+			or perspective_node == self
+			or not _element_parents.has(perspective_node)
+	);
+	var is_synodic: bool = (
+			not is_heliocentric
+			and perspective_rotation_mode == PerspectiveRotationMode.SYNODIC_ORBITAL
+	);
+
+	for w: int in range(well_count):
+		var anchor_elem: JrOrreryElement = _get_forecast_well_element(w);
+		var common_well: JrOrreryElement = _find_common_ancestor_well(anchor_elem, selected_well);
+		var common_now: Vector3 = _compute_lca_position_difference(common_well, perspective_node);
+		var apply_syn: bool = is_synodic and _should_apply_synodic_rotation_to_well(common_well);
+		_fc_proj_well_common[w] = common_well;
+		_fc_proj_well_common_now[w] = common_now;
+		_fc_proj_well_sys_common_now[w] = system_basis * common_now;
+		_fc_proj_well_is_synodic[w] = 1 if apply_syn else 0;
+		_fc_proj_well_common_id[w] = int(common_well.get_instance_id());
+
+
+## Ensures shared synodic inverse bases are populated for `(count, step_dt)` when [param need_synodic]
+## is active, invalidating cached well step arrays only if the grid stride changed.
+func _ensure_forecast_projection_grid(
+		count: int,
+		step_dt: float,
+		need_synodic: bool
+) -> void:
+	var key := Vector2(float(count), step_dt);
+	if _fc_proj_grid_key != key:
+		_fc_proj_grid_key = key;
+		_fc_proj_synodic_bases.clear();
+		_fc_proj_well_origins_ready.fill(0);
+		_fc_proj_well_offsets_ready.fill(0);
+
+	if need_synodic and _fc_proj_synodic_bases.size() != count:
+		_fc_proj_synodic_bases.resize(count);
+		for k: int in range(count):
+			var eval_t: float = time + float(k) * step_dt;
+			_fc_proj_synodic_bases[k] = _compute_synodic_perspective_basis_at(eval_t);
+
+
+## Lazily evaluates and caches inertial origins and LCA offsets across `count` forecast steps
+## for [param well_idx].
+func _ensure_forecast_well_arrays(well_idx: int, count: int, step_dt: float) -> void:
+	var anchor_elem: JrOrreryElement = _get_forecast_well_element(well_idx);
+	if _fc_proj_well_origins_ready[well_idx] == 0:
+		var origins := PackedVector3Array();
+		origins.resize(count);
+		if anchor_elem != null and anchor_elem != self:
+			for k: int in range(count):
+				var eval_t: float = time + float(k) * step_dt;
+				origins[k] = evaluate_element_driver_origin_at(anchor_elem, eval_t);
+		_fc_proj_well_origins[well_idx] = origins;
+		_fc_proj_well_origins_ready[well_idx] = 1;
+
+	if _fc_proj_well_offsets_ready[well_idx] == 0:
+		var common_well: JrOrreryElement = _fc_proj_well_common[well_idx];
+		if anchor_elem == common_well:
+			var zero_offsets := PackedVector3Array();
+			zero_offsets.resize(count);
+			_fc_proj_well_offsets[well_idx] = zero_offsets;
+		elif common_well == self:
+			_fc_proj_well_offsets[well_idx] = _fc_proj_well_origins[well_idx];
+		else:
+			var offsets := PackedVector3Array();
+			offsets.resize(count);
+			for k: int in range(count):
+				var eval_t: float = time + float(k) * step_dt;
+				offsets[k] = _compute_lca_well_position_difference_at(
+						anchor_elem,
+						common_well,
+						eval_t
+				);
+			_fc_proj_well_offsets[well_idx] = offsets;
+		_fc_proj_well_offsets_ready[well_idx] = 1;
 
 
 ## Projects [param pts4] at each forecast step into the reference frame of the
@@ -1227,79 +2175,101 @@ func _project_forecast_to_perspective(
 		pts4: PackedVector4Array,
 		system_basis: Basis
 ) -> void:
-	var count: int = pts4.size()
+	var count: int = pts4.size();
 	if count == 0:
-		ballistic.set_runtime_forecast_points([], [], [])
-		return
+		if ballistic.has_runtime_forecast_points():
+			ballistic.set_runtime_forecast_points(
+					PackedVector3Array(),
+					PackedVector3Array(),
+					PackedVector3Array()
+			);
+		return;
 
-	var step_dt: float = ballistic.preview_duration / float(maxi(1, count - 1))
-	var selected_well: JrOrreryElement = _get_perspective_gravity_well()
+	if _fc_proj_well_common.is_empty():
+		_begin_forecast_projection_pass(system_basis);
+
+	var well_limit: int = maxi(0, _fc_proj_well_common.size() - 1);
+	var step_dt: float = ballistic.preview_duration / float(maxi(1, count - 1));
 	var is_heliocentric: bool = (
 			perspective_node == null
 			or perspective_node == self
 			or not _element_parents.has(perspective_node)
-	)
-	var identity_basis: bool = system_basis.is_equal_approx(Basis.IDENTITY)
+	);
+	var identity_basis: bool = (
+			system_basis == Basis.IDENTITY or system_basis.is_equal_approx(Basis.IDENTITY)
+	);
 	var is_synodic: bool = (
 			not is_heliocentric
 			and perspective_rotation_mode == PerspectiveRotationMode.SYNODIC_ORBITAL
-	)
-	var synodic_now_basis: Basis = system_basis.transposed() if is_synodic else Basis.IDENTITY
+	);
+	_ensure_forecast_projection_grid(count, step_dt, is_synodic);
 
-	var inertial_pts: PackedVector3Array = []
-	var unrotated_pts: PackedVector3Array = []
-	var system_pts: PackedVector3Array = []
-	var ref_ids: PackedInt64Array = []
-	inertial_pts.resize(count)
-	unrotated_pts.resize(count)
-	system_pts.resize(count)
-	ref_ids.resize(count)
+	var inertial_pts := PackedVector3Array();
+	var ref_ids := PackedInt64Array();
+	inertial_pts.resize(count);
+	ref_ids.resize(count);
 
-	var last_common_well: JrOrreryElement = null
-	var last_common_from_persp_now := Vector3.ZERO
-	var last_common_synodic: bool = false
-	var last_common_id: int = 0
+	var last_well_idx: int = -1;
+	var curr_origins := PackedVector3Array();
+	var curr_offsets := PackedVector3Array();
+	var curr_common_now := Vector3.ZERO;
+	var curr_sys_common_now := Vector3.ZERO;
+	var curr_synodic: bool = false;
+	var curr_common_id: int = 0;
+
+	if is_heliocentric and identity_basis:
+		for k: int in range(count):
+			var pt4: Vector4 = pts4[k];
+			var well_idx: int = clampi(int(roundf(pt4.w)), 0, well_limit);
+			if well_idx != last_well_idx:
+				last_well_idx = well_idx;
+				_ensure_forecast_well_arrays(well_idx, count, step_dt);
+				curr_origins = _fc_proj_well_origins[well_idx];
+				curr_common_id = _fc_proj_well_common_id[well_idx];
+			inertial_pts[k] = curr_origins[k] + Vector3(pt4.x, pt4.y, pt4.z);
+			ref_ids[k] = curr_common_id;
+		ballistic.set_runtime_forecast_points(inertial_pts, inertial_pts, inertial_pts, ref_ids);
+		_any_ballistic_has_forecast_points = true;
+		return;
+
+	var synodic_now_basis: Basis = system_basis.transposed() if is_synodic else Basis.IDENTITY;
+	var unrotated_pts := PackedVector3Array();
+	var system_pts := PackedVector3Array();
+	unrotated_pts.resize(count);
+	system_pts.resize(count);
 
 	for k: int in range(count):
-		var pt4: Vector4 = pts4[k]
-		var anchor_elem: JrOrreryElement = _get_forecast_well_element(int(roundf(pt4.w)))
-		var eval_t: float = time + float(k) * step_dt
-		var r_rel := Vector3(pt4.x, pt4.y, pt4.z)
-		var anchor_origin: Vector3 = evaluate_element_driver_origin_at(anchor_elem, eval_t)
-		inertial_pts[k] = anchor_origin + r_rel
+		var pt4: Vector4 = pts4[k];
+		var well_idx: int = clampi(int(roundf(pt4.w)), 0, well_limit);
+		if well_idx != last_well_idx:
+			last_well_idx = well_idx;
+			_ensure_forecast_well_arrays(well_idx, count, step_dt);
+			curr_origins = _fc_proj_well_origins[well_idx];
+			curr_offsets = _fc_proj_well_offsets[well_idx];
+			curr_common_now = _fc_proj_well_common_now[well_idx];
+			curr_sys_common_now = _fc_proj_well_sys_common_now[well_idx];
+			curr_synodic = (_fc_proj_well_is_synodic[well_idx] != 0);
+			curr_common_id = _fc_proj_well_common_id[well_idx];
 
-		var common_well: JrOrreryElement = _find_common_ancestor_well(anchor_elem, selected_well)
-		if common_well != last_common_well:
-			last_common_well = common_well
-			last_common_from_persp_now = _compute_lca_position_difference(
-					common_well,
-					perspective_node
-			)
-			last_common_synodic = is_synodic and _should_apply_synodic_rotation_to_well(
-					common_well
-			)
-			last_common_id = int(common_well.get_instance_id())
-		ref_ids[k] = last_common_id
+		var r_rel := Vector3(pt4.x, pt4.y, pt4.z);
+		inertial_pts[k] = curr_origins[k] + r_rel;
+		ref_ids[k] = curr_common_id;
 
-		var offset_from_common_at_eval: Vector3 = (
-				_compute_lca_well_position_difference_at(anchor_elem, common_well, eval_t)
-				+ r_rel
-		)
-
-		if last_common_synodic:
-			var synodic_step_inv: Basis = _compute_synodic_perspective_basis_at(eval_t)
+		var offset_from_common_at_eval: Vector3 = curr_offsets[k] + r_rel;
+		if curr_synodic:
+			var synodic_step_inv: Basis = _fc_proj_synodic_bases[k];
 			var synodic_pt: Vector3 = (
-					(system_basis * last_common_from_persp_now)
-					+ (synodic_step_inv * offset_from_common_at_eval)
-			)
-			system_pts[k] = synodic_pt
-			unrotated_pts[k] = synodic_now_basis * synodic_pt
+					curr_sys_common_now + (synodic_step_inv * offset_from_common_at_eval)
+			);
+			system_pts[k] = synodic_pt;
+			unrotated_pts[k] = synodic_now_basis * synodic_pt;
 		else:
-			var unrot_pt: Vector3 = last_common_from_persp_now + offset_from_common_at_eval
-			unrotated_pts[k] = unrot_pt
-			system_pts[k] = unrot_pt if identity_basis else (system_basis * unrot_pt)
+			var unrot_pt: Vector3 = curr_common_now + offset_from_common_at_eval;
+			unrotated_pts[k] = unrot_pt;
+			system_pts[k] = unrot_pt if identity_basis else (system_basis * unrot_pt);
 
-	ballistic.set_runtime_forecast_points(inertial_pts, unrotated_pts, system_pts, ref_ids)
+	ballistic.set_runtime_forecast_points(inertial_pts, unrotated_pts, system_pts, ref_ids);
+	_any_ballistic_has_forecast_points = true;
 
 
 ## Returns the gravity-well element ([JrOrbitDriver] or [JrRailOrbiter]) associated
@@ -1310,16 +2280,16 @@ func _get_perspective_gravity_well() -> JrOrreryElement:
 			or perspective_node == self
 			or not _element_parents.has(perspective_node)
 	):
-		return self
+		return self;
 	if perspective_node is JrRailOrbiter:
-		return perspective_node
+		return perspective_node;
 	if perspective_node is JrBallisticOrbiter:
-		var b_node := perspective_node as JrBallisticOrbiter
-		var b_anchor: JrOrreryElement = b_node.get_anchor_element()
+		var b_node := perspective_node as JrBallisticOrbiter;
+		var b_anchor: JrOrreryElement = b_node.get_anchor_element();
 		if b_anchor != null and _is_tracked_or_self(b_anchor):
-			return b_anchor
-		return _resolve_ballistic_spawn_parent(b_node)
-	return self
+			return b_anchor;
+		return _resolve_ballistic_spawn_parent(b_node);
+	return self;
 
 
 ## Returns the lowest (earliest) common ancestor gravity well of [param well_a]
@@ -1332,34 +2302,34 @@ func _find_common_ancestor_well(
 			well_a
 			if (well_a != null and _is_tracked_or_self(well_a))
 			else self
-	)
+	);
 	var target_b: JrOrreryElement = (
 			well_b
 			if (well_b != null and _is_tracked_or_self(well_b))
 			else self
-	)
+	);
 	if target_a == self or target_b == self:
-		return self
+		return self;
 	if target_a == target_b:
-		return target_a
+		return target_a;
 
-	var b_ancestors: Array[JrOrreryElement] = []
-	var curr_b: JrOrreryElement = target_b
+	_lca_b_elems.clear();
+	var curr_b: JrOrreryElement = target_b;
 	while curr_b != null:
-		b_ancestors.append(curr_b)
+		_lca_b_elems.append(curr_b);
 		if curr_b == self:
-			break
-		curr_b = _get_element_kinematic_parent(curr_b)
+			break;
+		curr_b = _get_element_kinematic_parent(curr_b);
 
-	var curr_a: JrOrreryElement = target_a
+	var curr_a: JrOrreryElement = target_a;
 	while curr_a != null:
-		if b_ancestors.has(curr_a):
-			return curr_a
+		if _lca_b_elems.has(curr_a):
+			return curr_a;
 		if curr_a == self:
-			break
-		curr_a = _get_element_kinematic_parent(curr_a)
+			break;
+		curr_a = _get_element_kinematic_parent(curr_a);
 
-	return self
+	return self;
 
 
 ## Returns [code]true[/code] when [param common_well] lies within the subtree of
@@ -1386,7 +2356,7 @@ func _get_forecast_well_element(well_idx: int) -> JrOrreryElement:
 ## Returns [code]true[/code] if [param element] is either this driver itself or a tracked
 ## descendant.
 func _is_tracked_or_self(element: JrOrreryElement) -> bool:
-	return element == self or _element_parents.has(element)
+	return element != null and (element._owning_driver == self or element == self);
 
 
 ## Updates the generated [JrReferenceDirection] from the exported properties
@@ -1519,64 +2489,198 @@ func _should_step_time() -> bool:
 
 ## Synchronizes the active simulation-playing flag across all tracked descendant elements.
 func _sync_simulation_playing_state() -> void:
-	var playing: bool = _should_step_time()
-	set_simulation_playing(playing)
-	for orbiter: JrRailOrbiter in _orbit_sequence:
-		orbiter.set_simulation_playing(playing)
-	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
-		ballistic.set_simulation_playing(playing)
+	_has_synced_playing = false;
+	_sync_playing_if_changed(_should_step_time());
 
 
 ## Registers a newly added descendant simulation [param child] ([JrRailOrbiter] or
-## [JrBallisticOrbiter])
-## and its [param parent] into the appropriate flat traversal sequence.
+## [JrBallisticOrbiter]) and its [param parent] into the appropriate flat traversal sequence.
 func _on_subtree_element_added(parent: JrOrreryElement, child: JrOrreryElement) -> void:
 	if child == null or parent == null or child == self:
-		return
+		return;
 
-	_element_parents[child] = parent
+	_owning_driver = self;
+	var already_tracked: bool = _element_parents.has(child);
+	_element_parents[child] = parent;
+	child._owning_driver = self;
+	child._tracked_scene_parent = parent;
+	_ballistic_anchors_dirty = true;
+	_ballistic_solver.invalidate_resident_step_buffer();
 	if child is JrRailOrbiter:
-		var orbiter := child as JrRailOrbiter
-		_children[orbiter] = parent
-		if not _orbit_sequence.has(orbiter):
-			_orbit_sequence.append(orbiter)
+		var orbiter := child as JrRailOrbiter;
+		var already_rail: bool = _children.has(orbiter);
+		_children[orbiter] = parent;
+		if not already_rail:
+			_orbit_sequence.append(orbiter);
 	elif child is JrBallisticOrbiter:
-		var ballistic := child as JrBallisticOrbiter
-		if not _ballistic_sequence.has(ballistic):
-			_ballistic_sequence.append(ballistic)
+		var ballistic := child as JrBallisticOrbiter;
+		ballistic._fast_root_sync_ready = false;
+		ballistic._direct_system_xf = _last_direct_system_xf_state;
+		_queue_non_root_sync_ballistic(ballistic);
+		if not already_tracked:
+			ballistic._ballistic_seq_index = _ballistic_sequence.size();
+			_ballistic_sequence.append(ballistic);
+			if ballistic.runtime_forecast_enabled:
+				_forecast_enabled_ballistics.append(ballistic);
+		_pending_ballistic_init = true;
+		if not ballistic.ballistic_runtime_dirtied.is_connected(_on_ballistic_runtime_dirtied):
+			ballistic.ballistic_runtime_dirtied.connect(_on_ballistic_runtime_dirtied);
+		if not ballistic.ballistic_gpu_dirtied.is_connected(_on_ballistic_gpu_dirtied):
+			ballistic.ballistic_gpu_dirtied.connect(_on_ballistic_gpu_dirtied);
+		if not ballistic.ballistic_sync_dirtied.is_connected(_on_ballistic_sync_dirtied):
+			ballistic.ballistic_sync_dirtied.connect(_on_ballistic_sync_dirtied);
+		if not ballistic.ballistic_forecast_toggle_changed.is_connected(
+				_on_ballistic_forecast_toggle_changed
+		):
+			ballistic.ballistic_forecast_toggle_changed.connect(
+					_on_ballistic_forecast_toggle_changed
+			);
+
+	_units_and_mu_dirty = true;
+	_has_synced_playing = false;
 
 	if not child.orbit_visuals_changed.is_connected(_on_descendant_orbit_visuals_changed):
-		child.orbit_visuals_changed.connect(_on_descendant_orbit_visuals_changed)
+		child.orbit_visuals_changed.connect(_on_descendant_orbit_visuals_changed);
 
 	if is_inside_tree() and not _updating_orbits:
-		update_orbits()
+		update_orbits();
 
 
 ## Removes an exiting descendant simulation [param child] from the lookup tables
 ## and flat traversal sequences.
 func _on_subtree_element_removed(_parent: JrOrreryElement, child: JrOrreryElement) -> void:
 	if child == null:
-		return
+		return;
 
 	if child.orbit_visuals_changed.is_connected(_on_descendant_orbit_visuals_changed):
-		child.orbit_visuals_changed.disconnect(_on_descendant_orbit_visuals_changed)
+		child.orbit_visuals_changed.disconnect(_on_descendant_orbit_visuals_changed);
 
-	_element_parents.erase(child)
+	_element_parents.erase(child);
+	child._owning_driver = null;
+	child._tracked_scene_parent = null;
+	child._runtime_well_index = -1;
+	_ballistic_solver.invalidate_resident_step_buffer();
 	if child is JrRailOrbiter:
-		var orbiter := child as JrRailOrbiter
-		_children.erase(orbiter)
-		_orbit_sequence.erase(orbiter)
+		var orbiter := child as JrRailOrbiter;
+		_children.erase(orbiter);
+		if (
+				not _orbit_sequence.is_empty()
+				and _orbit_sequence[_orbit_sequence.size() - 1] == orbiter
+		):
+			_orbit_sequence.pop_back();
+		else:
+			_orbit_sequence.erase(orbiter);
+		_units_and_mu_dirty = true;
+		_has_synced_playing = false;
+		_ballistic_anchors_dirty = true;
 	elif child is JrBallisticOrbiter:
-		var ballistic := child as JrBallisticOrbiter
-		_ballistic_sequence.erase(ballistic)
-		_last_forecast_anchor_points.erase(ballistic)
+		var ballistic := child as JrBallisticOrbiter;
+		ballistic._fast_root_sync_ready = false;
+		ballistic._in_non_root_sync_list = false;
+		ballistic._ballistic_seq_index = -1;
+		if ballistic.ballistic_runtime_dirtied.is_connected(_on_ballistic_runtime_dirtied):
+			ballistic.ballistic_runtime_dirtied.disconnect(_on_ballistic_runtime_dirtied);
+		if ballistic.ballistic_gpu_dirtied.is_connected(_on_ballistic_gpu_dirtied):
+			ballistic.ballistic_gpu_dirtied.disconnect(_on_ballistic_gpu_dirtied);
+		if ballistic.ballistic_sync_dirtied.is_connected(_on_ballistic_sync_dirtied):
+			ballistic.ballistic_sync_dirtied.disconnect(_on_ballistic_sync_dirtied);
+		if ballistic.ballistic_forecast_toggle_changed.is_connected(
+				_on_ballistic_forecast_toggle_changed
+		):
+			ballistic.ballistic_forecast_toggle_changed.disconnect(
+					_on_ballistic_forecast_toggle_changed
+			);
+		_remove_ballistic_from_sparse_list(_non_root_sync_ballistics, ballistic);
+		_remove_ballistic_from_sparse_list(_forecast_enabled_ballistics, ballistic);
+		if (
+				not _ballistic_sequence.is_empty()
+				and _ballistic_sequence[_ballistic_sequence.size() - 1] == ballistic
+		):
+			_ballistic_sequence.pop_back();
+		else:
+			_ballistic_sequence.erase(ballistic);
+			for seq_idx: int in range(_ballistic_sequence.size()):
+				_ballistic_sequence[seq_idx]._ballistic_seq_index = seq_idx;
+		_last_forecast_anchor_points.erase(ballistic);
+		if child == perspective_node and is_inside_tree() and not _updating_orbits:
+			update_orbits();
+		return;
 
+	if child == perspective_node and is_inside_tree() and not _updating_orbits:
+		update_orbits();
+	else:
+		_schedule_deferred_orbit_update();
+
+
+## Marks ballistic initialization and pre-step anchor synchronization dirty when signaled upward.
+func _on_ballistic_runtime_dirtied() -> void:
+	_pending_ballistic_init = true;
+	_ballistic_anchors_dirty = true;
+
+
+## Notifies [member _ballistic_solver] that [param ballistic] changed state on the CPU.
+func _on_ballistic_gpu_dirtied(ballistic: JrBallisticOrbiter) -> void:
+	_ballistic_solver.record_dirty_gpu_body(ballistic);
+
+
+## Queues [param ballistic] into [member _non_root_sync_ballistics] when signaled upward.
+func _on_ballistic_sync_dirtied(ballistic: JrBallisticOrbiter) -> void:
+	_queue_non_root_sync_ballistic(ballistic);
+
+
+## Appends [param ballistic] to [member _non_root_sync_ballistics] if not already queued.
+func _queue_non_root_sync_ballistic(ballistic: JrBallisticOrbiter) -> void:
+	if not ballistic._in_non_root_sync_list:
+		ballistic._in_non_root_sync_list = true;
+		_non_root_sync_ballistics.append(ballistic);
+
+
+## Updates [member _forecast_enabled_ballistics] when [member JrBallisticOrbiter.runtime_forecast_enabled] changes.
+func _on_ballistic_forecast_toggle_changed(ballistic: JrBallisticOrbiter) -> void:
+	if ballistic.runtime_forecast_enabled:
+		if not _forecast_enabled_ballistics.has(ballistic):
+			_forecast_enabled_ballistics.append(ballistic);
+	else:
+		_remove_ballistic_from_sparse_list(_forecast_enabled_ballistics, ballistic);
+		if ballistic.has_runtime_forecast_points():
+			ballistic.set_runtime_forecast_points(
+					PackedVector3Array(),
+					PackedVector3Array(),
+					PackedVector3Array()
+			);
+
+
+## Removes [param target] from [param list] with a fast `pop_back()` path duringLIFO teardown.
+func _remove_ballistic_from_sparse_list(
+		list: Array[JrBallisticOrbiter],
+		target: JrBallisticOrbiter
+) -> void:
+	if list.is_empty():
+		return;
+	if list[list.size() - 1] == target:
+		list.pop_back();
+	else:
+		list.erase(target);
+
+
+## Schedules a single coalesced [method update_orbits] pass at the end of the frame.
+func _schedule_deferred_orbit_update() -> void:
+	if _deferred_orbit_update_queued or not is_inside_tree():
+		return;
+	_deferred_orbit_update_queued = true;
+	call_deferred(&"_flush_deferred_orbit_update");
+
+
+## Executes a coalesced [method update_orbits] pass if this driver is still inside the scene tree.
+func _flush_deferred_orbit_update() -> void:
+	_deferred_orbit_update_queued = false;
 	if is_inside_tree() and not _updating_orbits:
-		update_orbits()
+		update_orbits();
 
 
 ## Re-evaluates system state when a descendant element's parameters change in
 ## the editor or at runtime.
 func _on_descendant_orbit_visuals_changed() -> void:
+	_units_and_mu_dirty = true;
 	if is_inside_tree() and not _updating_orbits:
-		update_orbits()
+		update_orbits();

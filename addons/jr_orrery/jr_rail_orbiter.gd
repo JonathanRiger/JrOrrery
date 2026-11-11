@@ -146,20 +146,22 @@ var argument_of_periapsis: float = 0.0:
 @export_range(-180.0, 180.0, 0.1, "radians_as_degrees")
 var axial_tilt: float = 0.0:
 	set(value):
-		var normalized: float = 0.0 if is_locked_to_ecliptic() else normalize_angle(value)
+		var normalized: float = 0.0 if is_locked_to_ecliptic() else normalize_angle(value);
 		if not is_equal_approx(axial_tilt, normalized):
-			axial_tilt = normalized
-			_notify_orbital_parameters_changed()
+			axial_tilt = normalized;
+			_update_reference_frame_cache();
+			_notify_orbital_parameters_changed();
 
 ## Azimuthal direction of [member axial_tilt] within the orbital plane (in radians),
 ## normalized to [code](-PI, PI][/code].
 @export_range(-180.0, 180.0, 0.1, "radians_as_degrees")
 var axial_tilt_longitude: float = 0.0:
 	set(value):
-		var normalized: float = normalize_angle(value)
+		var normalized: float = normalize_angle(value);
 		if not is_equal_approx(axial_tilt_longitude, normalized):
-			axial_tilt_longitude = normalized
-			_notify_orbital_parameters_changed()
+			axial_tilt_longitude = normalized;
+			_update_reference_frame_cache();
+			_notify_orbital_parameters_changed();
 
 ## Sidereal rotational angular speed around the body's spin axis in radians per
 ## unit time. Must be non-negative; set to [code]0.0[/code] for a non-rotating body.
@@ -389,7 +391,31 @@ var _parent_effective_mu: float = 0.0
 var _syncing_binary_partner: bool = false
 
 ## Re-entrancy guard preventing recursion when deriving [member mean_motion] from gravity.
-var _updating_synced_motion: bool = false
+var _updating_synced_motion: bool = false;
+
+## Cached flag indicating whether [member eccentricity] forms a circular orbit.
+var _is_circular: bool = true;
+
+## Cached flag indicating whether [member eccentricity] forms a parabolic trajectory.
+var _is_parabolic: bool = false;
+
+## Cached flag indicating whether [member eccentricity] forms an unbound escape trajectory.
+var _is_unbound: bool = false;
+
+## Whether the cached [member _reference_plane] composite bases are currently valid.
+var _has_ref_frame_cache: bool = false;
+
+## Cached composite [Basis] (`_reference_plane.orbit_transform.basis * _orbital_transform.basis`).
+var _cached_ref_orbit_basis: Basis = Basis.IDENTITY;
+
+## Cached orthonormal orbital plane [Basis] in [member _reference_plane] space.
+var _cached_ref_plane_basis: Basis = Basis.IDENTITY;
+
+## Cached orthonormal body [Basis] after applying [member axial_tilt] in [member _reference_plane] space.
+var _cached_ref_tilted_basis: Basis = Basis.IDENTITY;
+
+## Cached handedness sign (`-1.0` clockwise, `+1.0` counter-clockwise) for [member _reference_plane].
+var _cached_ref_dir_sign: float = -1.0;
 
 
 ## Computes the analytical Keplerian mean motion [code]n[/code] (in rad / time_unit)
@@ -589,69 +615,73 @@ func is_orbit_valid() -> bool:
 ## Returns [code]true[/code] if the orbit is gravitationally bound
 ## ([code]0.0 <= eccentricity < 1.0[/code]).
 func is_bound_orbit() -> bool:
-	return eccentricity >= 0.0 and eccentricity < 1.0
+	return not _is_unbound;
 
 
 ## Returns [code]true[/code] if the trajectory is an unbound escape trajectory
 ## ([code]eccentricity >= 1.0[/code]).
 func is_unbound_orbit() -> bool:
-	return eccentricity >= 1.0
+	return _is_unbound;
 
 
 ## Returns [code]true[/code] if the animated editor preview ghost currently has
 ## a valid evaluated position.
 func has_ghost_position() -> bool:
-	return _has_ghost_position
+	return _has_ghost_position;
 
 
 ## Returns the animated editor preview ghost's position relative to the parent
 ## focus in the coordinate space of [member _reference_plane].
 func get_ghost_relative_position() -> Vector3:
-	return _ghost_relative_position
+	return _ghost_relative_position;
 
 
 ## Returns the animated editor preview ghost's 3D orientation [Basis] in the
 ## coordinate space of [member _reference_plane].
 func get_ghost_body_basis() -> Basis:
-	return _ghost_body_basis
+	return _ghost_body_basis;
 
 
 ## Updates the cached [member _reference_plane] reference and connects its
 ## [signal JrReferenceDirection.changed] signal.
 func set_reference_plane(new_reference_plane: JrReferenceDirection) -> void:
 	if new_reference_plane == null:
-		return
+		return;
 	if _reference_plane != new_reference_plane:
 		if (
 				_reference_plane != null
 				and _reference_plane.changed.is_connected(_on_reference_plane_changed)
 		):
-			_reference_plane.changed.disconnect(_on_reference_plane_changed)
-		_reference_plane = new_reference_plane
+			_reference_plane.changed.disconnect(_on_reference_plane_changed);
+		_reference_plane = new_reference_plane;
 		if not _reference_plane.changed.is_connected(_on_reference_plane_changed):
-			_reference_plane.changed.connect(_on_reference_plane_changed)
-	if is_locked_to_ecliptic():
-		_enforce_ecliptic_lock()
+			_reference_plane.changed.connect(_on_reference_plane_changed);
+		if is_locked_to_ecliptic():
+			_enforce_ecliptic_lock();
+		_update_reference_frame_cache();
+	elif not _has_ref_frame_cache:
+		_update_reference_frame_cache();
 
 
 ## Converts the given [param true_anomaly] (in radians) into the corresponding
 ## mean anomaly via Kepler's or Barker's equation for any conic section.
 func get_mean_anomaly_from_true_anomaly(true_anomaly: float) -> float:
-	var anomaly: float = get_eccentric_anomaly_from_true_anomaly(true_anomaly)
-	if is_parabolic_trajectory():
-		return anomaly + (anomaly * anomaly * anomaly) / 3.0
-	if is_unbound_orbit():
-		return eccentricity * sinh(anomaly) - anomaly
-	return normalize_angle(anomaly - eccentricity * sin(anomaly))
+	var anomaly: float = get_eccentric_anomaly_from_true_anomaly(true_anomaly);
+	if _is_parabolic:
+		return anomaly + (anomaly * anomaly * anomaly) / 3.0;
+	if _is_unbound:
+		return eccentricity * sinh(anomaly) - anomaly;
+	return normalize_angle(anomaly - eccentricity * sin(anomaly));
 
 
 ## Returns the 3D position of the body relative to the central focus in the
 ## coordinate space of [param reference] (or [member _reference_plane] if omitted)
 ## at the given [param time].
 func get_relative_position(time: float, reference: JrReferenceDirection = null) -> Vector3:
-	var ref: JrReferenceDirection = reference if reference != null else _reference_plane
-	var perifocal_position: Vector3 = get_perifocal_position(time)
-	return ref.orbit_transform * (_orbital_transform * perifocal_position)
+	if _has_ref_frame_cache and (reference == null or reference == _reference_plane):
+		return _cached_ref_orbit_basis * get_perifocal_position(time);
+	var ref: JrReferenceDirection = reference if reference != null else _reference_plane;
+	return (ref.orbit_transform.basis * _orbital_transform.basis) * get_perifocal_position(time);
 
 
 ## Returns the 3D orbital velocity vector of the body relative to its parent focus
@@ -660,26 +690,29 @@ func get_relative_position(time: float, reference: JrReferenceDirection = null) 
 ## parent-relative velocity from the most recent orbital evaluation.
 func get_relative_velocity(time: float = NAN, reference: JrReferenceDirection = null) -> Vector3:
 	if is_nan(time) and reference == null:
-		return _relative_velocity
-	var eval_time: float = _last_time if is_nan(time) else time
-	var ref: JrReferenceDirection = reference if reference != null else _reference_plane
+		return _relative_velocity;
+	var eval_time: float = _last_time if is_nan(time) else time;
+	if _has_ref_frame_cache and (reference == null or reference == _reference_plane):
+		return _cached_ref_orbit_basis * get_perifocal_velocity(eval_time);
+	var ref: JrReferenceDirection = reference if reference != null else _reference_plane;
 	if ref == null:
-		return Vector3.ZERO
-	var perifocal_velocity: Vector3 = get_perifocal_velocity(eval_time)
-	return ref.orbit_transform.basis * (_orbital_transform.basis * perifocal_velocity)
+		return Vector3.ZERO;
+	return (ref.orbit_transform.basis * _orbital_transform.basis) * get_perifocal_velocity(eval_time);
 
 
 ## Returns the right-handed 3D [Basis] of the orbital perifocal frame in the
 ## coordinate space of [param reference] (or [member _reference_plane] if omitted),
 ## prior to applying [member axial_tilt] and sidereal rotation.
 func get_orbital_plane_basis(reference: JrReferenceDirection = null) -> Basis:
-	var ref: JrReferenceDirection = reference if reference != null else _reference_plane
+	if _has_ref_frame_cache and (reference == null or reference == _reference_plane):
+		return _cached_ref_plane_basis;
+	var ref: JrReferenceDirection = reference if reference != null else _reference_plane;
 	var orbital_plane_basis: Basis = (
 			_orbital_transform.basis
 			if ref.positive_is_clockwise
 			else _orbital_basis_ccw
-	)
-	return (ref.rotation_basis * orbital_plane_basis).orthonormalized()
+	);
+	return (ref.rotation_basis * orbital_plane_basis).orthonormalized();
 
 
 ## Returns the right-handed 3D [Basis] of the body in the coordinate space of
@@ -687,17 +720,19 @@ func get_orbital_plane_basis(reference: JrReferenceDirection = null) -> Basis:
 ## [member axial_tilt] along [member axial_tilt_longitude], prior to applying
 ## sidereal spin around the body's polar [code]+Y[/code] axis.
 func get_tilted_body_basis(reference: JrReferenceDirection = null) -> Basis:
-	var ref: JrReferenceDirection = reference if reference != null else _reference_plane
-	var dir_sign: float = -1.0 if ref.positive_is_clockwise else 1.0
-	var orbital_frame: Basis = get_orbital_plane_basis(ref)
-	var tilt_basis := Basis.IDENTITY
+	if _has_ref_frame_cache and (reference == null or reference == _reference_plane):
+		return _cached_ref_tilted_basis;
+	var ref: JrReferenceDirection = reference if reference != null else _reference_plane;
+	var dir_sign: float = -1.0 if ref.positive_is_clockwise else 1.0;
+	var orbital_frame: Basis = get_orbital_plane_basis(ref);
+	var tilt_basis := Basis.IDENTITY;
 	if not is_zero_approx(axial_tilt) and (ref == null or not ref.lock_to_ecliptic):
 		var tilt_axis := Vector3.FORWARD.rotated(
 				Vector3.UP,
 				dir_sign * axial_tilt_longitude
-		)
-		tilt_basis = Basis(tilt_axis, dir_sign * axial_tilt)
-	return (orbital_frame * tilt_basis).orthonormalized()
+		);
+		tilt_basis = Basis(tilt_axis, dir_sign * axial_tilt);
+	return (orbital_frame * tilt_basis).orthonormalized();
 
 
 ## Returns the right-handed 3D orientation [Basis] of the body at the given [param time]
@@ -705,11 +740,17 @@ func get_tilted_body_basis(reference: JrReferenceDirection = null) -> Basis:
 ## incorporating the orbital plane orientation, [member axial_tilt] along
 ## [member axial_tilt_longitude], and sidereal spin.
 func get_body_basis(time: float, reference: JrReferenceDirection = null) -> Basis:
-	var ref: JrReferenceDirection = reference if reference != null else _reference_plane
-	var dir_sign: float = -1.0 if ref.positive_is_clockwise else 1.0
-	var spin_angle: float = normalize_angle(get_rotation_angle(time))
-	var spin_basis := Basis(Vector3.UP, dir_sign * spin_angle)
-	return (get_tilted_body_basis(ref) * spin_basis).orthonormalized()
+	if _has_ref_frame_cache and (reference == null or reference == _reference_plane):
+		var raw_spin: float = time * rotational_motion + rotation_at_epoch;
+		if raw_spin == 0.0:
+			return _cached_ref_tilted_basis;
+		var cached_spin_angle: float = normalize_angle(raw_spin);
+		return _cached_ref_tilted_basis * Basis(Vector3.UP, _cached_ref_dir_sign * cached_spin_angle);
+	var ref: JrReferenceDirection = reference if reference != null else _reference_plane;
+	var dir_sign: float = -1.0 if ref.positive_is_clockwise else 1.0;
+	var spin_angle: float = normalize_angle(get_rotation_angle(time));
+	var spin_basis := Basis(Vector3.UP, dir_sign * spin_angle);
+	return (get_tilted_body_basis(ref) * spin_basis).orthonormalized();
 
 
 ## Returns the 3D [Basis] in [param reference] space oriented to the ascending node
@@ -848,18 +889,18 @@ func get_parent_effective_mu() -> float:
 
 ## Returns [code]true[/code] if the orbit is circular ([code]eccentricity ~= 0.0[/code]).
 func is_circular_orbit() -> bool:
-	return is_zero_approx(eccentricity) and eccentricity >= 0.0
+	return _is_circular;
 
 
 ## Returns [code]true[/code] if the orbit is closed and elliptical
 ## ([code]0.0 <= eccentricity < 1.0[/code]).
 func is_elliptical_orbit() -> bool:
-	return eccentricity >= 0.0 and eccentricity < 1.0
+	return not _is_unbound;
 
 
 ## Returns [code]true[/code] if the trajectory is parabolic ([code]eccentricity ~= 1.0[/code]).
 func is_parabolic_trajectory() -> bool:
-	return is_equal_approx(eccentricity, 1.0) and eccentricity >= 1.0
+	return _is_parabolic;
 
 
 ## Evaluates this orbiter's focus-relative position, parent-relative and global
@@ -872,14 +913,15 @@ func evaluate_orbital_state(
 		parent_driver_transform: Transform3D = Transform3D.IDENTITY,
 		parent_global_velocity: Vector3 = Vector3.ZERO
 ) -> void:
-	_last_time = 0.0 if Engine.is_editor_hint() else time
-	_parent_driver_basis = parent_driver_transform.basis
-	set_reference_plane(reference_plane)
+	_last_time = 0.0 if Engine.is_editor_hint() else time;
+	_parent_driver_basis = parent_driver_transform.basis;
+	if _reference_plane != reference_plane or not _has_ref_frame_cache:
+		set_reference_plane(reference_plane);
 	if not is_orbit_valid() or _reference_plane == null:
-		_relative_velocity = Vector3.ZERO
-		_global_velocity = parent_global_velocity
-		return
-	_compute_orbital_transforms(_last_time, parent_driver_transform.origin, parent_global_velocity)
+		_relative_velocity = Vector3.ZERO;
+		_global_velocity = parent_global_velocity;
+		return;
+	_compute_orbital_transforms(_last_time, parent_driver_transform.origin, parent_global_velocity);
 
 
 ## Convenience method that evaluates the orbital state at [param time] and
@@ -1222,18 +1264,53 @@ func _compute_orbital_transforms(
 		parent_driver_origin: Vector3,
 		parent_global_velocity: Vector3 = Vector3.ZERO
 ) -> void:
-	_focus_relative_position = get_relative_position(eval_time, _reference_plane)
-	_relative_velocity = get_relative_velocity(eval_time, _reference_plane)
-	_global_velocity = parent_global_velocity + _relative_velocity
-	_driver_relative_basis = get_body_basis(eval_time, _reference_plane)
-	var inv_parent: Basis = _parent_driver_basis.transposed()
-	var local_pos: Vector3 = inv_parent * _focus_relative_position
-	var local_basis: Basis = (inv_parent * _driver_relative_basis).orthonormalized()
-	_local_orbital_transform = Transform3D(local_basis, local_pos)
+	if not _is_unbound and _has_ref_frame_cache:
+		_evaluate_bound_focus_pos_and_vel(eval_time);
+	else:
+		_focus_relative_position = get_relative_position(eval_time, _reference_plane);
+		_relative_velocity = get_relative_velocity(eval_time, _reference_plane);
+	_global_velocity = parent_global_velocity + _relative_velocity;
+	_driver_relative_basis = get_body_basis(eval_time, _reference_plane);
+	if _parent_driver_basis == Basis.IDENTITY:
+		_local_orbital_transform = Transform3D(_driver_relative_basis, _focus_relative_position);
+	else:
+		var inv_parent: Basis = _parent_driver_basis.transposed();
+		_local_orbital_transform = Transform3D(
+				inv_parent * _driver_relative_basis,
+				inv_parent * _focus_relative_position
+		);
 	_driver_relative_transform = Transform3D(
 			_driver_relative_basis,
 			parent_driver_origin + _focus_relative_position
-	)
+	);
+
+
+## Computes [member _focus_relative_position] and [member _relative_velocity] in a single
+## trigonometric pass for bound circular or elliptical orbits.
+func _evaluate_bound_focus_pos_and_vel(eval_time: float) -> void:
+	var anomaly: float = solve_eccentric_anomaly(eval_time);
+	var sin_e: float = sin(anomaly);
+	var cos_e: float = cos(anomaly);
+	var perifocal_pos := Vector3(
+			_semi_minor_axis * sin_e,
+			0.0,
+			-_semi_major_axis * (cos_e - eccentricity)
+	);
+	_focus_relative_position = _cached_ref_orbit_basis * perifocal_pos;
+	if mean_motion <= 0.0:
+		_relative_velocity = Vector3.ZERO;
+		return;
+	var denom: float = 1.0 - eccentricity * cos_e;
+	if is_zero_approx(denom):
+		_relative_velocity = Vector3.ZERO;
+		return;
+	var de_dt: float = mean_motion / denom;
+	var perifocal_vel := Vector3(
+			_semi_minor_axis * cos_e * de_dt,
+			0.0,
+			_semi_major_axis * sin_e * de_dt
+	);
+	_relative_velocity = _cached_ref_orbit_basis * perifocal_vel;
 
 
 ## Evaluates the orbiter's state when modified in the Inspector or gizmos,
@@ -1264,13 +1341,16 @@ func _evaluate_standalone_or_epoch_state() -> void:
 ## [member _semi_minor_axis], and [member _semi_parameter]) from [member periapsis]
 ## and [member eccentricity].
 func _update_orbital_shape_cache() -> void:
-	_semi_parameter = periapsis * (1.0 + eccentricity)
-	if is_parabolic_trajectory():
-		_semi_major_axis = INF
-		_semi_minor_axis = INF
+	_is_circular = is_zero_approx(eccentricity) and eccentricity >= 0.0;
+	_is_parabolic = is_equal_approx(eccentricity, 1.0) and eccentricity >= 1.0;
+	_is_unbound = eccentricity >= 1.0;
+	_semi_parameter = periapsis * (1.0 + eccentricity);
+	if _is_parabolic:
+		_semi_major_axis = INF;
+		_semi_minor_axis = INF;
 	else:
-		_semi_major_axis = periapsis / (1.0 - eccentricity)
-		_semi_minor_axis = absf(_semi_major_axis) * sqrt(absf(1.0 - eccentricity ** 2))
+		_semi_major_axis = periapsis / (1.0 - eccentricity);
+		_semi_minor_axis = absf(_semi_major_axis) * sqrt(absf(1.0 - eccentricity * eccentricity));
 
 
 ## Recalculates the cached 3D orbital orientation transforms from
@@ -1281,17 +1361,43 @@ func _update_orbital_orientation_cache() -> void:
 			(PI if absf(inclination) > PI * 0.5 else 0.0)
 			if is_locked_to_ecliptic()
 			else inclination
-	)
-	var cw_lan := Basis(Vector3.UP, -longitude_of_the_ascending_node)
-	var cw_inc := Basis(Vector3.FORWARD, -eff_inc)
-	var cw_arg := Basis(Vector3.UP, -argument_of_periapsis)
-	var cw_basis: Basis = (cw_lan * cw_inc * cw_arg).orthonormalized()
-	_orbital_transform = Transform3D(cw_basis, Vector3.ZERO)
+	);
+	var cw_lan := Basis(Vector3.UP, -longitude_of_the_ascending_node);
+	var cw_inc := Basis(Vector3.FORWARD, -eff_inc);
+	var cw_arg := Basis(Vector3.UP, -argument_of_periapsis);
+	var cw_basis: Basis = (cw_lan * cw_inc * cw_arg).orthonormalized();
+	_orbital_transform = Transform3D(cw_basis, Vector3.ZERO);
 
-	var ccw_lan := Basis(Vector3.UP, longitude_of_the_ascending_node)
-	var ccw_inc := Basis(Vector3.FORWARD, eff_inc)
-	var ccw_arg := Basis(Vector3.UP, argument_of_periapsis)
-	_orbital_basis_ccw = (ccw_lan * ccw_inc * ccw_arg).orthonormalized()
+	var ccw_lan := Basis(Vector3.UP, longitude_of_the_ascending_node);
+	var ccw_inc := Basis(Vector3.FORWARD, eff_inc);
+	var ccw_arg := Basis(Vector3.UP, argument_of_periapsis);
+	_orbital_basis_ccw = (ccw_lan * ccw_inc * ccw_arg).orthonormalized();
+	_update_reference_frame_cache();
+
+
+## Rebuilds the cached composite bases combining [member _reference_plane] with
+## [member _orbital_transform] and [member axial_tilt].
+func _update_reference_frame_cache() -> void:
+	if _reference_plane == null:
+		_has_ref_frame_cache = false;
+		return;
+	_cached_ref_orbit_basis = _reference_plane.orbit_transform.basis * _orbital_transform.basis;
+	var plane_src: Basis = (
+			_orbital_transform.basis
+			if _reference_plane.positive_is_clockwise
+			else _orbital_basis_ccw
+	);
+	_cached_ref_plane_basis = (_reference_plane.rotation_basis * plane_src).orthonormalized();
+	_cached_ref_dir_sign = -1.0 if _reference_plane.positive_is_clockwise else 1.0;
+	var tilt_basis := Basis.IDENTITY;
+	if not is_zero_approx(axial_tilt) and not _reference_plane.lock_to_ecliptic:
+		var tilt_axis := Vector3.FORWARD.rotated(
+				Vector3.UP,
+				_cached_ref_dir_sign * axial_tilt_longitude
+		);
+		tilt_basis = Basis(tilt_axis, _cached_ref_dir_sign * axial_tilt);
+	_cached_ref_tilted_basis = (_cached_ref_plane_basis * tilt_basis).orthonormalized();
+	_has_ref_frame_cache = true;
 
 
 ## Invalidates the cached eccentric anomaly solution so the next query recomputes

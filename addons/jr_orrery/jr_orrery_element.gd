@@ -101,6 +101,15 @@ var _driver_relative_transform := Transform3D.IDENTITY
 ## [member JrOrbitDriver.perspective_node] offset and rotation lock.
 var _system_transform := Transform3D.IDENTITY
 
+## Transient runtime gravity-well index assigned during [JrOrbitDriver] stepping passes (`-1` when unassigned).
+var _runtime_well_index: int = -1;
+
+## Owning [JrOrbitDriver] currently tracking this element (`null` when untracked).
+var _owning_driver: JrOrreryElement = null;
+
+## Immediate scene-tree parent [JrOrreryElement] recorded by [member _owning_driver].
+var _tracked_scene_parent: JrOrreryElement = null;
+
 
 ## Connects tree-monitoring signals and populates the initial set of direct child elements.
 func _ready() -> void:
@@ -359,6 +368,16 @@ func get_system_transform() -> Transform3D:
 func set_system_transform(new_system_transform: Transform3D) -> void:
 	_system_transform = new_system_transform
 	transform_updated.emit()
+
+
+## Returns the transient runtime gravity-well index assigned by [JrOrbitDriver].
+func get_runtime_well_index() -> int:
+	return _runtime_well_index;
+
+
+## Sets the transient runtime gravity-well index assigned by [JrOrbitDriver].
+func set_runtime_well_index(well_index: int) -> void:
+	_runtime_well_index = well_index;
 
 
 ## Returns the 3D periapsis position relative to the central focus. Overridden by Keplerian
