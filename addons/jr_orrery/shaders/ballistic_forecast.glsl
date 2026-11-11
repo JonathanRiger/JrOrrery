@@ -1,22 +1,23 @@
 #[compute]
 #version 450
 
-// Batched forward-looking trajectory forecaster for JrBallisticOrbiter nodes.
+// Batched forward-looking Cubic Hermite trajectory-horizon baker for JrBallisticOrbiter nodes.
 // Uses Universal-Variable Kepler Kick-Drift-Kick in anchor-relative coordinates,
 // LCA tree-relative well difference walks, Battin's f(q) differential tides,
-// ThrustFrame.ORBITAL prograde/normal/radial basis updates, and mid-forecast
-// Hill-sphere anchor handoffs.
+// ThrustFrame.ORBITAL prograde/normal/radial basis updates, and mid-horizon
+// Hill-sphere anchor handoffs. Supports mixed full-horizon bakes and incremental
+// tail-chunk extensions in a single dispatch via per-body start_t_offset and knot_dt.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 struct ForecastBodyInput {
-	vec4 rel_pos_duration;    // xyz = initial anchor-relative pos, w = forecast duration
-	vec4 rel_vel_steps;       // xyz = initial anchor-relative vel, w = step count (as float)
-	vec4 ext_accel_offset;    // xyz = external thrust accel,       w = output start index (as float)
-	vec4 anchor_frame_flags;  // x = anchor_well_idx, y = thrust_frame, z = enable_tidal, w = is_pinned
+	vec4 rel_pos_step_dt;     // xyz = start anchor-relative pos, w = knot_dt
+	vec4 rel_vel_steps;       // xyz = start anchor-relative vel, w = step count (as float)
+	vec4 ext_accel_t0;        // xyz = external thrust accel,     w = start_t_offset (from timeline t0)
+	vec4 anchor_frame_flags;  // x = out_base_knot, y = anchor_well_idx, z = packed_mode_bits, w = substeps
 };
 
-// Binding 0: Per-body initial state and configuration (64 bytes per body).
+// Binding 0: Per-body starting state and horizon job configuration (64 bytes per body).
 layout(set = 0, binding = 0, std430) restrict readonly buffer ForecastBodyInputBuffer {
 	ForecastBodyInput bodies[];
 };
@@ -28,9 +29,18 @@ layout(set = 0, binding = 1, std430) restrict readonly buffer WellTimelineBuffer
 	vec4 well_samples[];
 };
 
-// Binding 2: Flattened output trajectory points across all bodies (xyz = anchor-relative pos, w = anchor_well_idx).
+// Binding 2: Contiguous per-body [pos_anchor[0..steps] | vel_flags[0..steps]] slices (2 vec4s per knot).
+// For body with out_base_knot and pt_count = steps + 1:
+//   forecast_knots[out_base_knot * 2 + k]            = vec4(r_rel, float(anchor_idx))
+//   forecast_knots[out_base_knot * 2 + pt_count + k] = vec4(v_rel, unperturbed_flag)
 layout(set = 0, binding = 2, std430) restrict writeonly buffer ForecastPointOutputBuffer {
-	vec4 forecast_points[];
+	vec4 forecast_knots[];
+};
+
+// Binding 3: Optional resident GPU trajectory-tape atlas (272 vec4s per body slot:
+// [0..135] pos_anchor, [136..271] vel_flags) populated directly when atlas_slot_plus_one > 0.
+layout(set = 0, binding = 3, std430) restrict writeonly buffer TapeAtlasWriteBuffer {
+	vec4 atlas_knots[];
 };
 
 layout(push_constant, std430) uniform ForecastParams {
@@ -40,8 +50,25 @@ layout(push_constant, std430) uniform ForecastParams {
 	uint timeline_segments;
 } params;
 
-const uint INTERNAL_SUBSTEPS = 2u;
 const float TWO_PI = 6.28318530718;
+const uint ATLAS_SLOT_VEC4S = 272u;
+const uint ATLAS_VEL_OFFSET = 136u;
+
+struct KnotWriteTarget {
+	uint pos_base;
+	uint vel_base;
+	uint atlas_pos_base;
+	bool write_atlas;
+};
+
+void write_knot(KnotWriteTarget dst, uint k_idx, vec4 pos_v4, vec4 vel_v4) {
+	forecast_knots[dst.pos_base + k_idx] = pos_v4;
+	forecast_knots[dst.vel_base + k_idx] = vel_v4;
+	if (dst.write_atlas) {
+		atlas_knots[dst.atlas_pos_base + k_idx] = pos_v4;
+		atlas_knots[dst.atlas_pos_base + ATLAS_VEL_OFFSET + k_idx] = vel_v4;
+	}
+}
 
 float stumpff_c(float z) {
 	if (abs(z) < 1e-3) {
@@ -198,11 +225,11 @@ vec3 compute_timeline_well_difference(int well_a, int well_b, uint idx_a, uint i
 	return diff;
 }
 
-vec3 evaluate_thrust_acceleration(vec3 r_rel, vec3 v_rel, vec3 ext_accel, float thrust_frame) {
+vec3 evaluate_thrust_acceleration(vec3 r_rel, vec3 v_rel, vec3 ext_accel, bool is_orbital_thrust) {
 	if (dot(ext_accel, ext_accel) <= 0.0) {
 		return vec3(0.0);
 	}
-	if (thrust_frame < 1.5) {
+	if (!is_orbital_thrust) {
 		return ext_accel;
 	}
 	float v_len = length(v_rel);
@@ -226,8 +253,10 @@ vec3 compute_timeline_perturbing_gravity(
 	int anchor_idx,
 	float mu_anchor,
 	float t_offset,
-	bool enable_tidal
+	bool enable_tidal,
+	out bool any_pert_active
 ) {
+	any_pert_active = false;
 	if (params.well_count == 0u) {
 		return vec3(0.0);
 	}
@@ -264,6 +293,7 @@ vec3 compute_timeline_perturbing_gravity(
 			if (!enable_tidal && !is_descendant_of(k_idx, anchor_idx)) {
 				continue;
 			}
+			any_pert_active = true;
 			vec3 rho = r_rel + d_vec;
 			float rho_sq = dot(rho, rho);
 			if (rho_sq > 1e-12) {
@@ -285,6 +315,7 @@ vec3 compute_timeline_perturbing_gravity(
 			continue;
 		}
 
+		any_pert_active = true;
 		vec3 rho = r_rel + d_vec;
 		float rho_sq = dot(rho, rho);
 		if (rho_sq <= 1e-12) {
@@ -376,57 +407,136 @@ void main() {
 	}
 
 	ForecastBodyInput input_body = bodies[gid];
-	vec3 r_rel = input_body.rel_pos_duration.xyz;
-	float duration = max(0.0, input_body.rel_pos_duration.w);
+	vec3 r_rel = input_body.rel_pos_step_dt.xyz;
+	float step_dt = max(0.0, input_body.rel_pos_step_dt.w);
 	vec3 v_rel = input_body.rel_vel_steps.xyz;
 	uint steps = max(1u, uint(round(input_body.rel_vel_steps.w)));
-	vec3 ext_accel = input_body.ext_accel_offset.xyz;
-	uint out_base = uint(round(input_body.ext_accel_offset.w));
-	int anchor_idx = int(round(input_body.anchor_frame_flags.x));
-	float thrust_frame = input_body.anchor_frame_flags.y;
-	bool enable_tidal = input_body.anchor_frame_flags.z > 0.5;
-	bool is_pinned = input_body.anchor_frame_flags.w > 0.5;
+	vec3 ext_accel = input_body.ext_accel_t0.xyz;
+	float elapsed = max(0.0, input_body.ext_accel_t0.w);
 
-	forecast_points[out_base] = vec4(r_rel, float(anchor_idx));
+	uint out_knot_base = uint(round(input_body.anchor_frame_flags.x));
+	int anchor_idx = int(round(input_body.anchor_frame_flags.y));
+	uint mode_bits = uint(round(input_body.anchor_frame_flags.z));
+	uint substeps = clamp(uint(round(input_body.anchor_frame_flags.w)), 1u, 64u);
 
-	float step_dt = duration / float(steps);
+	uint low_mode = mode_bits & 7u;
+	uint atlas_slot_plus_one = mode_bits >> 3u;
+	bool is_orbital_thrust = (low_mode & 1u) != 0u;
+	bool enable_tidal = (low_mode & 2u) != 0u;
+	bool is_pinned = (low_mode & 4u) != 0u;
+
+	uint pt_count = steps + 1u;
+	uint pos_base = out_knot_base * 2u;
+	uint vel_base = pos_base + pt_count;
+	bool write_atlas = (atlas_slot_plus_one > 0u) && (pt_count <= ATLAS_VEL_OFFSET);
+	uint atlas_pos_base = write_atlas ? ((atlas_slot_plus_one - 1u) * ATLAS_SLOT_VEC4S) : 0u;
+	KnotWriteTarget dst = KnotWriteTarget(pos_base, vel_base, atlas_pos_base, write_atlas);
+
 	if (step_dt <= 0.0) {
-		for (uint k = 1u; k <= steps; k++) {
-			forecast_points[out_base + k] = vec4(r_rel, float(anchor_idx));
+		for (uint k = 0u; k <= steps; k++) {
+			write_knot(dst, k, vec4(r_rel, float(anchor_idx)), vec4(v_rel, 0.0));
 		}
 		return;
 	}
 
-	float sub_dt = step_dt / float(INTERNAL_SUBSTEPS);
-	float elapsed = 0.0;
 	float mu_anchor = (anchor_idx >= 0 && uint(anchor_idx) < params.well_count)
 		? well_samples[uint(anchor_idx) * 2u].w
 		: 0.0;
+	bool has_thrust = dot(ext_accel, ext_accel) > 0.0;
+	bool pert_active = false;
+	vec3 pert_accel = compute_timeline_perturbing_gravity(
+		r_rel,
+		anchor_idx,
+		mu_anchor,
+		elapsed,
+		enable_tidal,
+		pert_active
+	) + evaluate_thrust_acceleration(r_rel, v_rel, ext_accel, is_orbital_thrust);
 
-	vec3 pert_accel = compute_timeline_perturbing_gravity(r_rel, anchor_idx, mu_anchor, 0.0, enable_tidal)
-		+ evaluate_thrust_acceleration(r_rel, v_rel, ext_accel, thrust_frame);
+	bool all_unperturbed = (!has_thrust) && (mu_anchor > 0.0) && (!pert_active);
+	vec3 r_job0 = r_rel;
+	vec3 v_job0 = v_rel;
+	float elapsed0 = elapsed;
+	write_knot(dst, 0u, vec4(r_rel, float(anchor_idx)), vec4(v_rel, all_unperturbed ? 1.0 : 0.0));
+
+	float sub_dt = step_dt / float(substeps);
 
 	for (uint k = 0u; k < steps; k++) {
-		for (uint s = 0u; s < INTERNAL_SUBSTEPS; s++) {
+		if (all_unperturbed) {
+			vec3 r_cand = r_job0;
+			vec3 v_cand = v_job0;
+			float dt_from_job0 = float(k + 1u) * step_dt;
+			kepler_drift(r_cand, v_cand, mu_anchor, dt_from_job0);
+			float t_cand = elapsed0 + dt_from_job0;
+			bool cand_pert = false;
+			compute_timeline_perturbing_gravity(
+				r_cand,
+				anchor_idx,
+				mu_anchor,
+				t_cand,
+				enable_tidal,
+				cand_pert
+			);
+			if (!cand_pert) {
+				int cand_anchor = anchor_idx;
+				vec3 r_soi = r_cand;
+				vec3 v_soi = v_cand;
+				if (!is_pinned) {
+					maybe_switch_forecast_anchor(r_soi, v_soi, cand_anchor, t_cand);
+				}
+				if (cand_anchor == anchor_idx) {
+					r_rel = r_cand;
+					v_rel = v_cand;
+					elapsed = t_cand;
+					write_knot(dst, k + 1u, vec4(r_rel, float(anchor_idx)), vec4(v_rel, 1.0));
+					continue;
+				}
+			}
+			all_unperturbed = false;
+			pert_accel = vec3(0.0);
+		}
+
+		for (uint s = 0u; s < substeps; s++) {
 			v_rel += 0.5 * sub_dt * pert_accel;
 			kepler_drift(r_rel, v_rel, mu_anchor, sub_dt);
 			elapsed += sub_dt;
 
-			pert_accel = compute_timeline_perturbing_gravity(r_rel, anchor_idx, mu_anchor, elapsed, enable_tidal)
-				+ evaluate_thrust_acceleration(r_rel, v_rel, ext_accel, thrust_frame);
+			pert_accel = compute_timeline_perturbing_gravity(
+				r_rel,
+				anchor_idx,
+				mu_anchor,
+				elapsed,
+				enable_tidal,
+				pert_active
+			) + evaluate_thrust_acceleration(r_rel, v_rel, ext_accel, is_orbital_thrust);
+			if (pert_active) {
+				all_unperturbed = false;
+			}
 			v_rel += 0.5 * sub_dt * pert_accel;
 		}
 		if (!is_pinned) {
 			int prev_anchor = anchor_idx;
 			maybe_switch_forecast_anchor(r_rel, v_rel, anchor_idx, elapsed);
 			if (anchor_idx != prev_anchor) {
+				all_unperturbed = false;
 				mu_anchor = (anchor_idx >= 0 && uint(anchor_idx) < params.well_count)
 					? well_samples[uint(anchor_idx) * 2u].w
 					: 0.0;
-				pert_accel = compute_timeline_perturbing_gravity(r_rel, anchor_idx, mu_anchor, elapsed, enable_tidal)
-					+ evaluate_thrust_acceleration(r_rel, v_rel, ext_accel, thrust_frame);
+				pert_accel = compute_timeline_perturbing_gravity(
+					r_rel,
+					anchor_idx,
+					mu_anchor,
+					elapsed,
+					enable_tidal,
+					pert_active
+				) + evaluate_thrust_acceleration(r_rel, v_rel, ext_accel, is_orbital_thrust);
 			}
 		}
-		forecast_points[out_base + k + 1u] = vec4(r_rel, float(anchor_idx));
+		write_knot(
+			dst,
+			k + 1u,
+			vec4(r_rel, float(anchor_idx)),
+			vec4(v_rel, all_unperturbed ? 1.0 : 0.0)
+		);
 	}
 }
