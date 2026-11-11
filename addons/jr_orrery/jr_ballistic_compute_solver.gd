@@ -15,7 +15,13 @@ extends RefCounted
 const SHADER_PATH: String = "res://addons/jr_orrery/shaders/ballistic_gravity.glsl"
 
 ## Path to the forward trajectory forecast GLSL compute shader resource.
-const FORECAST_SHADER_PATH: String = "res://addons/jr_orrery/shaders/ballistic_forecast.glsl"
+const FORECAST_SHADER_PATH: String = "res://addons/jr_orrery/shaders/ballistic_forecast.glsl";
+
+## Path to the GPU periodic cubic B-spline baker shader for [JrRailOrbiter] mean-to-true anomaly lookup.
+const RAIL_SPLINE_SHADER_PATH: String = "res://addons/jr_orrery/shaders/rail_spline_bake.glsl";
+
+## Byte stride of a single 256-segment baked B-spline table (`256 * sizeof(vec4) = 4096 bytes`).
+const BYTES_PER_RAIL_SPLINE: int = JrRailOrbiter.NU_SPLINE_SEGMENTS * BYTES_PER_VEC4;
 
 ## Compute shader workgroup X dimension matching [code]local_size_x[/code] in GLSL.
 const WORKGROUP_SIZE_X: int = 64
@@ -104,7 +110,13 @@ static var _shared_pipeline_rid := RID()
 static var _shared_forecast_shader_rid := RID()
 
 ## Shared forecast compute pipeline [RID] on [member _shared_rd].
-static var _shared_forecast_pipeline_rid := RID()
+static var _shared_forecast_pipeline_rid := RID();
+
+## Shared compiled rail B-spline baker shader [RID] on [member _shared_rd].
+static var _shared_rail_spline_shader_rid := RID();
+
+## Shared rail B-spline baker compute pipeline [RID] on [member _shared_rd].
+static var _shared_rail_spline_pipeline_rid := RID();
 
 ## Number of active solver instances currently holding a reference to [member _shared_rd].
 static var _shared_rd_ref_count: int = 0
@@ -122,7 +134,10 @@ var _gpu_init_attempted: bool = false
 var _gpu_available: bool = false
 
 ## Whether the trajectory forecast GPU compute pipeline compiled successfully.
-var _forecast_gpu_available: bool = false
+var _forecast_gpu_available: bool = false;
+
+## Whether the rail B-spline baker GPU compute pipeline compiled successfully.
+var _rail_spline_gpu_available: bool = false;
 
 ## Compiled stepping compute shader [RID] on [member _rd].
 var _shader_rid := RID()
@@ -176,7 +191,28 @@ var _forecast_body_capacity: int = 0
 var _forecast_timeline_capacity: int = 0
 
 ## Allocated vec4 point capacity of [member _forecast_output_buffer_rid].
-var _forecast_output_capacity: int = 0
+var _forecast_output_capacity: int = 0;
+
+## Compiled rail B-spline baker shader [RID] on [member _rd].
+var _rail_spline_shader_rid := RID();
+
+## Rail B-spline baker compute pipeline [RID] on [member _rd].
+var _rail_spline_pipeline_rid := RID();
+
+## Storage buffer [RID] for rail spline baker Binding 0 (`EccentricityInputBuffer`).
+var _rail_spline_in_rid := RID();
+
+## Storage buffer [RID] for rail spline baker Binding 1 (`SplineSegmentOutputBuffer`).
+var _rail_spline_out_rid := RID();
+
+## Uniform set [RID] for rail spline baker bindings 0 and 1.
+var _rail_spline_uniform_set_rid := RID();
+
+## Allocated curve capacity of [member _rail_spline_in_rid] and [member _rail_spline_out_rid].
+var _rail_spline_capacity: int = 0;
+
+## Cache of baked 256-segment B-spline tables keyed by exact quantized orbital eccentricity.
+var _baked_ecc_cache: Dictionary[float, PackedVector4Array] = {};
 
 ## Current simulation timestamp supplied for the active stepping pass.
 var _step_current_time: float = 0.0
@@ -374,10 +410,16 @@ static func _dispose_shared_rd() -> void:
 		_shared_rd.free_rid(_shared_forecast_pipeline_rid)
 		_shared_forecast_pipeline_rid = RID()
 	if _shared_forecast_shader_rid.is_valid():
-		_shared_rd.free_rid(_shared_forecast_shader_rid)
-		_shared_forecast_shader_rid = RID()
-	_shared_rd.free()
-	_shared_rd = null
+		_shared_rd.free_rid(_shared_forecast_shader_rid);
+		_shared_forecast_shader_rid = RID();
+	if _shared_rail_spline_pipeline_rid.is_valid():
+		_shared_rd.free_rid(_shared_rail_spline_pipeline_rid);
+		_shared_rail_spline_pipeline_rid = RID();
+	if _shared_rail_spline_shader_rid.is_valid():
+		_shared_rd.free_rid(_shared_rail_spline_shader_rid);
+		_shared_rail_spline_shader_rid = RID();
+	_shared_rd.free();
+	_shared_rd = null;
 
 
 ## Returns the smallest power of two greater than or equal to [param value] (minimum 8).
@@ -458,8 +500,67 @@ func is_gpu_active() -> bool:
 func is_forecast_gpu_active() -> bool:
 	if _force_cpu:
 		return false;
-	_ensure_gpu_initialized()
-	return _forecast_gpu_available
+	_ensure_gpu_initialized();
+	return _forecast_gpu_available;
+
+
+## Returns `true` if the GPU periodic cubic B-spline baker pipeline is active.
+func is_rail_spline_gpu_active() -> bool:
+	if _force_cpu:
+		return false;
+	_ensure_gpu_initialized();
+	return _rail_spline_gpu_available;
+
+
+## Bakes 256-segment periodic cubic B-spline lookup tables (`M -> nu(M) - M`) for all
+## [JrRailOrbiter] nodes in [param orbiters] requiring a bake, deduplicating shared
+## eccentricities and dispatching [constant RAIL_SPLINE_SHADER_PATH] on the GPU.
+func bake_rail_splines(orbiters: Array[JrRailOrbiter]) -> void:
+	if orbiters.is_empty():
+		return;
+
+	var pending_orbiters: Array[JrRailOrbiter] = [];
+	var unique_ecc_keys: Array[float] = [];
+	var unique_eccs: PackedFloat32Array = PackedFloat32Array();
+	var missing_ecc_map: Dictionary[float, int] = {};
+
+	for i: int in range(orbiters.size()):
+		var orbiter: JrRailOrbiter = orbiters[i];
+		if orbiter == null or not is_instance_valid(orbiter):
+			continue;
+		if not orbiter.needs_nu_spline_bake():
+			orbiter._in_dirty_spline_queue = false;
+			continue;
+		var ecc_key: float = orbiter.eccentricity;
+		if _baked_ecc_cache.has(ecc_key):
+			orbiter.apply_baked_nu_spline(ecc_key, _baked_ecc_cache[ecc_key]);
+			continue;
+		pending_orbiters.append(orbiter);
+		if not missing_ecc_map.has(ecc_key):
+			missing_ecc_map[ecc_key] = unique_ecc_keys.size();
+			unique_ecc_keys.append(ecc_key);
+			unique_eccs.append(ecc_key);
+
+	if unique_eccs.is_empty():
+		return;
+
+	var all_segments: PackedVector4Array = (
+			_bake_unique_splines_gpu(unique_eccs)
+			if is_rail_spline_gpu_active()
+			else _bake_unique_splines_cpu(unique_eccs)
+	);
+	var seg_stride: int = JrRailOrbiter.NU_SPLINE_SEGMENTS;
+	for c: int in range(unique_ecc_keys.size()):
+		var start_idx: int = c * seg_stride;
+		_baked_ecc_cache[unique_ecc_keys[c]] = all_segments.slice(start_idx, start_idx + seg_stride);
+
+	for p: int in range(pending_orbiters.size()):
+		var orb: JrRailOrbiter = pending_orbiters[p];
+		var ecc_k: float = orb.eccentricity;
+		if _baked_ecc_cache.has(ecc_k):
+			orb.apply_baked_nu_spline(ecc_k, _baked_ecc_cache[ecc_k]);
+		else:
+			orb._in_dirty_spline_queue = false;
 
 
 ## Configures the current simulation timestamp, tidal culling threshold, and ordered
@@ -485,33 +586,39 @@ func configure_step_context(
 ## is disposed) the shared pipelines, shaders, and local [RenderingDevice] to prevent RID leaks.
 func dispose() -> void:
 	if _rd == null:
-		_gpu_available = false
-		_forecast_gpu_available = false
-		_gpu_init_attempted = false
-		return
+		_gpu_available = false;
+		_forecast_gpu_available = false;
+		_rail_spline_gpu_available = false;
+		_gpu_init_attempted = false;
+		return;
 
-	_dispose_stepping_rids()
-	_dispose_forecast_rids()
-	_shader_rid = RID()
-	_pipeline_rid = RID()
-	_forecast_shader_rid = RID()
-	_forecast_pipeline_rid = RID()
+	_dispose_stepping_rids();
+	_dispose_forecast_rids();
+	_dispose_rail_spline_rids();
+	_shader_rid = RID();
+	_pipeline_rid = RID();
+	_forecast_shader_rid = RID();
+	_forecast_pipeline_rid = RID();
+	_rail_spline_shader_rid = RID();
+	_rail_spline_pipeline_rid = RID();
 
 	if _holds_shared_rd:
-		_holds_shared_rd = false
-		_shared_rd_ref_count = maxi(0, _shared_rd_ref_count - 1)
+		_holds_shared_rd = false;
+		_shared_rd_ref_count = maxi(0, _shared_rd_ref_count - 1);
 		if _shared_rd_ref_count == 0 and _shared_rd != null:
-			_dispose_shared_rd()
+			_dispose_shared_rd();
 
-	_rd = null
-	_body_capacity = 0
-	_well_capacity = 0
-	_forecast_body_capacity = 0
-	_forecast_timeline_capacity = 0
-	_forecast_output_capacity = 0
-	_gpu_available = false
-	_forecast_gpu_available = false
-	_gpu_init_attempted = false
+	_rd = null;
+	_body_capacity = 0;
+	_well_capacity = 0;
+	_forecast_body_capacity = 0;
+	_forecast_timeline_capacity = 0;
+	_forecast_output_capacity = 0;
+	_rail_spline_capacity = 0;
+	_gpu_available = false;
+	_forecast_gpu_available = false;
+	_rail_spline_gpu_available = false;
+	_gpu_init_attempted = false;
 
 
 ## Integrates all [param bodies] over [param dt] with up to [param substeps] adaptive
@@ -699,41 +806,53 @@ func compute_preview_trajectory(config: JrBallisticPreviewConfig) -> PackedVecto
 ## pipelines.
 func _ensure_gpu_initialized() -> void:
 	if _gpu_init_attempted:
-		return
-	_gpu_init_attempted = true
+		return;
+	_gpu_init_attempted = true;
 
 	if RenderingServer.get_current_rendering_driver_name() == "dummy":
-		_gpu_available = false
-		_forecast_gpu_available = false
-		return
+		_gpu_available = false;
+		_forecast_gpu_available = false;
+		_rail_spline_gpu_available = false;
+		return;
 
 	if _shared_rd == null:
-		_shared_rd = RenderingServer.create_local_rendering_device()
+		_shared_rd = RenderingServer.create_local_rendering_device();
 		if _shared_rd == null:
-			_gpu_available = false
-			_forecast_gpu_available = false
-			return
-		_rd = _shared_rd
-		_init_stepping_pipeline()
-		_init_forecast_pipeline()
-		_shared_shader_rid = _shader_rid
-		_shared_pipeline_rid = _pipeline_rid
-		_shared_forecast_shader_rid = _forecast_shader_rid
-		_shared_forecast_pipeline_rid = _forecast_pipeline_rid
-		if not _shared_pipeline_rid.is_valid() and not _shared_forecast_pipeline_rid.is_valid():
-			_dispose_shared_rd()
-			_rd = null
-			return
+			_gpu_available = false;
+			_forecast_gpu_available = false;
+			_rail_spline_gpu_available = false;
+			return;
+		_rd = _shared_rd;
+		_init_stepping_pipeline();
+		_init_forecast_pipeline();
+		_init_rail_spline_pipeline();
+		_shared_shader_rid = _shader_rid;
+		_shared_pipeline_rid = _pipeline_rid;
+		_shared_forecast_shader_rid = _forecast_shader_rid;
+		_shared_forecast_pipeline_rid = _forecast_pipeline_rid;
+		_shared_rail_spline_shader_rid = _rail_spline_shader_rid;
+		_shared_rail_spline_pipeline_rid = _rail_spline_pipeline_rid;
+		if (
+				not _shared_pipeline_rid.is_valid()
+				and not _shared_forecast_pipeline_rid.is_valid()
+				and not _shared_rail_spline_pipeline_rid.is_valid()
+		):
+			_dispose_shared_rd();
+			_rd = null;
+			return;
 
-	_rd = _shared_rd
-	_shader_rid = _shared_shader_rid
-	_pipeline_rid = _shared_pipeline_rid
-	_forecast_shader_rid = _shared_forecast_shader_rid
-	_forecast_pipeline_rid = _shared_forecast_pipeline_rid
-	_gpu_available = _pipeline_rid.is_valid()
-	_forecast_gpu_available = _forecast_pipeline_rid.is_valid()
-	_shared_rd_ref_count += 1
-	_holds_shared_rd = true
+	_rd = _shared_rd;
+	_shader_rid = _shared_shader_rid;
+	_pipeline_rid = _shared_pipeline_rid;
+	_forecast_shader_rid = _shared_forecast_shader_rid;
+	_forecast_pipeline_rid = _shared_forecast_pipeline_rid;
+	_rail_spline_shader_rid = _shared_rail_spline_shader_rid;
+	_rail_spline_pipeline_rid = _shared_rail_spline_pipeline_rid;
+	_gpu_available = _pipeline_rid.is_valid();
+	_forecast_gpu_available = _forecast_pipeline_rid.is_valid();
+	_rail_spline_gpu_available = _rail_spline_pipeline_rid.is_valid();
+	_shared_rd_ref_count += 1;
+	_holds_shared_rd = true;
 
 
 ## Compiles [constant SHADER_PATH] and creates [member _pipeline_rid].
@@ -766,8 +885,25 @@ func _init_forecast_pipeline() -> void:
 	if not _forecast_shader_rid.is_valid():
 		return
 
-	_forecast_pipeline_rid = _rd.compute_pipeline_create(_forecast_shader_rid)
-	_forecast_gpu_available = _forecast_pipeline_rid.is_valid()
+	_forecast_pipeline_rid = _rd.compute_pipeline_create(_forecast_shader_rid);
+	_forecast_gpu_available = _forecast_pipeline_rid.is_valid();
+
+
+## Compiles [constant RAIL_SPLINE_SHADER_PATH] and creates [member _rail_spline_pipeline_rid].
+func _init_rail_spline_pipeline() -> void:
+	var spirv: RDShaderSPIRV = _load_or_compile_spirv(RAIL_SPLINE_SHADER_PATH);
+	if (
+			spirv == null
+			or not spirv.get_stage_compile_error(RenderingDevice.SHADER_STAGE_COMPUTE).is_empty()
+	):
+		return;
+
+	_rail_spline_shader_rid = _rd.shader_create_from_spirv(spirv);
+	if not _rail_spline_shader_rid.is_valid():
+		return;
+
+	_rail_spline_pipeline_rid = _rd.compute_pipeline_create(_rail_spline_shader_rid);
+	_rail_spline_gpu_available = _rail_spline_pipeline_rid.is_valid();
 
 
 ## Compiles raw GLSL source from [param path] on [member _rd], or falls back to pre-imported
@@ -831,8 +967,147 @@ func _dispose_forecast_rids() -> void:
 		_rd.free_rid(_forecast_timeline_buffer_rid)
 		_forecast_timeline_buffer_rid = RID()
 	if _forecast_output_buffer_rid.is_valid():
-		_rd.free_rid(_forecast_output_buffer_rid)
-		_forecast_output_buffer_rid = RID()
+		_rd.free_rid(_forecast_output_buffer_rid);
+		_forecast_output_buffer_rid = RID();
+
+
+## Frees all per-instance rail spline baker buffers and uniform set RIDs on [member _rd].
+func _dispose_rail_spline_rids() -> void:
+	if _rail_spline_uniform_set_rid.is_valid() and _rd.uniform_set_is_valid(_rail_spline_uniform_set_rid):
+		_rd.free_rid(_rail_spline_uniform_set_rid);
+	_rail_spline_uniform_set_rid = RID();
+	if _rail_spline_in_rid.is_valid():
+		_rd.free_rid(_rail_spline_in_rid);
+		_rail_spline_in_rid = RID();
+	if _rail_spline_out_rid.is_valid():
+		_rd.free_rid(_rail_spline_out_rid);
+		_rail_spline_out_rid = RID();
+
+
+## Ensures rail spline baker SSBOs and uniform set have capacity for [param required_curves].
+func _ensure_rail_spline_capacities(required_curves: int) -> void:
+	var target: int = maxi(1, required_curves);
+	if (
+			target <= _rail_spline_capacity
+			and _rail_spline_in_rid.is_valid()
+			and _rail_spline_out_rid.is_valid()
+			and _rail_spline_uniform_set_rid.is_valid()
+			and _rd.uniform_set_is_valid(_rail_spline_uniform_set_rid)
+	):
+		return;
+
+	_dispose_rail_spline_rids();
+	_rail_spline_capacity = _next_power_of_two(target);
+	_rail_spline_in_rid = _rd.storage_buffer_create(_rail_spline_capacity * 4);
+	_rail_spline_out_rid = _rd.storage_buffer_create(_rail_spline_capacity * BYTES_PER_RAIL_SPLINE);
+
+	var u_in := RDUniform.new();
+	u_in.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER;
+	u_in.binding = 0;
+	u_in.add_id(_rail_spline_in_rid);
+
+	var u_out := RDUniform.new();
+	u_out.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER;
+	u_out.binding = 1;
+	u_out.add_id(_rail_spline_out_rid);
+
+	_rail_spline_uniform_set_rid = _rd.uniform_set_create([u_in, u_out], _rail_spline_shader_rid, 0);
+
+
+## Dispatches [constant RAIL_SPLINE_SHADER_PATH] on the GPU to bake [param unique_eccs] in parallel.
+func _bake_unique_splines_gpu(unique_eccs: PackedFloat32Array) -> PackedVector4Array:
+	var curve_count: int = unique_eccs.size();
+	_ensure_rail_spline_capacities(curve_count);
+
+	var ecc_bytes: PackedByteArray = unique_eccs.to_byte_array();
+	_rd.buffer_update(_rail_spline_in_rid, 0, ecc_bytes.size(), ecc_bytes);
+
+	var push_bytes := PackedByteArray();
+	push_bytes.resize(PUSH_CONSTANT_BYTES);
+	push_bytes.encode_u32(0, curve_count);
+
+	var cl: int = _rd.compute_list_begin();
+	_rd.compute_list_bind_compute_pipeline(cl, _rail_spline_pipeline_rid);
+	_rd.compute_list_bind_uniform_set(cl, _rail_spline_uniform_set_rid, 0);
+	_rd.compute_list_set_push_constant(cl, push_bytes, push_bytes.size());
+	_rd.compute_list_dispatch(cl, curve_count, 1, 1);
+	_rd.compute_list_end();
+
+	_rd.submit();
+	_rd.sync();
+
+	var out_bytes: PackedByteArray = _rd.buffer_get_data(
+			_rail_spline_out_rid,
+			0,
+			curve_count * BYTES_PER_RAIL_SPLINE
+	);
+	return out_bytes.to_vector4_array();
+
+
+## CPU fallback matching [constant RAIL_SPLINE_SHADER_PATH] when no GPU [RenderingDevice] is active.
+func _bake_unique_splines_cpu(unique_eccs: PackedFloat32Array) -> PackedVector4Array:
+	var seg_count: int = JrRailOrbiter.NU_SPLINE_SEGMENTS;
+	var curve_count: int = unique_eccs.size();
+	var out_segments := PackedVector4Array();
+	out_segments.resize(curve_count * seg_count);
+
+	var deltas := PackedFloat32Array();
+	deltas.resize(seg_count);
+	var ctrls := PackedFloat32Array();
+	ctrls.resize(seg_count);
+
+	for c: int in range(curve_count):
+		_bake_single_eccentricity_cpu(unique_eccs[c], c * seg_count, deltas, ctrls);
+		var base: int = c * seg_count;
+		for k: int in range(seg_count):
+			var p0: float = ctrls[(k + 255) & 255];
+			var p1: float = ctrls[k];
+			var p2: float = ctrls[(k + 1) & 255];
+			var p3: float = ctrls[(k + 2) & 255];
+			out_segments[base + k] = Vector4(
+					deltas[k],
+					0.5 * (p2 - p0),
+					0.5 * (p0 - 2.0 * p1 + p2),
+					(p3 - p0 + 3.0 * (p1 - p2)) * (1.0 / 6.0)
+			);
+	return out_segments;
+
+
+## Populates [param deltas] and periodic cubic B-spline control points [param ctrls] for [param ecc].
+func _bake_single_eccentricity_cpu(
+		ecc: float,
+		_out_offset: int,
+		deltas: PackedFloat32Array,
+		ctrls: PackedFloat32Array
+) -> void:
+	var clamped_e: float = clampf(ecc, 0.0, 0.9999);
+	var beta: float = clamped_e / (1.0 + sqrt(maxf(0.0, 1.0 - clamped_e * clamped_e)));
+	var step_rad: float = JrRailOrbiter.NU_SPLINE_STEP;
+
+	for k: int in range(256):
+		if k == 0 or k == 128 or clamped_e <= 1e-7:
+			deltas[k] = 0.0;
+			continue;
+		var mean_anom: float = -PI + float(k) * step_rad;
+		var de: float = clamped_e * sin(mean_anom);
+		for _iter: int in range(8):
+			var e_anom: float = mean_anom + de;
+			de -= (de - clamped_e * sin(e_anom)) / maxf(1e-6, 1.0 - clamped_e * cos(e_anom));
+		var e_final: float = mean_anom + de;
+		var nu_minus_e: float = 2.0 * atan(
+				(beta * sin(e_final)) / maxf(1e-7, 1.0 - beta * cos(e_final))
+		);
+		deltas[k] = de + nu_minus_e;
+
+	const POLE_Z1: float = -0.2679491924311227;
+	const GAIN_C0: float = 1.7320508075688772;
+	for k: int in range(256):
+		var sum_val: float = deltas[k];
+		var z_pow: float = POLE_Z1;
+		for tap: int in range(1, 17):
+			sum_val += z_pow * (deltas[(k - tap) & 255] + deltas[(k + tap) & 255]);
+			z_pow *= POLE_Z1;
+		ctrls[k] = GAIN_C0 * sum_val;
 
 
 ## Ensures stepping SSBOs and uniform set have capacity for [param required_bodies] and

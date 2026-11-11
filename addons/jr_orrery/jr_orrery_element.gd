@@ -110,6 +110,12 @@ var _owning_driver: JrOrreryElement = null;
 ## Immediate scene-tree parent [JrOrreryElement] recorded by [member _owning_driver].
 var _tracked_scene_parent: JrOrreryElement = null;
 
+## Cached LCA position offset from the active perspective element for the current frame pass.
+var _persp_offset_cached: Vector3 = Vector3.ZERO;
+
+## Monotonic pass stamp identifying when [member _persp_offset_cached] was populated.
+var _persp_offset_stamp: int = 0;
+
 
 ## Connects tree-monitoring signals and populates the initial set of direct child elements.
 func _ready() -> void:

@@ -327,8 +327,8 @@ var _lca_b_elems: Array[JrOrreryElement] = [];
 ## Reusable ancestor vector stack paired with [member _lca_b_elems] for allocation-free LCA queries.
 var _lca_b_vecs: PackedVector3Array = PackedVector3Array();
 
-## Per-frame LCA-exact position offsets relative to [member perspective_node] for tracked elements.
-var _persp_well_offsets: Dictionary[JrOrreryElement, Vector3] = {};
+## Monotonic pass stamp identifying the active perspective offset table evaluation pass.
+var _persp_pass_stamp: int = 0;
 
 ## Cached flag indicating whether the active [member perspective_node] resolves to heliocentric root.
 var _persp_is_heliocentric: bool = true;
@@ -392,6 +392,9 @@ var _pending_ballistic_init: bool = true;
 
 ## Dirty flag indicating one or more [JrBallisticOrbiter] nodes require pre-step anchor validation or pinning.
 var _ballistic_anchors_dirty: bool = true;
+
+## Sparse queue of [JrRailOrbiter] nodes whose GPU B-spline lookup tables need baking.
+var _dirty_rail_splines: Array[JrRailOrbiter] = [];
 
 
 ## Initializes the generated [JrReferenceDirection], connects subtree signals,
@@ -612,11 +615,7 @@ func update_orbits() -> void:
 	var is_identity_basis: bool = (persp_basis == Basis.IDENTITY);
 	_build_perspective_offset_table();
 
-	var root_rel_pos: Vector3 = (
-			Vector3.ZERO
-			if _persp_is_heliocentric
-			else _persp_well_offsets.get(self, Vector3.ZERO)
-	);
+	var root_rel_pos: Vector3 = Vector3.ZERO if _persp_is_heliocentric else _persp_offset_cached;
 	var driver_origin: Vector3 = (
 			root_rel_pos if is_identity_basis else (persp_basis * root_rel_pos)
 	);
@@ -627,16 +626,20 @@ func update_orbits() -> void:
 	emit_signal(&"transform_updated");
 
 	if _persp_is_heliocentric and is_identity_basis:
-		for orbiter: JrRailOrbiter in _orbit_sequence:
+		var r_seq: Array[JrRailOrbiter] = _orbit_sequence;
+		for r_idx: int in range(r_seq.size()):
+			var orbiter: JrRailOrbiter = r_seq[r_idx];
 			orbiter._system_transform = orbiter._driver_relative_transform;
 			orbiter.emit_signal(&"transform_updated");
 	else:
-		for orbiter: JrRailOrbiter in _orbit_sequence:
+		var r_seq: Array[JrRailOrbiter] = _orbit_sequence;
+		for r_idx: int in range(r_seq.size()):
+			var orbiter: JrRailOrbiter = r_seq[r_idx];
 			var drv_xf: Transform3D = orbiter._driver_relative_transform;
 			var rel_pos: Vector3 = (
 					drv_xf.origin
 					if _persp_is_heliocentric
-					else _persp_well_offsets.get(orbiter, Vector3.ZERO)
+					else orbiter._persp_offset_cached
 			);
 			if is_identity_basis:
 				orbiter._system_transform = Transform3D(drv_xf.basis, rel_pos);
@@ -851,11 +854,13 @@ func _invalidate_all_ballistic_forecasts() -> void:
 ## Evaluates epoch Keplerian states and forward-integrated ballistic trajectory
 ## previews when running inside the Godot Editor.
 func _evaluate_editor_system_state(playing: bool) -> void:
+	if not _dirty_rail_splines.is_empty():
+		_flush_dirty_rail_splines();
 	for orbiter: JrRailOrbiter in _orbit_sequence:
-		var parent_xf: Transform3D = _get_parent_driver_transform_for(orbiter)
-		var parent_vel: Vector3 = _get_parent_global_velocity_for(orbiter)
-		orbiter.set_simulation_playing(playing)
-		orbiter.evaluate_orbital_state(0.0, _reference_plane, parent_xf, parent_vel)
+		var parent_xf: Transform3D = _get_parent_driver_transform_for(orbiter);
+		var parent_vel: Vector3 = _get_parent_global_velocity_for(orbiter);
+		orbiter.set_simulation_playing(playing);
+		orbiter.evaluate_orbital_state(0.0, _reference_plane, parent_xf, parent_vel);
 
 	if _ballistic_sequence.is_empty():
 		return
@@ -972,11 +977,7 @@ func _apply_driver_and_rail_system_transforms_instrumented() -> Basis:
 	var is_identity_basis: bool = (persp_basis == Basis.IDENTITY);
 	_build_perspective_offset_table();
 
-	var root_rel_pos: Vector3 = (
-			Vector3.ZERO
-			if _persp_is_heliocentric
-			else _persp_well_offsets.get(self, Vector3.ZERO)
-	);
+	var root_rel_pos: Vector3 = Vector3.ZERO if _persp_is_heliocentric else _persp_offset_cached;
 	var driver_origin: Vector3 = (
 			root_rel_pos if is_identity_basis else (persp_basis * root_rel_pos)
 	);
@@ -984,18 +985,19 @@ func _apply_driver_and_rail_system_transforms_instrumented() -> Basis:
 	_local_orbital_transform = driver_system_transform;
 	_driver_relative_transform = Transform3D.IDENTITY;
 
-	var rail_count: int = _orbit_sequence.size();
+	var r_seq: Array[JrRailOrbiter] = _orbit_sequence;
+	var rail_count: int = r_seq.size();
 	var use_direct_driver_xf: bool = _persp_is_heliocentric and is_identity_basis;
 	var rail_transforms: Array[Transform3D] = [];
 	if not use_direct_driver_xf:
 		rail_transforms.resize(rail_count);
 		for i: int in range(rail_count):
-			var orbiter: JrRailOrbiter = _orbit_sequence[i];
-			var drv_xf: Transform3D = orbiter.get_driver_relative_transform();
+			var orbiter: JrRailOrbiter = r_seq[i];
+			var drv_xf: Transform3D = orbiter._driver_relative_transform;
 			var rel_pos: Vector3 = (
 					drv_xf.origin
 					if _persp_is_heliocentric
-					else _persp_well_offsets.get(orbiter, Vector3.ZERO)
+					else orbiter._persp_offset_cached
 			);
 			if is_identity_basis:
 				rail_transforms[i] = Transform3D(drv_xf.basis, rel_pos);
@@ -1010,12 +1012,12 @@ func _apply_driver_and_rail_system_transforms_instrumented() -> Basis:
 	emit_signal(&"transform_updated");
 	if use_direct_driver_xf:
 		for i: int in range(rail_count):
-			var orbiter: JrRailOrbiter = _orbit_sequence[i];
+			var orbiter: JrRailOrbiter = r_seq[i];
 			orbiter._system_transform = orbiter._driver_relative_transform;
 			orbiter.emit_signal(&"transform_updated");
 	else:
 		for i: int in range(rail_count):
-			var orbiter: JrRailOrbiter = _orbit_sequence[i];
+			var orbiter: JrRailOrbiter = r_seq[i];
 			orbiter._system_transform = rail_transforms[i];
 			orbiter.emit_signal(&"transform_updated");
 	var t_sig1: int = Time.get_ticks_usec();
@@ -1083,7 +1085,6 @@ func _sync_ballistic_direct_system_xf_flag(use_direct_xf: bool) -> void:
 ## Precomputes cancellation-free LCA offsets from [member perspective_node] for all gravity wells
 ## in a single top-down pass so per-orbiter and per-ballistic lookups run in `O(1)`.
 func _build_perspective_offset_table() -> void:
-	_persp_well_offsets.clear();
 	_persp_is_heliocentric = (
 			perspective_node == null
 			or perspective_node == self
@@ -1092,38 +1093,54 @@ func _build_perspective_offset_table() -> void:
 	if _persp_is_heliocentric:
 		return;
 
+	_persp_pass_stamp += 1;
+	var stamp: int = _persp_pass_stamp;
+	var self_elem: JrOrreryElement = self;
+
 	var curr_p: JrOrreryElement = perspective_node;
 	var accum_p := Vector3.ZERO;
 	while curr_p != null:
-		_persp_well_offsets[curr_p] = -accum_p;
-		if curr_p == self:
+		curr_p._persp_offset_cached = -accum_p;
+		curr_p._persp_offset_stamp = stamp;
+		if curr_p == self_elem:
 			break;
 		accum_p += _get_element_kinematic_local_offset(curr_p);
 		curr_p = _get_element_kinematic_parent(curr_p);
 
-	var self_elem: JrOrreryElement = self;
-	var root_offset: Vector3 = _persp_well_offsets.get(self_elem, -accum_p);
-	_persp_well_offsets[self_elem] = root_offset;
+	if _persp_offset_stamp != stamp:
+		_persp_offset_cached = -accum_p;
+		_persp_offset_stamp = stamp;
+	var root_offset: Vector3 = _persp_offset_cached;
 
-	for orbiter: JrRailOrbiter in _orbit_sequence:
-		var orb_elem: JrOrreryElement = orbiter;
-		if _persp_well_offsets.has(orb_elem):
+	var r_seq: Array[JrRailOrbiter] = _orbit_sequence;
+	for i: int in range(r_seq.size()):
+		var orbiter: JrRailOrbiter = r_seq[i];
+		if orbiter._persp_offset_stamp == stamp:
 			continue;
-		var parent_elem: JrOrreryElement = _children.get(orbiter, self_elem);
-		var parent_offset: Vector3 = _persp_well_offsets.get(parent_elem, root_offset);
-		_persp_well_offsets[orb_elem] = parent_offset + orbiter.get_focus_relative_position();
+		var parent_elem: JrOrreryElement = orbiter._tracked_scene_parent;
+		var parent_offset: Vector3 = (
+				parent_elem._persp_offset_cached
+				if (parent_elem != null and parent_elem._persp_offset_stamp == stamp)
+				else root_offset
+		);
+		orbiter._persp_offset_cached = parent_offset + orbiter._focus_relative_position;
+		orbiter._persp_offset_stamp = stamp;
 
 
 ## Returns the cancellation-free LCA offset of [param ballistic] from [member perspective_node]
-## in `O(1)` using [member _persp_well_offsets].
+## in `O(1)` using [member JrOrreryElement._persp_offset_cached].
 func _lookup_ballistic_perspective_offset(ballistic: JrBallisticOrbiter) -> Vector3:
 	if _persp_is_heliocentric:
 		return ballistic.get_driver_position();
-	if _persp_well_offsets.has(ballistic):
-		return Vector3.ZERO;
+	var stamp: int = _persp_pass_stamp;
+	if ballistic._persp_offset_stamp == stamp:
+		return ballistic._persp_offset_cached;
 	var kin_parent: JrOrreryElement = _get_element_kinematic_parent(ballistic);
-	var root_offset: Vector3 = _persp_well_offsets.get(self, Vector3.ZERO);
-	var parent_offset: Vector3 = _persp_well_offsets.get(kin_parent, root_offset);
+	var parent_offset: Vector3 = (
+			kin_parent._persp_offset_cached
+			if (kin_parent != null and kin_parent._persp_offset_stamp == stamp)
+			else _persp_offset_cached
+	);
 	return parent_offset + ballistic.get_anchor_relative_position();
 
 
@@ -1255,22 +1272,31 @@ func _sync_playing_if_changed(playing: bool) -> void:
 
 ## Evaluates all tracked [JrRailOrbiter] nodes in [member _orbit_sequence] at [param eval_time].
 func _evaluate_all_orbiters_at(eval_time: float, _playing: bool) -> void:
-	for orbiter: JrRailOrbiter in _orbit_sequence:
-		var parent_elem: JrOrreryElement = _children.get(orbiter, self);
-		if parent_elem == null or parent_elem == self:
-			orbiter.evaluate_orbital_state(
-					eval_time,
-					_reference_plane,
-					Transform3D.IDENTITY,
-					Vector3.ZERO
-			);
+	if not _dirty_rail_splines.is_empty():
+		_flush_dirty_rail_splines();
+	var ref_plane: JrReferenceDirection = _reference_plane;
+	var self_elem: JrOrreryElement = self;
+	var r_seq: Array[JrRailOrbiter] = _orbit_sequence;
+	for i: int in range(r_seq.size()):
+		var orbiter: JrRailOrbiter = r_seq[i];
+		var parent_elem: JrOrreryElement = orbiter._tracked_scene_parent;
+		if parent_elem == null or parent_elem == self_elem:
+			orbiter.evaluate_runtime_root_rail(eval_time, ref_plane);
 		else:
-			orbiter.evaluate_orbital_state(
+			orbiter.evaluate_runtime_child_rail(
 					eval_time,
-					_reference_plane,
-					parent_elem.get_driver_relative_transform(),
-					parent_elem.get_global_velocity()
+					ref_plane,
+					parent_elem._driver_relative_transform,
+					parent_elem._global_velocity
 			);
+
+
+## Flushes all queued [JrRailOrbiter] nodes in [member _dirty_rail_splines] through the GPU/CPU
+## periodic cubic B-spline baker on [member _ballistic_solver].
+func _flush_dirty_rail_splines() -> void:
+	var batch: Array[JrRailOrbiter] = _dirty_rail_splines.duplicate();
+	_dirty_rail_splines.clear();
+	_ballistic_solver.bake_rail_splines(batch);
 
 
 ## Initializes any [JrBallisticOrbiter] nodes that were newly added or requested a state reset.
@@ -2512,6 +2538,9 @@ func _on_subtree_element_added(parent: JrOrreryElement, child: JrOrreryElement) 
 		_children[orbiter] = parent;
 		if not already_rail:
 			_orbit_sequence.append(orbiter);
+		if not orbiter.rail_spline_dirtied.is_connected(_on_rail_spline_dirtied):
+			orbiter.rail_spline_dirtied.connect(_on_rail_spline_dirtied);
+		_queue_dirty_rail_spline(orbiter);
 	elif child is JrBallisticOrbiter:
 		var ballistic := child as JrBallisticOrbiter;
 		ballistic._fast_root_sync_ready = false;
@@ -2562,6 +2591,9 @@ func _on_subtree_element_removed(_parent: JrOrreryElement, child: JrOrreryElemen
 	_ballistic_solver.invalidate_resident_step_buffer();
 	if child is JrRailOrbiter:
 		var orbiter := child as JrRailOrbiter;
+		orbiter._in_dirty_spline_queue = false;
+		if orbiter.rail_spline_dirtied.is_connected(_on_rail_spline_dirtied):
+			orbiter.rail_spline_dirtied.disconnect(_on_rail_spline_dirtied);
 		_children.erase(orbiter);
 		if (
 				not _orbit_sequence.is_empty()
@@ -2616,6 +2648,18 @@ func _on_subtree_element_removed(_parent: JrOrreryElement, child: JrOrreryElemen
 func _on_ballistic_runtime_dirtied() -> void:
 	_pending_ballistic_init = true;
 	_ballistic_anchors_dirty = true;
+
+
+## Queues [param orbiter] into [member _dirty_rail_splines] when [signal JrRailOrbiter.rail_spline_dirtied] fires.
+func _on_rail_spline_dirtied(orbiter: JrRailOrbiter) -> void:
+	_queue_dirty_rail_spline(orbiter);
+
+
+## Queues [param orbiter] into [member _dirty_rail_splines] if it requires a B-spline bake.
+func _queue_dirty_rail_spline(orbiter: JrRailOrbiter) -> void:
+	if orbiter.needs_nu_spline_bake() and not orbiter._in_dirty_spline_queue:
+		orbiter._in_dirty_spline_queue = true;
+		_dirty_rail_splines.append(orbiter);
 
 
 ## Notifies [member _ballistic_solver] that [param ballistic] changed state on the CPU.
