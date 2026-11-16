@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://c06saxbimr2xq"
+path="res://.godot/imported/rail_spline_bake.glsl-3484b9beead6f40b0ba0bc55daf13a58.res"
+
+[deps]
+
+source_file="res://addons/jr_orrery/shaders/rail_spline_bake.glsl"
+dest_files=["res://.godot/imported/rail_spline_bake.glsl-3484b9beead6f40b0ba0bc55daf13a58.res"]
+
+[params]
+

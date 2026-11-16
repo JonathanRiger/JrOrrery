@@ -13,15 +13,21 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 struct BallisticBody {
-	vec4 rel_pos_anchor;   // xyz = anchor-relative pos (or epoch pos if on_rails), w = anchor_well_idx
-	vec4 rel_vel_dt;       // xyz = anchor-relative vel (or epoch vel if on_rails), w = effective_dt
-	vec4 ext_accel_frame;  // xyz = external thrust accel in driver units, w = thrust_frame (2.0 = ORBITAL)
-	vec4 rails_tidal_pad;  // x = is_on_rails (in/out), y = enable_tidal_forces, z = safe_max_radius, w = pad
+	vec4 rel_pos_anchor;   // xyz = live anchor-relative pos, w = anchor_well_idx
+	vec4 rel_vel_dt;       // xyz = live anchor-relative vel, w = unused
+	vec4 ext_accel_frame;  // xyz = external thrust accel in driver units, w = signed frame (+unpinned/-pinned, 1=inertial, 2=orbital)
+	vec4 rails_tidal_pad;  // x = is_on_rails (in/out), y = enable_tidal_forces, z = safe_max_radius, w = handoff_out
 };
 
 struct GravityWell {
 	vec4 local_pos_start_mu;     // xyz = parent-relative pos at step start, w = mu
 	vec4 local_pos_end_parent;   // xyz = parent-relative pos at step end,   w = parent_well_idx (-1 for root)
+	vec4 hill_params;            // x = entry_radius_sq, y = exit_radius_sq, z = can_exit (1/0), w = safe_max_radius
+};
+
+struct BallisticEpoch {
+	vec4 pos_hi;                 // xyz = frozen epoch anchor-relative pos, w = epoch_time_hi
+	vec4 vel_lo;                 // xyz = frozen epoch anchor-relative vel, w = epoch_time_lo
 };
 
 layout(set = 0, binding = 0, std430) restrict buffer BallisticBodyBuffer {
@@ -32,11 +38,23 @@ layout(set = 0, binding = 1, std430) restrict readonly buffer GravityWellBuffer 
 	GravityWell data[];
 } wells;
 
+layout(set = 0, binding = 2, std430) restrict buffer BallisticEpochBuffer {
+	BallisticEpoch data[];
+} epochs;
+
+layout(set = 0, binding = 3, std430) restrict buffer StepOutputBuffer {
+	uint words[];
+} step_out;
+
 layout(push_constant, std430) uniform PushConstants {
 	float cull_threshold_sq;
 	uint body_count;
 	uint well_count;
 	uint max_substeps;
+	float step_dt;
+	float time_hi;
+	float time_lo;
+	uint events_word_offset;
 } params;
 
 const float TWO_PI = 6.28318530718;
@@ -303,6 +321,65 @@ vec3 compute_perturbing_gravity(
 	return total_accel;
 }
 
+// Evaluates Hill-sphere entry into direct massive child wells or exit to parent well
+// when unpinned (pin_flag > -1.5). Returns target well index (>= 0.0) or -1.0 if unchanged.
+float evaluate_hill_handoff(vec3 r_rel, int anchor_idx, float pin_flag) {
+	if (pin_flag < -1.5 || anchor_idx < 0 || uint(anchor_idx) >= params.well_count) {
+		return -1.0;
+	}
+	int best_child = -1;
+	float best_dist_sq = 1e38;
+	for (uint k = 1u; k < params.well_count; k++) {
+		int parent_idx = int(round(wells.data[k].local_pos_end_parent.w));
+		if (parent_idx != anchor_idx) {
+			continue;
+		}
+		float entry_sq = wells.data[k].hill_params.x;
+		if (entry_sq <= 0.0) {
+			continue;
+		}
+		vec3 diff = r_rel - wells.data[k].local_pos_end_parent.xyz;
+		float dist_sq = dot(diff, diff);
+		if (dist_sq < entry_sq && dist_sq < best_dist_sq) {
+			best_dist_sq = dist_sq;
+			best_child = int(k);
+		}
+	}
+	if (best_child >= 0) {
+		return float(best_child);
+	}
+	if (anchor_idx > 0 && wells.data[anchor_idx].hill_params.z > 0.5) {
+		float exit_sq = wells.data[anchor_idx].hill_params.y;
+		if (dot(r_rel, r_rel) > exit_sq) {
+			return wells.data[anchor_idx].local_pos_end_parent.w;
+		}
+	}
+	return -1.0;
+}
+
+// Writes packed (pos, vel) to StepOutputBuffer and emits a sparse event only on rail/SOI transitions.
+void write_step_output(uint idx, vec3 r_rel, vec3 v_rel, bool prev_on_rails, bool next_on_rails, float handoff_val) {
+	uint pv_base = 6u + idx * 6u;
+	step_out.words[pv_base + 0u] = floatBitsToUint(r_rel.x);
+	step_out.words[pv_base + 1u] = floatBitsToUint(r_rel.y);
+	step_out.words[pv_base + 2u] = floatBitsToUint(r_rel.z);
+	step_out.words[pv_base + 3u] = floatBitsToUint(v_rel.x);
+	step_out.words[pv_base + 4u] = floatBitsToUint(v_rel.y);
+	step_out.words[pv_base + 5u] = floatBitsToUint(v_rel.z);
+
+	int handoff_well = int(round(handoff_val));
+	if ((next_on_rails != prev_on_rails) || (handoff_well >= 0)) {
+		uint slot = atomicAdd(step_out.words[0], 1u);
+		if (slot < params.body_count) {
+			uint ev_base = params.events_word_offset + slot * 2u;
+			uint rails_bit = next_on_rails ? 1u : 0u;
+			uint well_plus_one = (handoff_well >= 0) ? uint(handoff_well + 1) : 0u;
+			step_out.words[ev_base + 0u] = idx;
+			step_out.words[ev_base + 1u] = rails_bit | (well_plus_one << 1u);
+		}
+	}
+}
+
 void main() {
 	uint idx = gl_GlobalInvocationID.x;
 	if (idx >= params.body_count) {
@@ -312,10 +389,12 @@ void main() {
 	vec3 r_rel = bodies.data[idx].rel_pos_anchor.xyz;
 	int anchor_idx = int(round(bodies.data[idx].rel_pos_anchor.w));
 	vec3 v_rel = bodies.data[idx].rel_vel_dt.xyz;
-	float dt = bodies.data[idx].rel_vel_dt.w;
-	vec3 ext_accel = bodies.data[idx].ext_accel_frame.xyz;
-	float thrust_frame = bodies.data[idx].ext_accel_frame.w;
 	bool is_on_rails = bodies.data[idx].rails_tidal_pad.x > 0.5;
+	float dt = params.step_dt;
+	vec3 ext_accel = bodies.data[idx].ext_accel_frame.xyz;
+	float raw_frame_pin = bodies.data[idx].ext_accel_frame.w;
+	float thrust_frame = abs(raw_frame_pin);
+	float pin_flag = (raw_frame_pin < 0.0) ? -2.0 : -1.0;
 	bool enable_tidal = bodies.data[idx].rails_tidal_pad.y > 0.5;
 	float safe_max_radius = bodies.data[idx].rails_tidal_pad.z;
 
@@ -326,9 +405,14 @@ void main() {
 
 	bool has_thrust = dot(ext_accel, ext_accel) > 0.0;
 
-	// Tier-1 Epoch-Frozen On-Rails fast path: 1 analytical Kepler step from frozen epoch state.
+	// Tier-1 Epoch-Frozen On-Rails fast path: 1 analytical Kepler step from resident frozen epoch state.
 	if (is_on_rails && !has_thrust && mu_anchor > 0.0) {
-		kepler_drift(r_rel, v_rel, mu_anchor, dt);
+		vec4 ep_pos_hi = epochs.data[idx].pos_hi;
+		vec4 ep_vel_lo = epochs.data[idx].vel_lo;
+		r_rel = ep_pos_hi.xyz;
+		v_rel = ep_vel_lo.xyz;
+		float r_dt = (params.time_hi - ep_pos_hi.w) + (params.time_lo - ep_vel_lo.w);
+		kepler_drift(r_rel, v_rel, mu_anchor, r_dt);
 		bool wake_up = false;
 		if (enable_tidal) {
 			if (safe_max_radius > 0.0 && dot(r_rel, r_rel) > safe_max_radius * safe_max_radius) {
@@ -339,9 +423,13 @@ void main() {
 				wake_up = any_tide;
 			}
 		}
+		bool stay_on_rails = !wake_up;
+		float handoff_r = evaluate_hill_handoff(r_rel, anchor_idx, pin_flag);
 		bodies.data[idx].rel_pos_anchor.xyz = r_rel;
 		bodies.data[idx].rel_vel_dt.xyz = v_rel;
-		bodies.data[idx].rails_tidal_pad.x = wake_up ? 0.0 : 1.0;
+		bodies.data[idx].rails_tidal_pad.x = stay_on_rails ? 1.0 : 0.0;
+		bodies.data[idx].rails_tidal_pad.w = handoff_r;
+		write_step_output(idx, r_rel, v_rel, true, stay_on_rails, handoff_r);
 		return;
 	}
 
@@ -382,7 +470,18 @@ void main() {
 		v_rel += 0.5 * sub_dt * total_pert;
 	}
 
+	bool enter_rails = (!any_perturbation_ever && mu_anchor > 0.0);
+	if (enter_rails) {
+		epochs.data[idx].pos_hi = vec4(r_rel, params.time_hi);
+		epochs.data[idx].vel_lo = vec4(v_rel, params.time_lo);
+		bodies.data[idx].rails_tidal_pad.z = (anchor_idx >= 0 && uint(anchor_idx) < params.well_count)
+			? wells.data[anchor_idx].hill_params.w
+			: 0.0;
+	}
+	float handoff_kdk = evaluate_hill_handoff(r_rel, anchor_idx, pin_flag);
 	bodies.data[idx].rel_pos_anchor.xyz = r_rel;
 	bodies.data[idx].rel_vel_dt.xyz = v_rel;
-	bodies.data[idx].rails_tidal_pad.x = (!any_perturbation_ever && mu_anchor > 0.0) ? 1.0 : 0.0;
+	bodies.data[idx].rails_tidal_pad.x = enter_rails ? 1.0 : 0.0;
+	bodies.data[idx].rails_tidal_pad.w = handoff_kdk;
+	write_step_output(idx, r_rel, v_rel, is_on_rails, enter_rails, handoff_kdk);
 }

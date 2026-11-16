@@ -17,6 +17,21 @@ extends JrOrreryElement
 ## [param previous_body] to [param current_body].
 signal dominant_body_changed(previous_body: JrOrreryElement, current_body: JrOrreryElement)
 
+## Emitted upward when runtime re-initialization or pinned-anchor synchronization is required.
+signal ballistic_runtime_dirtied
+
+## Emitted upward when this body's state or parameters change relative to the resident GPU SSBO.
+signal ballistic_gpu_dirtied(body: JrBallisticOrbiter)
+
+## Emitted upward when this body exits the root-parent/root-anchor fast transform sync state.
+signal ballistic_sync_dirtied(body: JrBallisticOrbiter)
+
+## Emitted upward when [member runtime_forecast_enabled] is toggled on this body.
+signal ballistic_forecast_toggle_changed(body: JrBallisticOrbiter)
+
+## Emitted upward when this body's precomputed trajectory tape is invalidated by thrust or state changes.
+signal ballistic_trajectory_dirtied(body: JrBallisticOrbiter);
+
 ## Determines how the initial epoch state of this ballistic body is authored and edited.
 enum InitialStateMode {
 	## Authored via Cartesian [member initial_position] and [member initial_velocity] vectors
@@ -238,24 +253,23 @@ var manual_rotation := Vector3.ZERO:
 				Vector3(value.x, 0.0, value.z)
 				if is_locked_to_ecliptic()
 				else value
-		)
+		);
 		if not external_acceleration.is_equal_approx(target_acc):
-			external_acceleration = target_acc
-			if external_acceleration != Vector3.ZERO:
-				_is_on_rails = false
-			_forecast_dirty = true
+			external_acceleration = target_acc;
+			_has_external_thrust = (external_acceleration != Vector3.ZERO);
+			invalidate_trajectory();
 			if Engine.is_editor_hint():
-				orbit_visuals_changed.emit()
+				orbit_visuals_changed.emit();
 
 ## Physical unit used to scale [member external_acceleration] into driver units.
 @export
 var acceleration_unit := JrOrreryUnits.AccelerationUnit.METERS_PER_SECOND_SQUARED:
 	set(value):
 		if acceleration_unit != value:
-			acceleration_unit = value
-			_forecast_dirty = true
+			acceleration_unit = value;
+			invalidate_trajectory();
 			if Engine.is_editor_hint():
-				orbit_visuals_changed.emit()
+				orbit_visuals_changed.emit();
 
 ## Coordinate frame in which [member external_acceleration] is applied.
 ## Use [constant ThrustFrame.ORBITAL] for continuous prograde ([code]-Z[/code]),
@@ -263,10 +277,11 @@ var acceleration_unit := JrOrreryUnits.AccelerationUnit.METERS_PER_SECOND_SQUARE
 @export var thrust_frame := ThrustFrame.INERTIAL:
 	set(value):
 		if thrust_frame != value:
-			thrust_frame = value
-			_forecast_dirty = true
+			thrust_frame = value;
+			_update_solver_frame_pin_w();
+			invalidate_trajectory();
 			if Engine.is_editor_hint():
-				orbit_visuals_changed.emit()
+				orbit_visuals_changed.emit();
 
 @export_group("Gravity & Anchor")
 ## If [code]true[/code], third-body differential tidal forces (Battin's f(q)) that
@@ -276,26 +291,25 @@ var acceleration_unit := JrOrreryUnits.AccelerationUnit.METERS_PER_SECOND_SQUARE
 @export var enable_tidal_forces: bool = true:
 	set(value):
 		if enable_tidal_forces != value:
-			enable_tidal_forces = value
-			if not enable_tidal_forces and external_acceleration == Vector3.ZERO:
-				_forecast_dirty = true
-			else:
-				_is_on_rails = false
-				_forecast_dirty = true
+			enable_tidal_forces = value;
+			_solver_flags_y = 1.0 if enable_tidal_forces else 0.0;
+			invalidate_trajectory();
 			if Engine.is_editor_hint():
-				orbit_visuals_changed.emit()
+				orbit_visuals_changed.emit();
 
 ## Optional [JrOrreryElement] to permanently lock as this body's reference anchor,
 ## bypassing automatic Hill-sphere anchor switching. Leave [code]null[/code] for automatic
 ## switching.
 @export var pinned_anchor: JrOrreryElement = null:
 	set(value):
-		var target: JrOrreryElement = null if value == self else value
+		var target: JrOrreryElement = null if value == self else value;
 		if pinned_anchor != target:
-			pinned_anchor = target
-			_forecast_dirty = true
+			pinned_anchor = target;
+			_update_solver_frame_pin_w();
+			invalidate_trajectory();
+			ballistic_runtime_dirtied.emit();
 			if Engine.is_editor_hint():
-				orbit_visuals_changed.emit()
+				orbit_visuals_changed.emit();
 
 @export_group("Forecast & Editor Preview")
 ## If [code]true[/code], [JrOrbitDriver] continuously integrates a forward-looking
@@ -303,32 +317,39 @@ var acceleration_unit := JrOrreryUnits.AccelerationUnit.METERS_PER_SECOND_SQUARE
 @export var runtime_forecast_enabled: bool = true:
 	set(value):
 		if runtime_forecast_enabled != value:
-			runtime_forecast_enabled = value
-			_forecast_dirty = true
+			runtime_forecast_enabled = value;
+			_forecast_dirty = true;
+			if runtime_forecast_enabled:
+				invalidate_trajectory();
+			ballistic_forecast_toggle_changed.emit(self);
 
 ## Duration (in simulation time units) integrated forward from the current time
 ## when computing both the live runtime trajectory forecast and the editor preview line.
 @export_range(0.1, 10_000_000.0, 0.1, "exp", "or_greater")
 var preview_duration: float = 30.0:
 	set(value):
-		var clamped: float = maxf(MIN_PREVIEW_DURATION, value)
+		var clamped: float = maxf(MIN_PREVIEW_DURATION, value);
 		if not is_equal_approx(preview_duration, clamped):
-			preview_duration = clamped
-			_forecast_dirty = true
+			preview_duration = clamped;
+			_forecast_dirty = true;
+			if runtime_forecast_enabled:
+				invalidate_trajectory();
 			if Engine.is_editor_hint():
-				orbit_visuals_changed.emit()
+				orbit_visuals_changed.emit();
 
 ## Number of output segments sampled across [member preview_duration] for both
 ## the live runtime trajectory forecast and the editor trajectory preview line.
 @export_range(8, 2048, 1)
 var preview_steps: int = 192:
 	set(value):
-		var clamped: int = maxi(8, value)
+		var clamped: int = maxi(8, value);
 		if preview_steps != clamped:
-			preview_steps = clamped
-			_forecast_dirty = true
+			preview_steps = clamped;
+			_forecast_dirty = true;
+			if runtime_forecast_enabled:
+				invalidate_trajectory();
 			if Engine.is_editor_hint():
-				orbit_visuals_changed.emit()
+				orbit_visuals_changed.emit();
 
 ## Alias forwarding to [member initial_periapsis] for interactive 2D/3D conic gizmos.
 var periapsis: float:
@@ -447,7 +468,13 @@ var _spawn_parent: JrOrreryElement = null
 
 ## Guard set during [method JrOrbitDriver.collect_ballistic_nodes] so reparenting does not reset
 ## live state.
-var _suppress_reinit_on_reparent: bool = false
+var _suppress_reinit_on_reparent: bool = false;
+
+## Cached orthonormal driver-space orientation [Basis] (`_reference_plane.rotation_basis * _manual_basis`).
+var _cached_driver_basis: Basis = Basis.IDENTITY;
+
+## Whether [member _cached_driver_basis] needs recomputation.
+var _driver_basis_dirty: bool = true;
 
 ## Current position offset relative to [member _anchor_element] in the driver's unrotated reference
 ## frame.
@@ -515,6 +542,39 @@ var _anchor_to_parent_offset := Vector3.ZERO
 ## v_parent[/code]).
 var _anchor_to_parent_velocity := Vector3.ZERO
 
+## Cached flag indicating whether [member _parent_driver_basis] was identity on the last transform rebuild.
+var _parent_basis_is_identity: bool = true;
+
+## Dirty flag deferring non-identity [member _local_orbital_transform] evaluation until [method get_local_orbital_transform].
+var _local_orbital_xf_dirty: bool = false;
+
+## Cached flag indicating parent and anchor zero offsets are already stored for root-anchored sync.
+var _root_zero_offsets_cached: bool = false;
+
+## Cached flag enabling the single-check root-parent + root-anchor transform sync fast path.
+var _fast_root_sync_ready: bool = false;
+
+## Whether this body is currently queued in [member JrOrbitDriver._non_root_sync_ballistics].
+var _in_non_root_sync_list: bool = false;
+
+## Cached downward flag indicating [JrOrbitDriver] has heliocentric identity-basis system transforms.
+var _direct_system_xf: bool = true;
+
+## Dirty flag indicating this body's state must be uploaded into the resident GPU stepping SSBO.
+var _gpu_step_dirty: bool = true;
+
+## Cached index of this body inside [member JrOrbitDriver._ballistic_sequence] (`-1` when untracked).
+var _ballistic_seq_index: int = -1;
+
+## Cached flag indicating whether [member external_acceleration] is non-zero.
+var _has_external_thrust: bool = false;
+
+## Precomputed solver tidal-enable flag (`1.0` when [member enable_tidal_forces] is `true`, else `0.0`).
+var _solver_flags_y: float = 1.0;
+
+## Precomputed signed thrust-frame & pin scalar (`+` unpinned / `-` pinned; `1.0` inertial / `2.0` orbital).
+var _solver_frame_pin_w: float = 1.0;
+
 ## Cached parent-focus-relative trajectory preview vertices for editor visualization.
 var _preview_path_points: PackedVector3Array = []
 
@@ -535,7 +595,46 @@ var _forecast_reference_ids: PackedInt64Array = []
 
 ## Flag set when velocity, position, thrust, or horizon parameters change at runtime
 ## so [JrOrbitDriver] recomputes the forecast immediately even when paused.
-var _forecast_dirty: bool = true
+var _forecast_dirty: bool = true;
+
+## Precomputed rolling Cubic Hermite trajectory-horizon tape obeyed by this body at runtime.
+var _trajectory_tape := JrBallisticTrajectoryTape.new();
+
+## Dirty flag indicating [member _trajectory_tape] requires full forward recomputation.
+var _trajectory_dirty: bool = true;
+
+## Managed by [JrOrbitDriver] to track membership in its sparse dirty-trajectory queue.
+var _in_dirty_trajectory_queue: bool = false;
+
+## Cached gravity-well index matching [member _anchor_element] during tape sampling (`-1` if uninitialized).
+var _tape_anchor_idx: int = -1;
+
+## Simulation timestamp at which [member _trajectory_tape] next requires a tail-chunk refill (`INF` if periodic).
+var _next_refill_time: float = -INF;
+
+## Exact simulation timestamp matching the current [member _anchor_relative_position] and velocity.
+var _state_time: float = 0.0;
+
+## Whether [member _anchor_relative_velocity] awaits lazy Hermite derivative materialization at [member _state_time].
+var _tape_vel_pending: bool = false;
+
+## Shared 2-float `[eval_time, pass_id]` cell supplied downward by [JrOrbitDriver] for zero-overhead swarm sampling.
+var _driver_sampled_time_cell: PackedFloat64Array = PackedFloat64Array();
+
+## Single-element holder `[PackedVector3Array]` supplied downward by [JrOrbitDriver] for lazy GPU position reads.
+var _driver_sampled_pos_holder: Array = [];
+
+## Whether this body currently reads its sampled timestamp and lazy state from [member _driver_sampled_time_cell].
+var _obeying_shared_tape_clock: bool = false;
+
+## Last `pass_id` (`_driver_sampled_time_cell[1]`) at which [member _anchor_relative_position] was materialized.
+var _pos_materialized_pass_id: float = -1.0;
+
+## Last `pass_id` (`_driver_sampled_time_cell[1]`) at which [member _anchor_relative_velocity] was materialized.
+var _vel_materialized_pass_id: float = -1.0;
+
+## Deterministic 32-bucket refill cohort index (`0..31`) assigned by [JrOrbitDriver].
+var _tape_cohort: int = 0;
 
 ## Last editor preview timestamp supplied to [method update_editor_ghost].
 var _last_preview_time: float = 0.0
@@ -614,10 +713,11 @@ func _notification(what: int) -> void:
 			_conic_helper = null
 	elif what == NOTIFICATION_PARENTED or what == NOTIFICATION_UNPARENTED:
 		if not _suppress_reinit_on_reparent:
-			_needs_parent_reinit = true
+			_needs_parent_reinit = true;
 			if what == NOTIFICATION_PARENTED and get_parent() is JrOrreryElement:
-				_spawn_parent = get_parent() as JrOrreryElement
-		update_configuration_warnings()
+				_spawn_parent = get_parent() as JrOrreryElement;
+			ballistic_runtime_dirtied.emit();
+		update_configuration_warnings();
 
 
 ## Validates that this [JrBallisticOrbiter] is parented under a [JrOrreryElement] so it
@@ -659,14 +759,131 @@ func is_unbound_orbit() -> bool:
 	return _ensure_conic_helper().is_unbound_orbit()
 
 
+## Resolves this body's inertial/focus-relative position when [member _fast_root_sync_ready] is active.
+func _fast_root_pos() -> Vector3:
+	if is_tape_position_pending():
+		ensure_tape_position();
+	var anc: JrOrreryElement = _anchor_element;
+	if anc != null and anc != _owning_driver and anc._owning_driver == _owning_driver:
+		return anc._driver_relative_transform.origin + _anchor_relative_position;
+	return _anchor_relative_position;
+
+
+## Resolves this body's inertial/focus-relative velocity when [member _fast_root_sync_ready] is active.
+func _fast_root_vel() -> Vector3:
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	var anc: JrOrreryElement = _anchor_element;
+	if anc != null and anc != _owning_driver and anc._owning_driver == _owning_driver:
+		return anc._global_velocity + _anchor_relative_velocity;
+	return _anchor_relative_velocity;
+
+
+## Overrides [method JrOrreryElement.get_focus_relative_position] for lazy root-sync resolution.
+func get_focus_relative_position() -> Vector3:
+	if _fast_root_sync_ready:
+		return _fast_root_pos();
+	return _focus_relative_position;
+
+
+## Overrides [method JrOrreryElement.get_driver_relative_position] for lazy root-sync resolution.
+func get_driver_relative_position() -> Vector3:
+	if _fast_root_sync_ready:
+		return _fast_root_pos();
+	return _focus_relative_position;
+
+
 ## Overrides [method JrOrreryElement.get_relative_position] for Keplerian gizmo editing at epoch.
 func get_relative_position(time: float, reference: JrReferenceDirection = null) -> Vector3:
 	if initial_state_mode == InitialStateMode.KEPLERIAN_ELEMENTS:
-		var ref: JrReferenceDirection = reference if reference != null else _reference_plane
-		return _ensure_conic_helper().get_relative_position(time, ref)
+		var ref: JrReferenceDirection = reference if reference != null else _reference_plane;
+		return _ensure_conic_helper().get_relative_position(time, ref);
 	if is_zero_approx(time):
-		return get_focus_initial_position()
-	return _focus_relative_position
+		return get_focus_initial_position();
+	if _fast_root_sync_ready:
+		return _fast_root_pos();
+	return _focus_relative_position;
+
+
+## Overrides [method JrOrreryElement.get_relative_velocity] for lazy root-sync resolution.
+func get_relative_velocity(
+		_time: float = NAN,
+		_reference: JrReferenceDirection = null
+) -> Vector3:
+	if _fast_root_sync_ready:
+		return _fast_root_vel();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	return _relative_velocity;
+
+
+## Overrides [method JrOrreryElement.get_focus_relative_velocity] for lazy root-sync resolution.
+func get_focus_relative_velocity() -> Vector3:
+	if _fast_root_sync_ready:
+		return _fast_root_vel();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	return _relative_velocity;
+
+
+## Overrides [method JrOrreryElement.get_global_velocity] for lazy root-sync resolution.
+func get_global_velocity() -> Vector3:
+	if _fast_root_sync_ready:
+		return _fast_root_vel();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	return _global_velocity;
+
+
+## Overrides [method JrOrreryElement.get_driver_relative_velocity] for lazy root-sync resolution.
+func get_driver_relative_velocity() -> Vector3:
+	if _fast_root_sync_ready:
+		return _fast_root_vel();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	return _global_velocity;
+
+
+## Overrides [method JrOrreryElement.get_local_orbital_velocity] for lazy root-sync resolution.
+func get_local_orbital_velocity() -> Vector3:
+	if _fast_root_sync_ready:
+		return _fast_root_vel();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	return _parent_driver_basis.transposed() * _relative_velocity;
+
+
+## Overrides [method JrOrreryElement.get_local_orbital_transform] for lazy root-sync and parent-basis resolution.
+func get_local_orbital_transform() -> Transform3D:
+	if _fast_root_sync_ready:
+		return Transform3D(_driver_relative_basis, _fast_root_pos());
+	if _local_orbital_xf_dirty:
+		_local_orbital_xf_dirty = false;
+		if _parent_driver_basis == Basis.IDENTITY:
+			_parent_basis_is_identity = true;
+			_local_orbital_transform = Transform3D(_driver_relative_basis, _focus_relative_position);
+		else:
+			_parent_basis_is_identity = false;
+			var inv_parent: Basis = _parent_driver_basis.transposed();
+			_local_orbital_transform = Transform3D(
+					inv_parent * _driver_relative_basis,
+					inv_parent * _focus_relative_position
+			);
+	return _local_orbital_transform;
+
+
+## Overrides [method JrOrreryElement.get_driver_relative_transform] for lazy root-sync resolution.
+func get_driver_relative_transform() -> Transform3D:
+	if _fast_root_sync_ready:
+		return Transform3D(_driver_relative_basis, _fast_root_pos());
+	return _driver_relative_transform;
+
+
+## Overrides [method JrOrreryElement.get_system_transform] for lazy heliocentric root-sync resolution.
+func get_system_transform() -> Transform3D:
+	if _fast_root_sync_ready and _direct_system_xf:
+		return Transform3D(_driver_relative_basis, _fast_root_pos());
+	return _system_transform;
 
 
 ## Overrides [method JrOrreryElement.get_periapsis_relative_position].
@@ -796,25 +1013,27 @@ func get_trajectory_path_points(_point_count: int = 64) -> PackedVector3Array:
 ## Updates cached [member _reference_plane] and connects its change signal.
 func set_reference_plane(new_reference_plane: JrReferenceDirection) -> void:
 	if new_reference_plane == null:
-		return
+		return;
 	if _reference_plane != new_reference_plane:
 		if (
 				_reference_plane != null
 				and _reference_plane.changed.is_connected(_on_reference_plane_changed)
 		):
-			_reference_plane.changed.disconnect(_on_reference_plane_changed)
-		_reference_plane = new_reference_plane
+			_reference_plane.changed.disconnect(_on_reference_plane_changed);
+		_reference_plane = new_reference_plane;
+		_driver_basis_dirty = true;
+		_clear_fast_root_sync();
 		if _conic_helper != null and is_instance_valid(_conic_helper):
-			_conic_helper.set_reference_plane(new_reference_plane)
+			_conic_helper.set_reference_plane(new_reference_plane);
 		if not _reference_plane.changed.is_connected(_on_reference_plane_changed):
-			_reference_plane.changed.connect(_on_reference_plane_changed)
+			_reference_plane.changed.connect(_on_reference_plane_changed);
 	if is_locked_to_ecliptic():
-		_enforce_ecliptic_lock()
+		_enforce_ecliptic_lock();
 
 
 ## Invoked when the owning [JrOrbitDriver] updates its distance or time units.
 func _on_driver_units_updated() -> void:
-	_forecast_dirty = true
+	invalidate_trajectory();
 
 
 ## Called downward by [JrOrbitDriver] to provide the effective central gravitational
@@ -825,10 +1044,11 @@ func set_parent_effective_mu(parent_mu: float) -> void:
 		return
 	_parent_effective_mu = clamped
 	if initial_state_mode == InitialStateMode.KEPLERIAN_ELEMENTS:
-		_sync_vectors_from_keplerian()
+		_sync_vectors_from_keplerian();
 		if Engine.is_editor_hint() or not _has_initialized_state:
-			_needs_parent_reinit = true
-			_apply_standalone_epoch_state()
+			_needs_parent_reinit = true;
+			ballistic_runtime_dirtied.emit();
+			_apply_standalone_epoch_state();
 	else:
 		_mark_or_sync_keplerian_from_vectors()
 
@@ -851,7 +1071,375 @@ func is_forecast_dirty() -> bool:
 
 ## Marks this body's runtime trajectory forecast as needing recomputation.
 func mark_forecast_dirty() -> void:
-	_forecast_dirty = true
+	_forecast_dirty = true;
+
+
+## Called downward by [JrOrbitDriver] to bind shared `[eval_time, pass_id]` and GPU position holder buffers.
+func bind_driver_sample_buffers(time_cell: PackedFloat64Array, pos_holder: Array) -> void:
+	_driver_sampled_time_cell = time_cell;
+	_driver_sampled_pos_holder = pos_holder;
+	_obeying_shared_tape_clock = false;
+	_pos_materialized_pass_id = -1.0;
+	_vel_materialized_pass_id = -1.0;
+
+
+## Called downward by [JrOrbitDriver] to bind or unbind the shared `[eval_time, pass_id]` sampling cell.
+func set_driver_sampled_time_cell(time_cell: PackedFloat64Array) -> void:
+	bind_driver_sample_buffers(time_cell, []);
+
+
+## Returns the exact simulation timestamp of this body's current state (reading from
+## [member _driver_sampled_time_cell] when obeying the shared driver sampling pass).
+func get_effective_state_time() -> float:
+	if _obeying_shared_tape_clock and _driver_sampled_time_cell.size() >= 2:
+		return _driver_sampled_time_cell[0];
+	return _state_time;
+
+
+## Returns `true` when [member _anchor_relative_position] requires lazy read from [member _driver_sampled_pos_holder].
+func is_tape_position_pending() -> bool:
+	if _obeying_shared_tape_clock and _driver_sampled_time_cell.size() >= 2:
+		return _pos_materialized_pass_id != _driver_sampled_time_cell[1];
+	return false;
+
+
+## Materializes [member _anchor_relative_position] in `O(1)` from [member _driver_sampled_pos_holder]
+## when [method is_tape_position_pending] is `true`.
+func ensure_tape_position() -> void:
+	if not is_tape_position_pending():
+		return;
+	_pos_materialized_pass_id = _driver_sampled_time_cell[1];
+	if _driver_sampled_pos_holder.is_empty():
+		return;
+	var pos_vecs: PackedVector3Array = _driver_sampled_pos_holder[0] as PackedVector3Array;
+	var vec_idx: int = _ballistic_seq_index + 2;
+	if vec_idx >= 2 and vec_idx < pos_vecs.size():
+		var r_rel: Vector3 = pos_vecs[vec_idx];
+		if is_locked_to_ecliptic() and _reference_plane != null:
+			r_rel = _reference_plane.project_vector_to_ecliptic(r_rel);
+		_anchor_relative_position = r_rel;
+
+
+## Returns `true` when [member _anchor_relative_velocity] requires lazy Hermite evaluation.
+func is_tape_velocity_pending() -> bool:
+	if _tape_vel_pending:
+		return true;
+	if _obeying_shared_tape_clock and _driver_sampled_time_cell.size() >= 2:
+		return _vel_materialized_pass_id != _driver_sampled_time_cell[1];
+	return false;
+
+
+## Invalidates the precomputed rolling trajectory tape so [JrOrbitDriver] performs a full
+## forward re-integration from the current `(position, velocity, time)` state on the next pass.
+func invalidate_trajectory() -> void:
+	if is_tape_position_pending():
+		ensure_tape_position();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	elif _obeying_shared_tape_clock and _driver_sampled_time_cell.size() >= 2:
+		_state_time = _driver_sampled_time_cell[0];
+	_obeying_shared_tape_clock = false;
+	_trajectory_dirty = true;
+	_trajectory_tape.is_valid = false;
+	_trajectory_tape.is_periodic_loop = false;
+	_next_refill_time = -INF;
+	_tape_anchor_idx = -1;
+	_is_on_rails = false;
+	_forecast_dirty = true;
+	_mark_gpu_step_dirty();
+	if not _in_dirty_trajectory_queue:
+		ballistic_trajectory_dirtied.emit(self);
+
+
+## Lazily materializes [member _anchor_relative_velocity] and cached world/parent velocities from
+## [member _trajectory_tape] at [method get_effective_state_time] when [method is_tape_velocity_pending] is `true`.
+func ensure_tape_velocity() -> void:
+	if not is_tape_velocity_pending():
+		return;
+	_tape_vel_pending = false;
+	if _obeying_shared_tape_clock and _driver_sampled_time_cell.size() >= 2:
+		_state_time = _driver_sampled_time_cell[0];
+		_vel_materialized_pass_id = _driver_sampled_time_cell[1];
+	var tape: JrBallisticTrajectoryTape = _trajectory_tape;
+	if not tape.is_valid:
+		return;
+	if not tape.cpu_knots_resident:
+		tape.ensure_cpu_knots();
+
+	var rel_t: float = _state_time - tape.start_time;
+	if tape.is_periodic_loop:
+		rel_t = fposmod(rel_t, tape.loop_period);
+	var max_idx: float = float(tape.knot_count - 1);
+	var scaled: float = clampf(rel_t * tape.inv_knot_dt, 0.0, max_idx);
+	var idx_a: int = mini(int(scaled), tape.knot_count - 2);
+	var u: float = scaled - float(idx_a);
+	var v_rel: Vector3;
+	if u <= 1e-5:
+		var va0: Vector4 = tape.vel_flags[idx_a];
+		v_rel = Vector3(va0.x, va0.y, va0.z);
+	else:
+		var u2: float = u * u;
+		var dh00: float = (6.0 * u2 - 6.0 * u) * tape.inv_knot_dt;
+		var dh10: float = 3.0 * u2 - 4.0 * u + 1.0;
+		var dh11: float = 3.0 * u2 - 2.0 * u;
+		var v4: Vector4 = (
+				(tape.pos_anchor[idx_a] - tape.pos_anchor[idx_a + 1]) * dh00
+				+ tape.vel_flags[idx_a] * dh10
+				+ tape.vel_flags[idx_a + 1] * dh11
+		);
+		v_rel = Vector3(v4.x, v4.y, v4.z);
+
+	if is_locked_to_ecliptic() and _reference_plane != null:
+		v_rel = _reference_plane.project_vector_to_ecliptic(v_rel);
+	_anchor_relative_velocity = v_rel;
+	if _fast_root_sync_ready:
+		var anc: JrOrreryElement = _anchor_element;
+		var iv: Vector3 = (
+				anc._global_velocity + v_rel
+				if (anc != null and anc != _owning_driver and anc._owning_driver == _owning_driver)
+				else v_rel
+		);
+		_inertial_velocity = iv;
+		_global_velocity = iv;
+		_relative_velocity = iv;
+	else:
+		_relative_velocity = _anchor_to_parent_velocity + v_rel;
+		_inertial_velocity = _last_anchor_velocity + v_rel;
+		_global_velocity = _inertial_velocity;
+
+
+## Returns this body's rolling Cubic Hermite [JrBallisticTrajectoryTape].
+func get_trajectory_tape() -> JrBallisticTrajectoryTape:
+	return _trajectory_tape;
+
+
+## Returns `true` when [member _trajectory_tape] requires a full forward recomputation.
+func is_trajectory_dirty() -> bool:
+	return _trajectory_dirty;
+
+
+## Marks [member _trajectory_tape] clean and records [param next_refill_t] for `O(1)` cohort scheduling.
+func mark_trajectory_clean(next_refill_t: float) -> void:
+	_trajectory_dirty = false;
+	_in_dirty_trajectory_queue = false;
+	_next_refill_time = next_refill_t;
+
+
+## Adopts [param new_anchor] (at well index [param new_well_idx]) when crossing a pre-baked
+## Sphere-of-Influence transition along [member _trajectory_tape] without invalidating the tape.
+func adopt_tape_anchor_element(new_anchor: JrOrreryElement, new_well_idx: int) -> void:
+	_tape_anchor_idx = new_well_idx;
+	if new_anchor == null or new_anchor == _anchor_element:
+		return;
+	var keep_fast_root: bool = (
+			_fast_root_sync_ready
+			and _owning_driver != null
+			and (
+					new_anchor == _owning_driver
+					or (new_anchor._owning_driver == _owning_driver and not (new_anchor is JrBallisticOrbiter))
+			)
+	);
+	if not keep_fast_root:
+		_clear_fast_root_sync();
+	var prev_anchor: JrOrreryElement = _anchor_element;
+	_anchor_element = new_anchor;
+	if keep_fast_root:
+		_root_zero_offsets_cached = false;
+	dominant_body_changed.emit(prev_anchor, _anchor_element);
+
+
+## Evaluates `(r_rel, v_rel)` in `O(1)` via Cubic Hermite interpolation on [member _trajectory_tape]
+## at [param eval_time] when both segment knots share the same gravity-well anchor.
+## Returns the segment's `well_idx` (`>= 0`), or `-2` when the segment straddles an SOI handoff.
+func sample_tape_same_soi(eval_time: float) -> int:
+	var tape: JrBallisticTrajectoryTape = _trajectory_tape;
+	if not tape.cpu_knots_resident:
+		tape.ensure_cpu_knots();
+	var rel_t: float = eval_time - tape.start_time;
+	if tape.is_periodic_loop:
+		rel_t = fposmod(rel_t, tape.loop_period);
+	var max_idx: float = float(tape.knot_count - 1);
+	var scaled: float = clampf(rel_t * tape.inv_knot_dt, 0.0, max_idx);
+	var idx_a: int = mini(int(scaled), tape.knot_count - 2);
+	var u: float = scaled - float(idx_a);
+	var pa: Vector4 = tape.pos_anchor[idx_a];
+	if u <= 1e-5:
+		var va0: Vector4 = tape.vel_flags[idx_a];
+		_obeying_shared_tape_clock = false;
+		_state_time = eval_time;
+		_store_sampled_tape_state(Vector3(pa.x, pa.y, pa.z), Vector3(va0.x, va0.y, va0.z));
+		return int(roundf(pa.w));
+
+	var pb: Vector4 = tape.pos_anchor[idx_a + 1];
+	if pa.w != pb.w:
+		return -2;
+
+	var u2: float = u * u;
+	var u3: float = u2 * u;
+	var h: float = tape.knot_dt;
+	var va: Vector4 = tape.vel_flags[idx_a];
+	var vb: Vector4 = tape.vel_flags[idx_a + 1];
+	var p4: Vector4 = (
+			pa * (2.0 * u3 - 3.0 * u2 + 1.0)
+			+ va * ((u3 - 2.0 * u2 + u) * h)
+			+ pb * (-2.0 * u3 + 3.0 * u2)
+			+ vb * ((u3 - u2) * h)
+	);
+	var dh00: float = (6.0 * u2 - 6.0 * u) * tape.inv_knot_dt;
+	var v4: Vector4 = (pa - pb) * dh00 + va * (3.0 * u2 - 4.0 * u + 1.0) + vb * (3.0 * u2 - 2.0 * u);
+
+	_obeying_shared_tape_clock = false;
+	_state_time = eval_time;
+	_store_sampled_tape_state(Vector3(p4.x, p4.y, p4.z), Vector3(v4.x, v4.y, v4.z));
+	return int(roundf(pa.w));
+
+
+## Evaluates and stores Cubic Hermite `(r_rel, v_rel)` across a cross-SOI segment [param seg_idx]
+## at normalized parameter [param u] using [param pa_aligned] and [param va_aligned] shifted into
+## knot `seg_idx + 1`'s anchor frame.
+func apply_sampled_cross_soi_state(
+		seg_idx: int,
+		u: float,
+		pa_aligned: Vector3,
+		va_aligned: Vector3
+) -> void:
+	var tape: JrBallisticTrajectoryTape = _trajectory_tape;
+	if not tape.cpu_knots_resident:
+		tape.ensure_cpu_knots();
+	var u2: float = u * u;
+	var u3: float = u2 * u;
+	var h: float = tape.knot_dt;
+	var pb4: Vector4 = tape.pos_anchor[seg_idx + 1];
+	var vb4: Vector4 = tape.vel_flags[seg_idx + 1];
+	var pb := Vector3(pb4.x, pb4.y, pb4.z);
+	var vb := Vector3(vb4.x, vb4.y, vb4.z);
+	var r_rel: Vector3 = (
+			pa_aligned * (2.0 * u3 - 3.0 * u2 + 1.0)
+			+ va_aligned * ((u3 - 2.0 * u2 + u) * h)
+			+ pb * (-2.0 * u3 + 3.0 * u2)
+			+ vb * ((u3 - u2) * h)
+	);
+	var dh00: float = (6.0 * u2 - 6.0 * u) * tape.inv_knot_dt;
+	var v_rel: Vector3 = (
+			(pa_aligned - pb) * dh00
+			+ va_aligned * (3.0 * u2 - 4.0 * u + 1.0)
+			+ vb * (3.0 * u2 - 2.0 * u)
+	);
+	_store_sampled_tape_state(r_rel, v_rel);
+
+
+## Stores pre-evaluated anchor-relative `(r_rel, v_rel)` directly from inline GPU cross-SOI
+## sampling without downloading [member _trajectory_tape]'s full knot slot from VRAM.
+func apply_sampled_tape_state(r_rel: Vector3, v_rel: Vector3) -> void:
+	_store_sampled_tape_state(r_rel, v_rel);
+
+
+## Applies the `O(1)` CPU-resident tail state of [member _trajectory_tape] at [param eval_time]
+## without downloading VRAM knots, returning the tail gravity-well index.
+func apply_tape_tail_state(eval_time: float) -> int:
+	var tp: Vector4 = _trajectory_tape.tail_pos_anchor;
+	var tv: Vector4 = _trajectory_tape.tail_vel_flags;
+	_obeying_shared_tape_clock = false;
+	_state_time = eval_time;
+	_store_sampled_tape_state(Vector3(tp.x, tp.y, tp.z), Vector3(tv.x, tv.y, tv.z));
+	return int(roundf(tp.w));
+
+
+## Evaluates Cubic Hermite position at [param eval_time] along [member _trajectory_tape], returning
+## `Vector4(r_rel.x, r_rel.y, r_rel.z, well_idx)` or `w = -2.0` if straddling an SOI handoff.
+func sample_tape_pos_and_well_at(eval_time: float) -> Vector4:
+	var tape: JrBallisticTrajectoryTape = _trajectory_tape;
+	if not tape.cpu_knots_resident:
+		tape.ensure_cpu_knots();
+	var rel_t: float = eval_time - tape.start_time;
+	if tape.is_periodic_loop:
+		rel_t = fposmod(rel_t, tape.loop_period);
+	var max_idx: float = float(tape.knot_count - 1);
+	var scaled: float = clampf(rel_t * tape.inv_knot_dt, 0.0, max_idx);
+	var idx_a: int = mini(int(scaled), tape.knot_count - 2);
+	var u: float = scaled - float(idx_a);
+	var pa: Vector4 = tape.pos_anchor[idx_a];
+	if u <= 1e-5:
+		return pa;
+	var pb: Vector4 = tape.pos_anchor[idx_a + 1];
+	if pa.w != pb.w:
+		return Vector4(0.0, 0.0, 0.0, -2.0);
+
+	var u2: float = u * u;
+	var u3: float = u2 * u;
+	var h: float = tape.knot_dt;
+	var p4: Vector4 = (
+			pa * (2.0 * u3 - 3.0 * u2 + 1.0)
+			+ tape.vel_flags[idx_a] * ((u3 - 2.0 * u2 + u) * h)
+			+ pb * (-2.0 * u3 + 3.0 * u2)
+			+ tape.vel_flags[idx_a + 1] * ((u3 - u2) * h)
+	);
+	return Vector4(p4.x, p4.y, p4.z, pa.w);
+
+
+## Evaluates Cubic Hermite position on cross-SOI segment [param seg_idx] at [param u] using
+## [param pa_aligned] and [param va_aligned] expressed in knot `seg_idx + 1`'s anchor frame.
+func evaluate_tape_pos_aligned(
+		seg_idx: int,
+		u: float,
+		pa_aligned: Vector3,
+		va_aligned: Vector3
+) -> Vector3:
+	var tape: JrBallisticTrajectoryTape = _trajectory_tape;
+	if not tape.cpu_knots_resident:
+		tape.ensure_cpu_knots();
+	var u2: float = u * u;
+	var u3: float = u2 * u;
+	var h: float = tape.knot_dt;
+	var pb4: Vector4 = tape.pos_anchor[seg_idx + 1];
+	var vb4: Vector4 = tape.vel_flags[seg_idx + 1];
+	return (
+			pa_aligned * (2.0 * u3 - 3.0 * u2 + 1.0)
+			+ va_aligned * ((u3 - 2.0 * u2 + u) * h)
+			+ Vector3(pb4.x, pb4.y, pb4.z) * (-2.0 * u3 + 3.0 * u2)
+			+ Vector3(vb4.x, vb4.y, vb4.z) * ((u3 - u2) * h)
+	);
+
+
+## Stores sampled `(r_rel, v_rel)` onto this node without invalidating [member _trajectory_tape].
+func _store_sampled_tape_state(r_rel: Vector3, v_rel: Vector3) -> void:
+	_tape_vel_pending = false;
+	if _obeying_shared_tape_clock and _driver_sampled_time_cell.size() >= 2:
+		var pass_id: float = _driver_sampled_time_cell[1];
+		_pos_materialized_pass_id = pass_id;
+		_vel_materialized_pass_id = pass_id;
+	if is_locked_to_ecliptic() and _reference_plane != null:
+		_anchor_relative_position = _reference_plane.project_vector_to_ecliptic(r_rel);
+		_anchor_relative_velocity = _reference_plane.project_vector_to_ecliptic(v_rel);
+	else:
+		_anchor_relative_position = r_rel;
+		_anchor_relative_velocity = v_rel;
+
+	if _fast_root_sync_ready:
+		var anc: JrOrreryElement = _anchor_element;
+		if anc != null and anc != _owning_driver and anc._owning_driver == _owning_driver:
+			var ip: Vector3 = anc._driver_relative_transform.origin + _anchor_relative_position;
+			var iv: Vector3 = anc._global_velocity + _anchor_relative_velocity;
+			_focus_relative_position = ip;
+			_inertial_position = ip;
+			_inertial_velocity = iv;
+			_global_velocity = iv;
+			_relative_velocity = iv;
+			_driver_relative_transform.origin = ip;
+		else:
+			_focus_relative_position = _anchor_relative_position;
+			_inertial_position = _anchor_relative_position;
+			_inertial_velocity = _anchor_relative_velocity;
+			_global_velocity = _anchor_relative_velocity;
+			_relative_velocity = _anchor_relative_velocity;
+			_driver_relative_transform.origin = _anchor_relative_position;
+	else:
+		_inertial_position = _last_anchor_origin + _anchor_relative_position;
+		_inertial_velocity = _last_anchor_velocity + _anchor_relative_velocity;
+		_global_velocity = _inertial_velocity;
+		_driver_relative_transform.origin = _inertial_position;
+		if not _in_non_root_sync_list:
+			ballistic_sync_dirtied.emit(self);
 
 
 ## Returns the current dominant gravitational anchor [JrOrreryElement].
@@ -877,13 +1465,24 @@ func set_suppress_reinit_on_reparent(suppress: bool) -> void:
 ## Returns this body's current position offset relative to [member _anchor_element]
 ## in the driver's unrotated reference coordinate space.
 func get_anchor_relative_position() -> Vector3:
-	return _anchor_relative_position
+	if is_tape_position_pending():
+		ensure_tape_position();
+	return _anchor_relative_position;
+
+
+## Returns the active runtime gravity-well index of [member _anchor_element] (`0` if unassigned).
+func get_anchor_well_index() -> int:
+	if _anchor_element != null and _anchor_element._runtime_well_index >= 0:
+		return _anchor_element._runtime_well_index;
+	return 0;
 
 
 ## Returns this body's current velocity vector relative to [member _anchor_element]
 ## in the driver's unrotated reference coordinate space.
 func get_anchor_relative_velocity() -> Vector3:
-	return _anchor_relative_velocity
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	return _anchor_relative_velocity;
 
 
 ## Returns [code]true[/code] if this body is currently coasting in Tier-1 epoch-frozen on-rails
@@ -929,21 +1528,36 @@ func get_wrapped_epoch_elapsed_time(current_time: float) -> float:
 ## Enters Tier-1 epoch-frozen on-rails mode at [param current_time] with [param anchor_mu]
 ## and analytical wake-up radius [param safe_max_radius].
 func enter_on_rails_epoch(current_time: float, anchor_mu: float, safe_max_radius: float) -> void:
-	_is_on_rails = true
-	_epoch_anchor_pos = _anchor_relative_position
-	_epoch_anchor_vel = _anchor_relative_velocity
-	_epoch_time = current_time
-	_epoch_safe_max_radius = safe_max_radius
+	sync_on_rails_epoch_from_gpu(current_time, anchor_mu, safe_max_radius);
+	_mark_gpu_step_dirty();
+
+
+## Mirrors Tier-1 epoch-frozen state already recorded in VRAM without marking the GPU SSBO dirty.
+func sync_on_rails_epoch_from_gpu(
+		current_time: float,
+		anchor_mu: float,
+		safe_max_radius: float
+) -> void:
+	if is_tape_position_pending():
+		ensure_tape_position();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	_is_on_rails = true;
+	_epoch_anchor_pos = _anchor_relative_position;
+	_epoch_anchor_vel = _anchor_relative_velocity;
+	_epoch_time = current_time;
+	_epoch_safe_max_radius = safe_max_radius;
 	_epoch_orbital_period = _compute_bound_orbital_period(
 			_epoch_anchor_pos,
 			_epoch_anchor_vel,
 			anchor_mu
-	)
+	);
 
 
 ## Exits Tier-1 epoch-frozen on-rails mode so subsequent steps integrate incrementally.
 func exit_on_rails_epoch() -> void:
-	_is_on_rails = false
+	_is_on_rails = false;
+	_mark_gpu_step_dirty();
 
 
 ## Returns [member external_acceleration] scaled into driver units (dist_unit / time_unit^2).
@@ -951,29 +1565,36 @@ func exit_on_rails_epoch() -> void:
 ## this body's manual 3D orientation [Basis]. When [constant ThrustFrame.ORBITAL], returns
 ## the scaled local vector (which is rotated per-substep by the instantaneous RTN basis).
 func get_scaled_external_acceleration() -> Vector3:
+	if external_acceleration == Vector3.ZERO:
+		return Vector3.ZERO;
 	var raw_ext: Vector3 = (
 			Vector3(external_acceleration.x, 0.0, external_acceleration.z)
 			if is_locked_to_ecliptic()
 			else external_acceleration
-	)
+	);
 	var scaled: Vector3 = JrOrreryUnits.convert_acceleration_to_driver_units(
 			raw_ext,
 			acceleration_unit,
 			_driver_distance_unit,
 			_driver_time_unit
-	)
+	);
 	if scaled == Vector3.ZERO:
-		return Vector3.ZERO
+		return Vector3.ZERO;
 	if thrust_frame == ThrustFrame.BODY_LOCAL:
-		var local_rot: Vector3 = _compute_driver_basis() * scaled
+		var local_rot: Vector3 = _compute_driver_basis() * scaled;
 		return (
 				_reference_plane.project_vector_to_ecliptic(local_rot)
 				if is_locked_to_ecliptic()
 				else local_rot
-		)
+		);
 	if thrust_frame == ThrustFrame.INERTIAL and is_locked_to_ecliptic():
-		return _reference_plane.project_vector_to_ecliptic(scaled)
-	return scaled
+		return _reference_plane.project_vector_to_ecliptic(scaled);
+	return scaled;
+
+
+## Returns [code]true[/code] when non-empty runtime forecast point arrays are currently stored.
+func has_runtime_forecast_points() -> bool:
+	return not _forecast_system_points.is_empty();
 
 
 ## Computes the instantaneous orthonormal orbital (Radial / Normal / Prograde) [Basis]
@@ -981,7 +1602,11 @@ func get_scaled_external_acceleration() -> Vector3:
 ## is Prograde, [code]+Y[/code] ([constant Vector3.UP]) is Orbit Normal, and [code]+X[/code]
 ## ([constant Vector3.RIGHT]) is Radial Outward.
 func get_orbital_thrust_basis() -> Basis:
-	return compute_orbital_rtn_basis(_anchor_relative_position, _anchor_relative_velocity)
+	if is_tape_position_pending():
+		ensure_tape_position();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	return compute_orbital_rtn_basis(_anchor_relative_position, _anchor_relative_velocity);
 
 
 ## Returns the live forward-integrated trajectory forecast points in the active
@@ -1025,79 +1650,114 @@ func get_forecast_points_2d(pos_scale: float = 1.0) -> PackedVector2Array:
 ## on the next driver pass.
 func reset_state() -> void:
 	if initial_state_mode == InitialStateMode.KEPLERIAN_ELEMENTS:
-		_sync_vectors_from_keplerian()
-	var ref_basis: Basis = _get_reference_rotation_basis()
-	_anchor_relative_position = ref_basis * initial_position
-	_anchor_relative_velocity = ref_basis * initial_velocity
-	_inertial_position = _last_parent_origin + _anchor_relative_position
-	_inertial_velocity = _last_parent_velocity + _anchor_relative_velocity
-	_is_on_rails = false
-	_needs_parent_reinit = true
-	_forecast_dirty = true
-	_rebuild_transforms_from_anchor()
-	_system_transform = _driver_relative_transform
-	transform_updated.emit()
+		_sync_vectors_from_keplerian();
+	var ref_basis: Basis = _get_reference_rotation_basis();
+	_anchor_relative_position = ref_basis * initial_position;
+	_anchor_relative_velocity = ref_basis * initial_velocity;
+	_obeying_shared_tape_clock = false;
+	_tape_vel_pending = false;
+	_inertial_position = _last_parent_origin + _anchor_relative_position;
+	_inertial_velocity = _last_parent_velocity + _anchor_relative_velocity;
+	_is_on_rails = false;
+	_needs_parent_reinit = true;
+	invalidate_trajectory();
+	ballistic_runtime_dirtied.emit();
+	_rebuild_transforms_from_anchor();
+	_system_transform = _driver_relative_transform;
+	transform_updated.emit();
 
 
 ## Applies an instantaneous velocity change [param delta_v] (in inertial driver units).
 func apply_impulse(delta_v: Vector3) -> void:
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
 	var effective_dv: Vector3 = (
 			_reference_plane.project_vector_to_ecliptic(delta_v)
 			if is_locked_to_ecliptic()
 			else delta_v
-	)
-	_anchor_relative_velocity += effective_dv
-	_inertial_velocity += effective_dv
-	_global_velocity = _inertial_velocity
-	_relative_velocity = _anchor_to_parent_velocity + _anchor_relative_velocity
-	_is_on_rails = false
-	_forecast_dirty = true
+	);
+	_anchor_relative_velocity += effective_dv;
+	if _fast_root_sync_ready:
+		var anc: JrOrreryElement = _anchor_element;
+		var anc_vel: Vector3 = (
+				anc._global_velocity
+				if (anc != null and anc != _owning_driver and anc._owning_driver == _owning_driver)
+				else Vector3.ZERO
+		);
+		var iv: Vector3 = anc_vel + _anchor_relative_velocity;
+		_global_velocity = iv;
+		_inertial_velocity = iv;
+		_relative_velocity = iv;
+	else:
+		_global_velocity += effective_dv;
+		_inertial_velocity = _global_velocity;
+		_relative_velocity = _anchor_to_parent_velocity + _anchor_relative_velocity;
+	invalidate_trajectory();
 
 
 ## Applies an instantaneous velocity change [param local_delta_v] expressed in this
 ## body's manual 3D local orientation frame (for example, [code]Vector3.FORWARD * speed[/code]).
 func apply_local_impulse(local_delta_v: Vector3) -> void:
-	apply_impulse(_compute_driver_basis() * local_delta_v)
+	apply_impulse(_compute_driver_basis() * local_delta_v);
 
 
 ## Applies an instantaneous velocity change [param orbital_delta_v] expressed in this
 ## body's instantaneous orbital frame ([code]Vector3.FORWARD[/code] = prograde,
 ## [code]Vector3.UP[/code] = normal, [code]Vector3.RIGHT[/code] = radial outward).
 func apply_orbital_impulse(orbital_delta_v: Vector3) -> void:
-	apply_impulse(get_orbital_thrust_basis() * orbital_delta_v)
+	apply_impulse(get_orbital_thrust_basis() * orbital_delta_v);
 
 
 ## Returns this body's current inertial position in the unshifted [JrOrbitDriver] frame.
 func get_driver_position() -> Vector3:
-	return _inertial_position
+	if _fast_root_sync_ready:
+		return _fast_root_pos();
+	return _driver_relative_transform.origin;
 
 
 ## Directly sets this body's inertial position in the unshifted [JrOrbitDriver] frame.
 func set_driver_position(new_position: Vector3) -> void:
-	_inertial_position = new_position
-	_anchor_relative_position = new_position - _last_anchor_origin
-	_has_initialized_state = true
-	_needs_parent_reinit = false
-	_is_on_rails = false
-	_forecast_dirty = true
-	_rebuild_transforms_from_anchor()
+	if _fast_root_sync_ready:
+		_clear_fast_root_sync();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	elif _obeying_shared_tape_clock and _driver_sampled_time_cell.size() >= 2:
+		_state_time = _driver_sampled_time_cell[0];
+	_obeying_shared_tape_clock = false;
+	_inertial_position = new_position;
+	_anchor_relative_position = new_position - _last_anchor_origin;
+	_has_initialized_state = true;
+	_needs_parent_reinit = false;
+	invalidate_trajectory();
+	_rebuild_transforms_from_anchor();
 
 
 ## Returns this body's current inertial velocity in the unshifted [JrOrbitDriver] frame.
 func get_driver_velocity() -> Vector3:
-	return _inertial_velocity
+	if _fast_root_sync_ready:
+		return _fast_root_vel();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	return _global_velocity;
 
 
 ## Directly sets this body's inertial velocity in the unshifted [JrOrbitDriver] frame.
 func set_driver_velocity(new_velocity: Vector3) -> void:
-	_inertial_velocity = new_velocity
-	_anchor_relative_velocity = new_velocity - _last_anchor_velocity
-	_has_initialized_state = true
-	_needs_parent_reinit = false
-	_is_on_rails = false
-	_forecast_dirty = true
-	_global_velocity = _inertial_velocity
-	_relative_velocity = _anchor_to_parent_velocity + _anchor_relative_velocity
+	if _fast_root_sync_ready:
+		_clear_fast_root_sync();
+	if is_tape_position_pending():
+		ensure_tape_position();
+	if _obeying_shared_tape_clock and _driver_sampled_time_cell.size() >= 2:
+		_state_time = _driver_sampled_time_cell[0];
+	_obeying_shared_tape_clock = false;
+	_inertial_velocity = new_velocity;
+	_anchor_relative_velocity = new_velocity - _last_anchor_velocity;
+	_tape_vel_pending = false;
+	_has_initialized_state = true;
+	_needs_parent_reinit = false;
+	_global_velocity = _inertial_velocity;
+	_relative_velocity = _anchor_to_parent_velocity + _anchor_relative_velocity;
+	invalidate_trajectory();
 
 
 ## Returns the manual local 3D orientation [Basis] prior to reference-frame rotation.
@@ -1146,14 +1806,15 @@ func initialize_from_parent(
 	var ref_basis: Basis = _get_reference_rotation_basis()
 	_anchor_relative_position = ref_basis * initial_position
 	_anchor_relative_velocity = ref_basis * initial_velocity
+	_obeying_shared_tape_clock = false;
+	_tape_vel_pending = false;
 	_inertial_position = _last_anchor_origin + _anchor_relative_position
 	_inertial_velocity = _last_anchor_velocity + _anchor_relative_velocity
 
-	_is_on_rails = false
-	_has_initialized_state = true
-	_needs_parent_reinit = false
-	_forecast_dirty = true
-	_rebuild_transforms_from_anchor()
+	_has_initialized_state = true;
+	_needs_parent_reinit = false;
+	invalidate_trajectory();
+	_rebuild_transforms_from_anchor();
 
 
 ## Switches this body's dominant reference anchor to [param new_anchor] using the
@@ -1165,14 +1826,23 @@ func switch_anchor_element(
 		old_to_new_velocity: Vector3
 ) -> void:
 	if new_anchor == null or new_anchor == _anchor_element:
-		return
-	var prev_anchor: JrOrreryElement = _anchor_element
-	_anchor_element = new_anchor
-	_anchor_relative_position -= old_to_new_offset
-	_anchor_relative_velocity -= old_to_new_velocity
-	_is_on_rails = false
-	_forecast_dirty = true
-	dominant_body_changed.emit(prev_anchor, _anchor_element)
+		return;
+	if is_tape_position_pending():
+		ensure_tape_position();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
+	var prev_anchor: JrOrreryElement = _anchor_element;
+	if _fast_root_sync_ready:
+		_clear_fast_root_sync();
+	_anchor_element = new_anchor;
+	_anchor_relative_position -= old_to_new_offset;
+	_anchor_relative_velocity -= old_to_new_velocity;
+	if not _in_non_root_sync_list:
+		ballistic_sync_dirtied.emit(self);
+	invalidate_trajectory();
+	if pinned_anchor != null and _anchor_element != pinned_anchor:
+		ballistic_runtime_dirtied.emit();
+	dominant_body_changed.emit(prev_anchor, _anchor_element);
 
 
 ## Stores the newly integrated anchor-relative position and velocity produced by
@@ -1181,24 +1851,40 @@ func apply_integrated_anchor_state(
 		new_anchor_rel_pos: Vector3,
 		new_anchor_rel_vel: Vector3
 ) -> void:
+	if _fast_root_sync_ready:
+		_clear_fast_root_sync();
+	if _obeying_shared_tape_clock and _driver_sampled_time_cell.size() >= 2:
+		_state_time = _driver_sampled_time_cell[0];
+	_obeying_shared_tape_clock = false;
+	_tape_vel_pending = false;
 	if is_locked_to_ecliptic():
-		_anchor_relative_position = _reference_plane.project_vector_to_ecliptic(new_anchor_rel_pos)
-		_anchor_relative_velocity = _reference_plane.project_vector_to_ecliptic(new_anchor_rel_vel)
+		_anchor_relative_position = _reference_plane.project_vector_to_ecliptic(new_anchor_rel_pos);
+		_anchor_relative_velocity = _reference_plane.project_vector_to_ecliptic(new_anchor_rel_vel);
 	else:
-		_anchor_relative_position = new_anchor_rel_pos
-		_anchor_relative_velocity = new_anchor_rel_vel
-	_inertial_position = _last_anchor_origin + _anchor_relative_position
-	_inertial_velocity = _last_anchor_velocity + _anchor_relative_velocity
-	_forecast_dirty = true
+		_anchor_relative_position = new_anchor_rel_pos;
+		_anchor_relative_velocity = new_anchor_rel_vel;
+	_inertial_position = _last_anchor_origin + _anchor_relative_position;
+	_inertial_velocity = _last_anchor_velocity + _anchor_relative_velocity;
+	_global_velocity = _inertial_velocity;
+	_driver_relative_transform.origin = _inertial_position;
+	invalidate_trajectory();
 
 
 ## Backwards-compatible hook storing newly integrated inertial position and velocity.
 func apply_integrated_state(new_inertial_pos: Vector3, new_inertial_vel: Vector3) -> void:
-	_inertial_position = new_inertial_pos
-	_inertial_velocity = new_inertial_vel
-	_anchor_relative_position = new_inertial_pos - _last_anchor_origin
-	_anchor_relative_velocity = new_inertial_vel - _last_anchor_velocity
-	_forecast_dirty = true
+	if _fast_root_sync_ready:
+		_clear_fast_root_sync();
+	if _obeying_shared_tape_clock and _driver_sampled_time_cell.size() >= 2:
+		_state_time = _driver_sampled_time_cell[0];
+	_obeying_shared_tape_clock = false;
+	_tape_vel_pending = false;
+	_inertial_position = new_inertial_pos;
+	_inertial_velocity = new_inertial_vel;
+	_global_velocity = new_inertial_vel;
+	_driver_relative_transform.origin = new_inertial_pos;
+	_anchor_relative_position = new_inertial_pos - _last_anchor_origin;
+	_anchor_relative_velocity = new_inertial_vel - _last_anchor_velocity;
+	invalidate_trajectory();
 
 
 ## Stores the forward-integrated runtime forecast polylines computed by [JrOrbitDriver].
@@ -1231,6 +1917,117 @@ func sync_transforms_with_anchor_and_parent(
 	_last_anchor_origin = _last_parent_origin + _anchor_to_parent_offset
 	_last_anchor_velocity = _last_parent_velocity + _anchor_to_parent_velocity
 	_rebuild_transforms_from_anchor()
+
+
+## Fast in-class `O(1)` transform synchronization for bodies in [member JrOrbitDriver._non_root_sync_ballistics].
+## Returns `1` when synchronized (staying non-root), `2` when graduated to [member _fast_root_sync_ready],
+## or `0` when [method JrOrbitDriver._sync_single_ballistic_transforms] fallback is required.
+func sync_non_root_fast(
+		root_elem: JrOrreryElement,
+		cur_pass: float,
+		pos_vecs: PackedVector3Array
+) -> int:
+	if _driver_basis_dirty:
+		return 0;
+
+	var scene_parent: JrOrreryElement = _tracked_scene_parent;
+	var has_pos: bool = pos_vecs.size() > 2;
+	if scene_parent != null and scene_parent != root_elem:
+		if scene_parent._owning_driver != root_elem or scene_parent is JrBallisticOrbiter:
+			return 0;
+		var anchor_c: JrOrreryElement = _anchor_element;
+		if anchor_c == null or anchor_c._owning_driver != root_elem:
+			anchor_c = scene_parent;
+
+		var parent_xf: Transform3D = scene_parent._driver_relative_transform;
+		var parent_vel: Vector3 = scene_parent._global_velocity;
+		var a2p_pos: Vector3;
+		var a2p_vel: Vector3;
+		var anchor_origin: Vector3;
+		var anchor_vel: Vector3;
+
+		if anchor_c == scene_parent:
+			a2p_pos = Vector3.ZERO;
+			a2p_vel = Vector3.ZERO;
+			anchor_origin = parent_xf.origin;
+			anchor_vel = parent_vel;
+		elif anchor_c == root_elem:
+			a2p_pos = -parent_xf.origin;
+			a2p_vel = -parent_vel;
+			anchor_origin = Vector3.ZERO;
+			anchor_vel = Vector3.ZERO;
+		elif anchor_c._tracked_scene_parent == scene_parent and not (anchor_c is JrBallisticOrbiter):
+			a2p_pos = anchor_c._focus_relative_position;
+			a2p_vel = anchor_c._relative_velocity;
+			anchor_origin = parent_xf.origin + a2p_pos;
+			anchor_vel = parent_vel + a2p_vel;
+		elif scene_parent._tracked_scene_parent == anchor_c and not (scene_parent is JrBallisticOrbiter):
+			a2p_pos = -scene_parent._focus_relative_position;
+			a2p_vel = -scene_parent._relative_velocity;
+			anchor_origin = anchor_c._driver_relative_transform.origin;
+			anchor_vel = anchor_c._global_velocity;
+		else:
+			return 0;
+
+		if has_pos and _obeying_shared_tape_clock and _pos_materialized_pass_id != cur_pass:
+			_anchor_relative_position = pos_vecs[_ballistic_seq_index + 2];
+			_pos_materialized_pass_id = cur_pass;
+
+		_fast_root_sync_ready = false;
+		_root_zero_offsets_cached = false;
+		_parent_driver_basis = parent_xf.basis;
+		_parent_basis_is_identity = false;
+		_local_orbital_xf_dirty = true;
+		_last_parent_origin = parent_xf.origin;
+		_last_parent_velocity = parent_vel;
+		_anchor_to_parent_offset = a2p_pos;
+		_anchor_to_parent_velocity = a2p_vel;
+		_last_anchor_origin = anchor_origin;
+		_last_anchor_velocity = anchor_vel;
+
+		var r_rel: Vector3 = _anchor_relative_position;
+		var inert_pos: Vector3 = anchor_origin + r_rel;
+		_focus_relative_position = a2p_pos + r_rel;
+		_inertial_position = inert_pos;
+
+		if not (_tape_vel_pending or (_obeying_shared_tape_clock and _vel_materialized_pass_id != cur_pass)):
+			var v_rel: Vector3 = _anchor_relative_velocity;
+			var iv: Vector3 = anchor_vel + v_rel;
+			_relative_velocity = a2p_vel + v_rel;
+			_inertial_velocity = iv;
+			_global_velocity = iv;
+
+		var drv_basis: Basis = _cached_driver_basis;
+		_driver_relative_basis = drv_basis;
+		_driver_relative_transform = Transform3D(drv_basis, inert_pos);
+		_in_non_root_sync_list = true;
+		return 1;
+
+	if not _parent_basis_is_identity:
+		return 0;
+
+	var anchor_r: JrOrreryElement = _anchor_element;
+	if anchor_r != null and anchor_r != root_elem:
+		if anchor_r._owning_driver != root_elem or anchor_r is JrBallisticOrbiter:
+			return 0;
+		_driver_relative_basis = _cached_driver_basis;
+		_root_zero_offsets_cached = false;
+		_in_non_root_sync_list = false;
+		_fast_root_sync_ready = true;
+		return 2;
+
+	_driver_relative_basis = _cached_driver_basis;
+	if not _root_zero_offsets_cached:
+		_last_parent_origin = Vector3.ZERO;
+		_last_parent_velocity = Vector3.ZERO;
+		_anchor_to_parent_offset = Vector3.ZERO;
+		_anchor_to_parent_velocity = Vector3.ZERO;
+		_last_anchor_origin = Vector3.ZERO;
+		_last_anchor_velocity = Vector3.ZERO;
+		_root_zero_offsets_cached = true;
+	_in_non_root_sync_list = false;
+	_fast_root_sync_ready = true;
+	return 2;
 
 
 ## Recomputes focus-relative, local parent-canceled, and heliocentric driver transforms
@@ -1279,9 +2076,11 @@ func update_editor_ghost(
 		reference_plane: JrReferenceDirection,
 		parent_driver_basis: Basis = Basis.IDENTITY
 ) -> void:
-	_last_preview_time = preview_time
-	_parent_driver_basis = parent_driver_basis
-	set_reference_plane(reference_plane)
+	_last_preview_time = preview_time;
+	_parent_driver_basis = parent_driver_basis;
+	_parent_basis_is_identity = (_parent_driver_basis == Basis.IDENTITY);
+	_clear_fast_root_sync();
+	set_reference_plane(reference_plane);
 	_refresh_ghost_state()
 	editor_ghost_updated.emit(preview_time)
 
@@ -1411,19 +2210,26 @@ func _sync_vectors_from_keplerian() -> void:
 
 ## Handles orientation updates on the shared [JrReferenceDirection].
 func _on_reference_plane_changed() -> void:
+	_driver_basis_dirty = true;
+	_clear_fast_root_sync();
+	invalidate_trajectory();
 	if is_locked_to_ecliptic():
-		_enforce_ecliptic_lock()
+		_enforce_ecliptic_lock();
 	if Engine.is_editor_hint() or not _has_initialized_state:
-		_apply_standalone_epoch_state()
+		_apply_standalone_epoch_state();
 	else:
-		_rebuild_transforms_from_anchor()
-	orbit_visuals_changed.emit()
+		_rebuild_transforms_from_anchor();
+	orbit_visuals_changed.emit();
 
 
 ## Clamps initial position, velocity, inclination, thrust, manual orientation, and
 ## active anchor-relative vectors onto the ecliptic plane when [method is_locked_to_ecliptic] is
 ## active.
 func _enforce_ecliptic_lock() -> void:
+	if is_tape_position_pending():
+		ensure_tape_position();
+	if is_tape_velocity_pending():
+		ensure_tape_velocity();
 	if _conic_helper != null and is_instance_valid(_conic_helper):
 		_conic_helper.set_reference_plane(_reference_plane)
 	if not is_zero_approx(initial_position.y):
@@ -1443,73 +2249,148 @@ func _enforce_ecliptic_lock() -> void:
 	_anchor_relative_velocity = _reference_plane.project_vector_to_ecliptic(
 			_anchor_relative_velocity
 	)
-	_forecast_dirty = true
+	invalidate_trajectory();
 
 
 ## Returns the pure right-handed rotation [Basis] of [member _reference_plane].
 func _get_reference_rotation_basis() -> Basis:
 	if _reference_plane != null:
-		return _reference_plane.rotation_basis
-	return Basis.IDENTITY
+		return _reference_plane.rotation_basis;
+	return Basis.IDENTITY;
 
 
 ## Returns the body's manual orientation [Basis] in the driver's reference space.
 func _compute_driver_basis() -> Basis:
-	return (_get_reference_rotation_basis() * _manual_basis).orthonormalized()
+	if _driver_basis_dirty:
+		_cached_driver_basis = (_get_reference_rotation_basis() * _manual_basis).orthonormalized();
+		_driver_basis_dirty = false;
+	return _cached_driver_basis;
 
 
 ## Recomputes all [JrOrreryElement] cached positions, velocities, and transforms
 ## directly from [member _anchor_relative_position] and [member _anchor_to_parent_offset]
-## without subtracting large heliocentric coordinates.
+## without subtracting large heliocentric coordinates or forcing VRAM velocity readbacks.
 func _rebuild_transforms_from_anchor() -> void:
-	_focus_relative_position = _anchor_to_parent_offset + _anchor_relative_position
-	_relative_velocity = _anchor_to_parent_velocity + _anchor_relative_velocity
-	_inertial_position = _last_anchor_origin + _anchor_relative_position
-	_inertial_velocity = _last_anchor_velocity + _anchor_relative_velocity
-	_global_velocity = _inertial_velocity
-	_driver_relative_basis = _compute_driver_basis()
+	if is_tape_position_pending():
+		ensure_tape_position();
+	_root_zero_offsets_cached = false;
+	_clear_fast_root_sync();
+	_focus_relative_position = _anchor_to_parent_offset + _anchor_relative_position;
+	_inertial_position = _last_anchor_origin + _anchor_relative_position;
+	if not is_tape_velocity_pending():
+		_relative_velocity = _anchor_to_parent_velocity + _anchor_relative_velocity;
+		_inertial_velocity = _last_anchor_velocity + _anchor_relative_velocity;
+		_global_velocity = _inertial_velocity;
+	_driver_relative_basis = _compute_driver_basis();
 
-	var inv_parent: Basis = _parent_driver_basis.transposed()
-	var local_pos: Vector3 = inv_parent * _focus_relative_position
-	var local_basis: Basis = (inv_parent * _driver_relative_basis).orthonormalized()
-	_local_orbital_transform = Transform3D(local_basis, local_pos)
-	_driver_relative_transform = Transform3D(_driver_relative_basis, _inertial_position)
+	_parent_basis_is_identity = (_parent_driver_basis == Basis.IDENTITY);
+	if _parent_basis_is_identity:
+		_local_orbital_xf_dirty = false;
+		_local_orbital_transform = Transform3D(_driver_relative_basis, _focus_relative_position);
+	else:
+		_local_orbital_xf_dirty = true;
+	_driver_relative_transform = Transform3D(_driver_relative_basis, _inertial_position);
+
+
+## Clears [member _fast_root_sync_ready] and emits [signal ballistic_sync_dirtied] when transitioning.
+func _clear_fast_root_sync() -> void:
+	if _fast_root_sync_ready:
+		if is_tape_position_pending():
+			ensure_tape_position();
+		_fast_root_sync_ready = false;
+		_root_zero_offsets_cached = false;
+		var anc: JrOrreryElement = _anchor_element;
+		if anc != null and anc != _owning_driver and anc._owning_driver == _owning_driver:
+			var anc_pos: Vector3 = anc._driver_relative_transform.origin;
+			var anc_vel: Vector3 = anc._global_velocity;
+			var pos: Vector3 = anc_pos + _anchor_relative_position;
+			_last_parent_origin = Vector3.ZERO;
+			_last_parent_velocity = Vector3.ZERO;
+			_anchor_to_parent_offset = anc_pos;
+			_anchor_to_parent_velocity = anc_vel;
+			_last_anchor_origin = anc_pos;
+			_last_anchor_velocity = anc_vel;
+			_focus_relative_position = pos;
+			_inertial_position = pos;
+			_driver_relative_transform.origin = pos;
+			if not is_tape_velocity_pending():
+				var vel: Vector3 = anc_vel + _anchor_relative_velocity;
+				_relative_velocity = vel;
+				_inertial_velocity = vel;
+				_global_velocity = vel;
+		else:
+			_last_parent_origin = Vector3.ZERO;
+			_last_parent_velocity = Vector3.ZERO;
+			_anchor_to_parent_offset = Vector3.ZERO;
+			_anchor_to_parent_velocity = Vector3.ZERO;
+			_last_anchor_origin = Vector3.ZERO;
+			_last_anchor_velocity = Vector3.ZERO;
+			_focus_relative_position = _anchor_relative_position;
+			_inertial_position = _anchor_relative_position;
+			_driver_relative_transform.origin = _anchor_relative_position;
+			if not is_tape_velocity_pending():
+				_relative_velocity = _anchor_relative_velocity;
+				_inertial_velocity = _anchor_relative_velocity;
+				_global_velocity = _anchor_relative_velocity;
+	if not _in_non_root_sync_list:
+		ballistic_sync_dirtied.emit(self);
+
+
+## Updates [member _solver_frame_pin_w] from [member thrust_frame] and [member pinned_anchor].
+func _update_solver_frame_pin_w() -> void:
+	var mag: float = 2.0 if thrust_frame == ThrustFrame.ORBITAL else 1.0;
+	_solver_frame_pin_w = -mag if pinned_anchor != null else mag;
+
+
+## Marks this body as needing re-upload into the resident GPU SSBO and signals upward on transition.
+func _mark_gpu_step_dirty() -> void:
+	if not _gpu_step_dirty:
+		_gpu_step_dirty = true;
+		ballistic_gpu_dirtied.emit(self);
 
 
 ## Evaluates standalone/editor epoch state when edited in the Inspector or gizmos.
 func _on_initial_parameters_changed() -> void:
 	if not is_inside_tree():
-		_needs_parent_reinit = true
-		return
+		_needs_parent_reinit = true;
+		return;
 	if Engine.is_editor_hint() or not _has_initialized_state:
-		_needs_parent_reinit = true
-		_apply_standalone_epoch_state()
-	orbit_visuals_changed.emit()
+		_needs_parent_reinit = true;
+		invalidate_trajectory();
+		ballistic_runtime_dirtied.emit();
+		_apply_standalone_epoch_state();
+	orbit_visuals_changed.emit();
 
 
 ## Updates cached transforms and notifies followers when manual orientation changes.
 func _on_orientation_changed() -> void:
-	_rebuild_transforms_from_anchor()
+	_driver_basis_dirty = true;
+	_clear_fast_root_sync();
+	if _has_external_thrust and thrust_frame == ThrustFrame.BODY_LOCAL:
+		invalidate_trajectory();
+	_rebuild_transforms_from_anchor();
 	if Engine.is_editor_hint() or not _simulation_playing:
-		_system_transform = _driver_relative_transform
-	_refresh_ghost_state()
-	transform_updated.emit()
-	orbit_visuals_changed.emit()
+		_system_transform = _driver_relative_transform;
+	_refresh_ghost_state();
+	transform_updated.emit();
+	orbit_visuals_changed.emit();
 
 
 ## Computes epoch transforms from cached parent state prior to a full driver pass.
 func _apply_standalone_epoch_state() -> void:
-	var ref_basis: Basis = _get_reference_rotation_basis()
-	_anchor_relative_position = ref_basis * initial_position
-	_anchor_relative_velocity = ref_basis * initial_velocity
-	_anchor_to_parent_offset = Vector3.ZERO
-	_anchor_to_parent_velocity = Vector3.ZERO
-	_last_anchor_origin = _last_parent_origin
-	_last_anchor_velocity = _last_parent_velocity
-	_rebuild_transforms_from_anchor()
-	_system_transform = _driver_relative_transform
-	_refresh_ghost_state()
-	transform_updated.emit()
+	var ref_basis: Basis = _get_reference_rotation_basis();
+	_anchor_relative_position = ref_basis * initial_position;
+	_anchor_relative_velocity = ref_basis * initial_velocity;
+	_obeying_shared_tape_clock = false;
+	_tape_vel_pending = false;
+	_anchor_to_parent_offset = Vector3.ZERO;
+	_anchor_to_parent_velocity = Vector3.ZERO;
+	_last_anchor_origin = _last_parent_origin;
+	_last_anchor_velocity = _last_parent_velocity;
+	_rebuild_transforms_from_anchor();
+	_system_transform = _driver_relative_transform;
+	_refresh_ghost_state();
+	transform_updated.emit();
 
 
 ## Linearly interpolates [member _ghost_relative_position] along [member _preview_path_points].

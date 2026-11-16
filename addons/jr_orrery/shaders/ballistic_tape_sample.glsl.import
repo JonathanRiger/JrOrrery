@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://yt6qd7prkru7"
+path="res://.godot/imported/ballistic_tape_sample.glsl-fe9281bdcaa1b652c57c6051a67a9743.res"
+
+[deps]
+
+source_file="res://addons/jr_orrery/shaders/ballistic_tape_sample.glsl"
+dest_files=["res://.godot/imported/ballistic_tape_sample.glsl-fe9281bdcaa1b652c57c6051a67a9743.res"]
+
+[params]
+

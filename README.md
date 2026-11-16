@@ -242,6 +242,73 @@ Open and run `res://addons/jr_orrery/demo/demo.tscn` to explore five interactive
 
 ---
 
+## Performance & Runtime Telemetry (`JrOrreryTelemetry`)
+
+JR Orrery includes an opt-in, zero-overhead microsecond telemetry profiler (`JrOrreryTelemetry`) and an automated 43-case CLI benchmark harness (`benchmarks/run_benchmarks.ps1`).
+
+### Compute & Trajectory-Horizon Architecture
+- **Rolling Cubic Hermite Trajectory-Horizon Tapes (`JrBallisticTrajectoryTape`)**: Ballistic bodies precompute and follow a rolling Cubic Hermite spline horizon `(pos_anchor, vel_flags)` rather than re-integrating every body on every tick. Horizon refills are staggered across **64 cohorts** (`1/64`th of active bodies per frame), while unperturbed closed orbits loop in `O(1)` (`JOB_PERIODIC_LOOP`) and only re-bake when gravitational wells or thrusters change.
+- **Resident VRAM Knot-Major SoA Tape Atlas & Fused GPU Pipeline**: For large swarms (`>= 1,024` bodies), trajectory knots stay resident in VRAM in **Knot-Major SoA layout** (`TapeAtlasBuffer`). Cohort KDK integration (`ballistic_forecast.glsl`), an in-command-list memory barrier, and 4,096-body Cubic Hermite evaluation (`ballistic_tape_sample.glsl`) execute in a **single GPU submission** and **single unified SSBO readback**, overlapped with CPU follower signal emission.
+- **GPU-Baked Periodic Cubic B-Spline Kepler Solver (`rail_kepler_spline.glsl`)**: `JrRailOrbiter` bakes a 256-segment periodic cubic B-spline lookup table (`M -> nu(M) - M`) per unique eccentricity on the GPU, evaluating exact 3D rail orbits in `O(1)` without iterative Newton–Raphson loops.
+
+### Benchmark Comparison (`v1.0` Release vs. Current)
+Measured on **Godot 4.7-stable (Forward+ D3D12)**, **Intel Core Ultra 9 185H**, **NVIDIA GeForce RTX 4070 Laptop GPU**:
+
+| Benchmark Scenario | `v1.0` Mean (`ms`) | `v1.0` P95 (`ms`) | Current Mean (`ms`) | Current P50 (`ms`) | Current P95 (`ms`) | P95 Speedup |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Planetary System [GPU]** (11 rails, 2 forecast probes) | `29.22` | `34.45` | **`0.62`** | **`0.19`** | **`0.38`** | **`91.3x`** |
+| **Real-Scale LEO [GPU]** (1 AU scale, ion spiral) | `15.93` | `20.08` | **`0.15`** | **`0.12`** | **`0.13`** | **`157.8x`** |
+| **Lagrange Points (Synodic) [GPU]** (L4/L5 Trojans) | `21.20` | `28.06` | **`0.16`** | **`0.16`** | **`0.19`** | **`150.5x`** |
+| **Binary Stars [GPU]** (coupled binary + probe) | `14.73` | `19.86` | **`0.07`** | **`0.07`** | **`0.07`** | **`267.3x`** |
+| **Asteroid Swarm 256 [GPU, Core Only]** | `19.43` | `25.22` | **`3.75`** | **`3.17`** | **`9.83`** | **`2.6x`** |
+| **Swarm 256 [GPU, Unpinned, Active KDK]** | `16.10` | `22.46` | **`3.72`** | **`3.37`** | **`5.35`** | **`4.2x`** |
+| **Swarm 1024 [GPU, Pinned, Active KDK]** | `39.29` | `50.50` | **`2.87`** | **`2.98`** | **`3.35`** | **`15.1x`** |
+| **Swarm 1024 [GPU, Unpinned, Active KDK]** | `56.07` | `72.45` | **`3.04`** | **`2.98`** | **`4.72`** | **`15.3x`** |
+| **Swarm 1024 [GPU, Pinned, Tier-1 On-Rails]** | `33.71` | `41.06` | **`1.70`** | **`1.68`** | **`1.82`** | **`22.5x`** |
+| **Swarm 4096 [GPU, Pinned, Active KDK]** | `132.25` | `165.48` | **`6.00`** | **`5.11`** | **`10.45`** | **`15.8x`** |
+| **Swarm 4096 [GPU, Unpinned, Active KDK]** | `221.10` | `280.77` | **`7.45`** | **`7.05`** | **`9.81`** | **`28.6x`** |
+| **Swarm 4096 [GPU, Pinned, Tier-1 On-Rails]** | `49.22` | `58.48` | **`2.05`** | **`2.11`** | **`2.91`** | **`20.1x`** |
+| **Forecast 16 bodies [GPU, Synodic]** (192 steps/body) | `91.88` | `105.92` | **`0.84`** | **`0.46`** | **`2.29`** | **`46.3x`** |
+| **Forecast 64 bodies [GPU, Inertial]** (192 steps/body) | `120.31` | `138.53` | **`2.38`** | **`2.08`** | **`3.30`** | **`42.0x`** |
+| **Forecast 64 bodies [GPU, Synodic]** (192 steps/body) | `233.28` | `279.82` | **`4.00`** | **`3.62`** | **`5.65`** | **`49.5x`** |
+| **Rails 256 bodies [Heliocentric]** | `7.38` | `10.97` | **`0.41`** | **`0.40`** | **`0.49`** | **`22.3x`** |
+| **Rails 1024 bodies [Heliocentric]** | `28.64` | `38.19` | **`2.17`** | **`1.96`** | **`2.89`** | **`13.2x`** |
+| **Rails 1024 bodies [Deep Moon Synodic]** | `52.22` | `58.28` | **`2.83`** | **`2.82`** | **`2.96`** | **`19.7x`** |
+
+### Profiling Your Scene in GDScript
+When no `JrOrreryTelemetry` instance is attached (`driver.get_telemetry() == null`), `JrOrbitDriver` and `JrBallisticComputeSolver` take a fast un-instrumented path with zero `Time.get_ticks_usec()` calls (`1.38 ms/tick` un-instrumented for 1,024 GPU ballistic bodies). Attach a collector at any time to record per-phase microsecond distributions (`mean`, `p50`, `p95`, `min`, `max`):
+
+```gdscript
+extends Node
+
+@export var driver: JrOrbitDriver;
+var _telemetry := JrOrreryTelemetry.new();
+
+
+func _ready() -> void:
+	_telemetry.configure(120);
+	driver.set_telemetry(_telemetry);
+
+
+func print_telemetry_snapshot() -> void:
+	print(_telemetry.format_summary("My Orbital System"));
+	var total_stats: Dictionary = _telemetry.get_phase_stats(JrOrreryTelemetry.PHASE_TOTAL_UPDATE);
+	print("P95 frame time (us): ", total_stats.get("p95_usec", 0.0));
+```
+
+### Running the CLI Benchmark Suite
+Run the full 43-case benchmark suite (or filter by suite/case) from PowerShell to generate console tables along with `benchmarks/results/latest_benchmark.md` and `benchmarks/results/latest_benchmark.json`:
+
+```powershell
+# Run all 43 benchmark cases across demos, swarms, forecasts, and rail hierarchies:
+powershell -NoProfile -ExecutionPolicy Bypass -File .\benchmarks\run_benchmarks.ps1
+
+# Run a single suite (demos | swarm | forecasts | rails) or filter by case substring:
+powershell -NoProfile -ExecutionPolicy Bypass -File .\benchmarks\run_benchmarks.ps1 -Suite swarm -Case "4096"
+```
+
+---
+
 ## Author, Version & License
 
 - **Author**: Jonathan Riger
