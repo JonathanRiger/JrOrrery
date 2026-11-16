@@ -3,16 +3,19 @@
 
 // Parallel O(1) Cubic Hermite trajectory-tape sampler for JrBallisticOrbiter swarms.
 // Evaluates anchor-relative positions from resident VRAM knot slots (written directly by
-// ballistic_forecast.glsl) and emits sparse CPU fallback or gravity-well handoff events
-// only when a body's active segment crosses a Sphere-of-Influence boundary or switches wells.
+// ballistic_forecast.glsl) and emits inline 5-vec4 Sphere-of-Influence handoff payloads or
+// sparse gravity-well switch events into TapeSampleOutputBuffer without extra VRAM readbacks.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-const uint ATLAS_SLOT_VEC4S = 272u;
-const uint ATLAS_VEL_OFFSET = 136u;
-const uint EVENT_CPU_FALLBACK = 0xFFFFFFFFu;
+const uint ATLAS_SLOT_VEC4S = 528u;
+const uint ATLAS_VEL_OFFSET = 264u;
+const uint EVENT_STRIDE_WORDS = 20u;
+const float EVENT_KIND_WELL_SWITCH = 1.0;
+const float EVENT_KIND_CROSS_SOI = 2.0;
+const float EVENT_KIND_CPU_FALLBACK = 3.0;
 
-// Binding 0: Resident per-body knot atlas (272 vec4s per slot: [0..135] pos_anchor, [136..271] vel_flags).
+// Binding 0: Resident per-body knot atlas (528 vec4s per slot: [0..263] pos_anchor, [264..527] vel_flags).
 layout(set = 0, binding = 0, std430) restrict readonly buffer TapeAtlasBuffer {
 	vec4 atlas_knots[];
 };
@@ -24,12 +27,11 @@ layout(set = 0, binding = 1, std430) restrict readonly buffer TapeMetaBuffer {
 	vec4 tape_meta[];
 };
 
-// Binding 2: Packed sampled-position & sparse event output buffer:
-//   out_words[0]                            = event_count (atomic counter)
-//   out_words[1..5]                         = 24-byte header padding (aligned to 2 x Vector3)
-//   out_words[6 + gid * 3 + 0..2]           = floatBitsToUint(r_rel.xyz)
-//   out_words[events_word_offset + e*2 + 0] = gid
-//   out_words[events_word_offset + e*2 + 1] = ev_code (EVENT_CPU_FALLBACK or uint(new_well_idx))
+// Binding 2: Unified sampled-position, fused compact-tail, & sparse 5-vec4 event output buffer:
+//   out_words[0]                             = event_count (atomic counter)
+//   out_words[1..5]                          = 24-byte header padding (aligned to 2 x Vector3)
+//   out_words[6 + gid * 3 + 0..2]            = floatBitsToUint(r_rel.xyz)
+//   out_words[events_word_offset + e*20 ..]  = 5 x vec4 event record (hdr, pa, pb, va, vb)
 layout(set = 0, binding = 2, std430) coherent buffer TapeSampleOutputBuffer {
 	uint out_words[];
 };
@@ -41,12 +43,30 @@ layout(push_constant, std430) uniform TapeSampleParams {
 	uint events_word_offset;
 } params;
 
-void emit_sample_event(uint gid, uint code) {
+void write_event_vec4(uint word_base, vec4 v) {
+	out_words[word_base] = floatBitsToUint(v.x);
+	out_words[word_base + 1u] = floatBitsToUint(v.y);
+	out_words[word_base + 2u] = floatBitsToUint(v.z);
+	out_words[word_base + 3u] = floatBitsToUint(v.w);
+}
+
+void emit_simple_event(uint gid, float kind, float arg) {
 	uint slot = atomicAdd(out_words[0], 1u);
 	if (slot < params.body_count) {
-		uint base = params.events_word_offset + slot * 2u;
-		out_words[base] = gid;
-		out_words[base + 1u] = code;
+		uint base = params.events_word_offset + slot * EVENT_STRIDE_WORDS;
+		write_event_vec4(base, vec4(float(gid), kind, arg, 0.0));
+	}
+}
+
+void emit_cross_soi_from_slot(vec4 hdr, uint slot_idx, uint atlas_stride, uint idx_a) {
+	uint slot = atomicAdd(out_words[0], 1u);
+	if (slot < params.body_count) {
+		uint base = params.events_word_offset + slot * EVENT_STRIDE_WORDS;
+		write_event_vec4(base, hdr);
+		write_event_vec4(base + 4u, atlas_knots[idx_a * atlas_stride + slot_idx]);
+		write_event_vec4(base + 8u, atlas_knots[(idx_a + 1u) * atlas_stride + slot_idx]);
+		write_event_vec4(base + 12u, atlas_knots[(ATLAS_VEL_OFFSET + idx_a) * atlas_stride + slot_idx]);
+		write_event_vec4(base + 16u, atlas_knots[(ATLAS_VEL_OFFSET + idx_a + 1u) * atlas_stride + slot_idx]);
 	}
 }
 
@@ -60,7 +80,7 @@ void main() {
 	vec4 m1 = tape_meta[gid * 2u + 1u];
 	uint knot_count = uint(max(0.0, round(m1.y)));
 	if (knot_count < 2u) {
-		emit_sample_event(gid, EVENT_CPU_FALLBACK);
+		emit_simple_event(gid, EVENT_KIND_CPU_FALLBACK, 0.0);
 		return;
 	}
 
@@ -79,8 +99,8 @@ void main() {
 	float u = scaled - float(idx_a);
 
 	uint slot_idx = uint(max(0.0, round(m1.x)));
-	uint slot_base = slot_idx * ATLAS_SLOT_VEC4S;
-	vec4 pa = atlas_knots[slot_base + idx_a];
+	uint atlas_stride = uint(atlas_knots.length()) / ATLAS_SLOT_VEC4S;
+	vec4 pa = atlas_knots[idx_a * atlas_stride + slot_idx];
 
 	vec3 r_rel;
 	int w_idx;
@@ -88,9 +108,14 @@ void main() {
 		r_rel = pa.xyz;
 		w_idx = int(round(pa.w));
 	} else {
-		vec4 pb = atlas_knots[slot_base + idx_a + 1u];
+		vec4 pb = atlas_knots[(idx_a + 1u) * atlas_stride + slot_idx];
 		if (abs(pa.w - pb.w) > 0.1) {
-			emit_sample_event(gid, EVENT_CPU_FALLBACK);
+			emit_cross_soi_from_slot(
+				vec4(float(gid), EVENT_KIND_CROSS_SOI, float(idx_a), u),
+				slot_idx,
+				atlas_stride,
+				idx_a
+			);
 			return;
 		}
 		if (u >= 0.99999) {
@@ -104,8 +129,8 @@ void main() {
 			float h10 = (u3 - 2.0 * u2 + u) * dt_k;
 			float h01 = -2.0 * u3 + 3.0 * u2;
 			float h11 = (u3 - u2) * dt_k;
-			vec3 va = atlas_knots[slot_base + ATLAS_VEL_OFFSET + idx_a].xyz;
-			vec3 vb = atlas_knots[slot_base + ATLAS_VEL_OFFSET + idx_a + 1u].xyz;
+			vec3 va = atlas_knots[(ATLAS_VEL_OFFSET + idx_a) * atlas_stride + slot_idx].xyz;
+			vec3 vb = atlas_knots[(ATLAS_VEL_OFFSET + idx_a + 1u) * atlas_stride + slot_idx].xyz;
 			r_rel = pa.xyz * h00 + va * h10 + pb.xyz * h01 + vb * h11;
 			w_idx = int(round(pa.w));
 		}
@@ -118,6 +143,6 @@ void main() {
 
 	int expected_well = int(round(m1.w));
 	if (w_idx != expected_well && w_idx >= 0) {
-		emit_sample_event(gid, uint(w_idx));
+		emit_simple_event(gid, EVENT_KIND_WELL_SWITCH, float(w_idx));
 	}
 }

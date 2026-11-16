@@ -737,6 +737,26 @@ func get_relative_position(time: float, reference: JrReferenceDirection = null) 
 	return (ref.orbit_transform.basis * _orbital_transform.basis) * get_perifocal_position(time);
 
 
+## Evaluates the parent-relative position in [member _reference_plane] space in `O(1)` when
+## [member _has_ref_frame_cache] is active, avoiding optional-argument reference checks in tight loops.
+func sample_local_position_fast(eval_time: float) -> Vector3:
+	if _has_ref_frame_cache:
+		if _is_circular:
+			var nu_c: float = eval_time * mean_motion + mean_anomaly_at_epoch;
+			return (
+					_orbit_axis_x * (_semi_major_axis * sin(nu_c))
+					- _orbit_axis_z * (_semi_major_axis * cos(nu_c))
+			);
+		if _has_baked_nu_spline:
+			var nu_s: float = _sample_baked_true_anomaly(eval_time);
+			var s_nu: float = sin(nu_s);
+			var c_nu: float = cos(nu_s);
+			var r_nu: float = _semi_parameter / (1.0 + eccentricity * c_nu);
+			return _orbit_axis_x * (r_nu * s_nu) - _orbit_axis_z * (r_nu * c_nu);
+		return _cached_ref_orbit_basis * get_perifocal_position(eval_time);
+	return get_relative_position(eval_time, _reference_plane);
+
+
 ## Returns the 3D orbital velocity vector of the body relative to its parent focus
 ## in the coordinate space of [param reference] (or [member _reference_plane] if omitted)
 ## at the given [param time]. When called with no arguments, returns the cached

@@ -5,8 +5,9 @@
 // Uses Universal-Variable Kepler Kick-Drift-Kick in anchor-relative coordinates,
 // LCA tree-relative well difference walks, Battin's f(q) differential tides,
 // ThrustFrame.ORBITAL prograde/normal/radial basis updates, and mid-horizon
-// Hill-sphere anchor handoffs. Supports mixed full-horizon bakes and incremental
-// tail-chunk extensions in a single dispatch via per-body start_t_offset and knot_dt.
+// Hill-sphere anchor handoffs. Supports mixed full-horizon bakes, incremental
+// tail-chunk extensions, and compact 2-vec4 tail-summary readbacks when writing
+// directly into the resident VRAM TapeAtlasBuffer.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -29,15 +30,18 @@ layout(set = 0, binding = 1, std430) restrict readonly buffer WellTimelineBuffer
 	vec4 well_samples[];
 };
 
-// Binding 2: Contiguous per-body [pos_anchor[0..steps] | vel_flags[0..steps]] slices (2 vec4s per knot).
-// For body with out_base_knot and pt_count = steps + 1:
+// Binding 2: Per-body output slices in ForecastPointOutputBuffer (2 vec4s per output knot).
+// Full readback mode (compact_tail_out == false, pt_count = steps + 1):
 //   forecast_knots[out_base_knot * 2 + k]            = vec4(r_rel, float(anchor_idx))
 //   forecast_knots[out_base_knot * 2 + pt_count + k] = vec4(v_rel, unperturbed_flag)
+// Compact tail-summary mode (compact_tail_out == true, 1 knot = 2 vec4s reserved):
+//   forecast_knots[out_base_knot * 2 + 0] = vec4(r_tail, float(anchor_tail))
+//   forecast_knots[out_base_knot * 2 + 1] = vec4(v_tail, unperturbed_flag)
 layout(set = 0, binding = 2, std430) restrict writeonly buffer ForecastPointOutputBuffer {
 	vec4 forecast_knots[];
 };
 
-// Binding 3: Optional resident GPU trajectory-tape atlas (272 vec4s per body slot:
+// Binding 3: Resident GPU trajectory-tape atlas (272 vec4s per body slot:
 // [0..135] pos_anchor, [136..271] vel_flags) populated directly when atlas_slot_plus_one > 0.
 layout(set = 0, binding = 3, std430) restrict writeonly buffer TapeAtlasWriteBuffer {
 	vec4 atlas_knots[];
@@ -51,47 +55,82 @@ layout(push_constant, std430) uniform ForecastParams {
 } params;
 
 const float TWO_PI = 6.28318530718;
-const uint ATLAS_SLOT_VEC4S = 272u;
-const uint ATLAS_VEL_OFFSET = 136u;
+const uint ATLAS_SLOT_VEC4S = 528u;
+const uint ATLAS_VEL_OFFSET = 264u;
+const uint MAX_CACHED_WELLS = 16u;
+
+// Per-invocation scalar cache of gravity-well bitmasks (`bits 0..15` = has_child,
+// `bits 16..31` = positive_mu for wells 0..15), 4-bit parent nibbles, and squared tidal threshold.
+uint g_well_masks = 0u;
+uint g_parent_nibbles_lo = 0u;
+uint g_parent_nibbles_hi = 0u;
+float g_cull_threshold_sq = 0.0;
+bool g_did_exit_anchor = false;
+int g_entered_child_well = -1;
 
 struct KnotWriteTarget {
 	uint pos_base;
 	uint vel_base;
-	uint atlas_pos_base;
+	uint atlas_slot;
+	uint atlas_stride;
+	uint final_step;
 	bool write_atlas;
+	bool compact_tail_out;
 };
 
 void write_knot(KnotWriteTarget dst, uint k_idx, vec4 pos_v4, vec4 vel_v4) {
-	forecast_knots[dst.pos_base + k_idx] = pos_v4;
-	forecast_knots[dst.vel_base + k_idx] = vel_v4;
 	if (dst.write_atlas) {
-		atlas_knots[dst.atlas_pos_base + k_idx] = pos_v4;
-		atlas_knots[dst.atlas_pos_base + ATLAS_VEL_OFFSET + k_idx] = vel_v4;
+		atlas_knots[k_idx * dst.atlas_stride + dst.atlas_slot] = pos_v4;
+		atlas_knots[(ATLAS_VEL_OFFSET + k_idx) * dst.atlas_stride + dst.atlas_slot] = vel_v4;
+	}
+	if (!dst.compact_tail_out) {
+		forecast_knots[dst.pos_base + k_idx] = pos_v4;
+		forecast_knots[dst.vel_base + k_idx] = vel_v4;
+	} else if (k_idx == dst.final_step) {
+		forecast_knots[dst.pos_base] = pos_v4;
+		forecast_knots[dst.vel_base] = vel_v4;
 	}
 }
 
-float stumpff_c(float z) {
-	if (abs(z) < 1e-3) {
-		return 0.5 - z * (1.0 / 24.0 - z * (1.0 / 720.0));
+float get_well_mu(int well_idx) {
+	if (well_idx < 0 || uint(well_idx) >= params.well_count) {
+		return 0.0;
 	}
-	if (z > 0.0) {
-		float sz = sqrt(z);
-		return (1.0 - cos(sz)) / z;
-	}
-	float sz = sqrt(-z);
-	return (cosh(sz) - 1.0) / (-z);
+	return well_samples[uint(well_idx) * 2u].w;
 }
 
-float stumpff_s(float z) {
-	if (abs(z) < 1e-3) {
-		return (1.0 / 6.0) - z * ((1.0 / 120.0) - z * (1.0 / 5040.0));
+int get_well_parent(int well_idx) {
+	if (well_idx <= 0 || uint(well_idx) >= params.well_count) {
+		return -1;
+	}
+	uint uw = uint(well_idx);
+	if (params.well_count <= 15u) {
+		if (uw < 8u) {
+			return int((g_parent_nibbles_lo >> (uw * 4u)) & 15u) - 1;
+		}
+		return int((g_parent_nibbles_hi >> ((uw - 8u) * 4u)) & 15u) - 1;
+	}
+	return int(round(well_samples[uw * 2u + 1u].z));
+}
+
+void stumpff_cs(float z, out float cz, out float sz) {
+	if (abs(z) <= 0.5) {
+		cz = 0.5 + z * ((-1.0 / 24.0) + z * ((1.0 / 720.0) - z * (1.0 / 40320.0)));
+		sz = (1.0 / 6.0) + z * ((-1.0 / 120.0) + z * ((1.0 / 5040.0) - z * (1.0 / 362880.0)));
+		return;
 	}
 	if (z > 0.0) {
-		float sz = sqrt(z);
-		return (sz - sin(sz)) / (z * sz);
+		float root_z = sqrt(z);
+		float inv_z = 1.0 / z;
+		cz = (1.0 - cos(root_z)) * inv_z;
+		sz = (root_z - sin(root_z)) * (inv_z / root_z);
+		return;
 	}
-	float sz = sqrt(-z);
-	return (sinh(sz) - sz) / ((-z) * sz);
+	float neg_z = -z;
+	float root_nz = sqrt(neg_z);
+	float inv_nz = 1.0 / neg_z;
+	cz = (cosh(root_nz) - 1.0) * inv_nz;
+	sz = (sinh(root_nz) - root_nz) * (inv_nz / root_nz);
 }
 
 void kepler_drift(inout vec3 r0, inout vec3 v0, float mu, float dt) {
@@ -125,12 +164,16 @@ void kepler_drift(inout vec3 r0, inout vec3 v0, float mu, float dt) {
 	float chi = (alpha > 1e-4) ? (dt_dim * alpha) : dt_dim;
 	chi = clamp(chi, -1e4, 1e4);
 
+	float chi2 = 0.0;
+	float z = 0.0;
+	float cz = 0.5;
+	float sz = 1.0 / 6.0;
+	float chi3 = 0.0;
 	for (int iter = 0; iter < 16; iter++) {
-		float chi2 = chi * chi;
-		float z = alpha * chi2;
-		float cz = stumpff_c(z);
-		float sz = stumpff_s(z);
-		float chi3 = chi2 * chi;
+		chi2 = chi * chi;
+		z = alpha * chi2;
+		stumpff_cs(z, cz, sz);
+		chi3 = chi2 * chi;
 
 		float f_val = sigma0 * chi2 * cz + (1.0 - alpha) * chi3 * sz + chi - dt_dim;
 		float df = sigma0 * chi * (1.0 - z * sz) + (1.0 - alpha) * chi2 * cz + 1.0;
@@ -138,15 +181,13 @@ void kepler_drift(inout vec3 r0, inout vec3 v0, float mu, float dt) {
 		float delta = f_val / safe_df;
 		chi -= delta;
 		if (abs(delta) < 1e-6) {
+			chi2 = chi * chi;
+			z = alpha * chi2;
+			stumpff_cs(z, cz, sz);
+			chi3 = chi2 * chi;
 			break;
 		}
 	}
-
-	float chi2 = chi * chi;
-	float z = alpha * chi2;
-	float cz = stumpff_c(z);
-	float sz = stumpff_s(z);
-	float chi3 = chi2 * chi;
 
 	float r_dim = max(1e-7, 1.0 + sigma0 * chi * (1.0 - z * sz) + (1.0 - alpha) * chi2 * cz);
 	float f_lag = 1.0 - chi2 * cz;
@@ -158,13 +199,6 @@ void kepler_drift(inout vec3 r0, inout vec3 v0, float mu, float dt) {
 	vec3 v1_dim = df_lag * r_unit + dg_lag * v_dim;
 	r0 = r1_dim * r_scale;
 	v0 = v1_dim * v_scale;
-}
-
-int get_well_parent(int well_idx) {
-	if (well_idx < 0 || uint(well_idx) >= params.well_count) {
-		return -1;
-	}
-	return int(round(well_samples[well_idx * 2 + 1].z));
 }
 
 bool is_descendant_of(int well_candidate, int ancestor_well) {
@@ -184,7 +218,7 @@ bool is_descendant_of(int well_candidate, int ancestor_well) {
 }
 
 vec3 sample_well_local_pos(int well_idx, uint idx_a, uint idx_b, float frac) {
-	if (well_idx < 0 || uint(well_idx) >= params.well_count) {
+	if (well_idx <= 0 || uint(well_idx) >= params.well_count) {
 		return vec3(0.0);
 	}
 	uint base_a = (idx_a * params.well_count + uint(well_idx)) * 2u;
@@ -192,13 +226,44 @@ vec3 sample_well_local_pos(int well_idx, uint idx_a, uint idx_b, float frac) {
 	return mix(well_samples[base_a].xyz, well_samples[base_b].xyz, frac);
 }
 
-vec3 sample_well_local_vel(int well_idx, uint idx_a, uint idx_b) {
-	if (well_idx < 0 || uint(well_idx) >= params.well_count || idx_a == idx_b) {
+vec3 well_knot_vel(int well_idx, uint seg_idx) {
+	if (well_idx <= 0 || uint(well_idx) >= params.well_count || params.timeline_segments == 0u) {
 		return vec3(0.0);
 	}
-	uint base_a = (idx_a * params.well_count + uint(well_idx)) * 2u;
-	uint base_b = (idx_b * params.well_count + uint(well_idx)) * 2u;
-	return (well_samples[base_b].xyz - well_samples[base_a].xyz) * params.inv_timeline_dt;
+	uint wc = params.well_count;
+	uint w = uint(well_idx);
+	uint max_s = params.timeline_segments;
+	if (max_s == 1u) {
+		vec3 p0 = well_samples[w * 2u].xyz;
+		vec3 p1 = well_samples[(wc + w) * 2u].xyz;
+		return (p1 - p0) * params.inv_timeline_dt;
+	}
+	if (seg_idx == 0u) {
+		vec3 p0 = well_samples[w * 2u].xyz;
+		vec3 p1 = well_samples[(wc + w) * 2u].xyz;
+		vec3 p2 = well_samples[(2u * wc + w) * 2u].xyz;
+		return (-1.5 * p0 + 2.0 * p1 - 0.5 * p2) * params.inv_timeline_dt;
+	}
+	if (seg_idx >= max_s) {
+		vec3 p_n = well_samples[(max_s * wc + w) * 2u].xyz;
+		vec3 p_n1 = well_samples[((max_s - 1u) * wc + w) * 2u].xyz;
+		vec3 p_n2 = well_samples[((max_s - 2u) * wc + w) * 2u].xyz;
+		return (1.5 * p_n - 2.0 * p_n1 + 0.5 * p_n2) * params.inv_timeline_dt;
+	}
+	vec3 p_prev = well_samples[((seg_idx - 1u) * wc + w) * 2u].xyz;
+	vec3 p_next = well_samples[((seg_idx + 1u) * wc + w) * 2u].xyz;
+	return (p_next - p_prev) * (0.5 * params.inv_timeline_dt);
+}
+
+vec3 sample_well_local_vel(int well_idx, uint idx_a, uint idx_b, float frac) {
+	if (well_idx <= 0 || uint(well_idx) >= params.well_count || params.timeline_segments == 0u) {
+		return vec3(0.0);
+	}
+	vec3 va = well_knot_vel(well_idx, idx_a);
+	if (idx_a == idx_b || frac <= 0.0) {
+		return va;
+	}
+	return mix(va, well_knot_vel(well_idx, idx_b), frac);
 }
 
 vec3 compute_timeline_well_difference(int well_a, int well_b, uint idx_a, uint idx_b, float frac) {
@@ -257,9 +322,13 @@ vec3 compute_timeline_perturbing_gravity(
 	out bool any_pert_active
 ) {
 	any_pert_active = false;
-	if (params.well_count == 0u) {
+	if (params.well_count == 0u || (mu_anchor > 0.0 && !enable_tidal)) {
+		g_did_exit_anchor = (anchor_idx > 0);
+		g_entered_child_well = -2;
 		return vec3(0.0);
 	}
+	g_did_exit_anchor = false;
+	g_entered_child_well = -1;
 
 	float max_seg = float(params.timeline_segments);
 	float sample_coord = clamp(t_offset * params.inv_timeline_dt, 0.0, max_seg);
@@ -267,26 +336,62 @@ vec3 compute_timeline_perturbing_gravity(
 	uint idx_b = min(idx_a + 1u, params.timeline_segments);
 	float frac = sample_coord - float(idx_a);
 
-	float cull_threshold_sq = well_samples[1].w;
+	uint row_a = idx_a * params.well_count * 2u;
+	uint row_b = idx_b * params.well_count * 2u;
 	float r_rel_sq = dot(r_rel, r_rel);
+	int anchor_parent = -1;
+	vec3 anchor_local_pos = vec3(0.0);
+	if (anchor_idx > 0 && uint(anchor_idx) < params.well_count) {
+		uint a_off = uint(anchor_idx) * 2u;
+		anchor_parent = get_well_parent(anchor_idx);
+		anchor_local_pos = mix(
+			well_samples[row_a + a_off].xyz,
+			well_samples[row_b + a_off].xyz,
+			frac
+		);
+		float exit_r = well_samples[row_a + a_off + 1u].y;
+		g_did_exit_anchor = (anchor_parent >= 0 && exit_r > 0.0 && r_rel_sq > exit_r * exit_r);
+	}
+
 	vec3 total_accel = vec3(0.0);
 
 	for (uint k = 0u; k < params.well_count; k++) {
 		int k_idx = int(k);
-		if (k_idx == anchor_idx) {
+		if (k_idx == anchor_idx || (k < MAX_CACHED_WELLS && (g_well_masks & (1u << (16u + k))) == 0u)) {
 			continue;
 		}
-		float mu_k = well_samples[k * 2u].w;
+		uint k_off = k * 2u;
+		vec4 wk_a0 = well_samples[row_a + k_off];
+		float mu_k = wk_a0.w;
 		if (mu_k <= 0.0) {
 			continue;
 		}
 
-		vec3 d_vec = (anchor_idx >= 0)
-			? compute_timeline_well_difference(anchor_idx, k_idx, idx_a, idx_b, frac)
-			: -compute_timeline_well_difference(k_idx, 0, idx_a, idx_b, frac);
+		int p_k = get_well_parent(k_idx);
+		vec3 d_vec;
+		if (p_k == anchor_idx) {
+			d_vec = -mix(wk_a0.xyz, well_samples[row_b + k_off].xyz, frac);
+		} else if (anchor_parent == k_idx) {
+			d_vec = anchor_local_pos;
+		} else if (anchor_parent >= 0 && anchor_parent == p_k) {
+			d_vec = anchor_local_pos - mix(wk_a0.xyz, well_samples[row_b + k_off].xyz, frac);
+		} else {
+			d_vec = (anchor_idx >= 0)
+				? compute_timeline_well_difference(anchor_idx, k_idx, idx_a, idx_b, frac)
+				: -compute_timeline_well_difference(k_idx, 0, idx_a, idx_b, frac);
+		}
 		float d_sq = dot(d_vec, d_vec);
 		if (d_sq <= 1e-12) {
 			continue;
+		}
+		if (p_k == anchor_idx && g_entered_child_well == -1) {
+			float entry_r = well_samples[row_a + k_off + 1u].x;
+			if (entry_r > 0.0) {
+				vec3 rho_c = r_rel + d_vec;
+				if (dot(rho_c, rho_c) < entry_r * entry_r) {
+					g_entered_child_well = k_idx;
+				}
+			}
 		}
 
 		if (mu_anchor <= 0.0) {
@@ -303,15 +408,11 @@ vec3 compute_timeline_perturbing_gravity(
 			continue;
 		}
 
-		if (!enable_tidal) {
-			continue;
-		}
-
 		float r_over_d_sq = r_rel_sq / d_sq;
 		float r_over_d_6 = r_over_d_sq * r_over_d_sq * r_over_d_sq;
 		float mu_ratio = mu_k / mu_anchor;
 		float tidal_ratio_sq = 4.0 * (mu_ratio * mu_ratio) * r_over_d_6;
-		if (tidal_ratio_sq < cull_threshold_sq) {
+		if (tidal_ratio_sq < g_cull_threshold_sq) {
 			continue;
 		}
 
@@ -349,6 +450,15 @@ void maybe_switch_forecast_anchor(
 	if (anchor_idx < 0 || uint(anchor_idx) >= params.well_count) {
 		return;
 	}
+	bool can_exit = g_did_exit_anchor && (anchor_idx > 0);
+	bool can_enter = (g_entered_child_well != -1) && (
+		(uint(anchor_idx) >= MAX_CACHED_WELLS)
+		|| ((g_well_masks & (1u << uint(anchor_idx))) != 0u)
+	);
+	if (!can_exit && !can_enter) {
+		return;
+	}
+
 	float max_seg = float(params.timeline_segments);
 	float sample_coord = clamp(t_offset * params.inv_timeline_dt, 0.0, max_seg);
 	uint idx_a = min(uint(floor(sample_coord)), params.timeline_segments);
@@ -356,28 +466,40 @@ void maybe_switch_forecast_anchor(
 	float frac = sample_coord - float(idx_a);
 
 	// 1. Check exit from current anchor into parent anchor(s).
-	for (int depth = 0; depth < 4; depth++) {
-		if (anchor_idx <= 0 || uint(anchor_idx) >= params.well_count) {
-			break;
+	if (can_exit) {
+		for (int depth = 0; depth < 4; depth++) {
+			if (anchor_idx <= 0 || uint(anchor_idx) >= params.well_count) {
+				break;
+			}
+			float exit_r = well_samples[(idx_a * params.well_count + uint(anchor_idx)) * 2u + 1u].y;
+			int parent_idx = get_well_parent(anchor_idx);
+			if (parent_idx >= 0 && exit_r > 0.0 && dot(r_rel, r_rel) > exit_r * exit_r) {
+				r_rel += sample_well_local_pos(anchor_idx, idx_a, idx_b, frac);
+				v_rel += sample_well_local_vel(anchor_idx, idx_a, idx_b, frac);
+				anchor_idx = parent_idx;
+				can_enter = true;
+			} else {
+				break;
+			}
 		}
-		vec4 anchor_meta = well_samples[(idx_a * params.well_count + uint(anchor_idx)) * 2u + 1u];
-		float exit_r = anchor_meta.y;
-		int parent_idx = int(round(anchor_meta.z));
-		if (parent_idx >= 0 && exit_r > 0.0 && dot(r_rel, r_rel) > exit_r * exit_r) {
-			r_rel += sample_well_local_pos(anchor_idx, idx_a, idx_b, frac);
-			v_rel += sample_well_local_vel(anchor_idx, idx_a, idx_b);
-			anchor_idx = parent_idx;
-		} else {
-			break;
-		}
+	}
+
+	if (!can_enter) {
+		return;
 	}
 
 	// 2. Check entry into a direct child well (and nested child wells) of the current anchor.
 	for (int depth = 0; depth < 4; depth++) {
+		if (uint(anchor_idx) < MAX_CACHED_WELLS && (g_well_masks & (1u << uint(anchor_idx))) == 0u) {
+			break;
+		}
 		bool entered_child = false;
-		for (uint w = 0u; w < params.well_count; w++) {
+		for (uint w = 1u; w < params.well_count; w++) {
 			int w_idx = int(w);
-			if (get_well_parent(w_idx) != anchor_idx) {
+			bool pos_mu = (w < MAX_CACHED_WELLS)
+				? ((g_well_masks & (1u << (16u + w))) != 0u)
+				: (get_well_mu(w_idx) > 0.0);
+			if (!pos_mu || get_well_parent(w_idx) != anchor_idx) {
 				continue;
 			}
 			float entry_r = well_samples[(idx_a * params.well_count + w) * 2u + 1u].x;
@@ -388,7 +510,7 @@ void maybe_switch_forecast_anchor(
 			vec3 diff_to_child = r_rel - child_local_pos;
 			if (dot(diff_to_child, diff_to_child) < entry_r * entry_r) {
 				r_rel = diff_to_child;
-				v_rel -= sample_well_local_vel(w_idx, idx_a, idx_b);
+				v_rel -= sample_well_local_vel(w_idx, idx_a, idx_b, frac);
 				anchor_idx = w_idx;
 				entered_child = true;
 				break;
@@ -419,18 +541,31 @@ void main() {
 	uint mode_bits = uint(round(input_body.anchor_frame_flags.z));
 	uint substeps = clamp(uint(round(input_body.anchor_frame_flags.w)), 1u, 64u);
 
-	uint low_mode = mode_bits & 7u;
-	uint atlas_slot_plus_one = mode_bits >> 3u;
+	uint low_mode = mode_bits & 15u;
+	uint atlas_slot_plus_one = mode_bits >> 4u;
 	bool is_orbital_thrust = (low_mode & 1u) != 0u;
 	bool enable_tidal = (low_mode & 2u) != 0u;
 	bool is_pinned = (low_mode & 4u) != 0u;
 
 	uint pt_count = steps + 1u;
-	uint pos_base = out_knot_base * 2u;
-	uint vel_base = pos_base + pt_count;
 	bool write_atlas = (atlas_slot_plus_one > 0u) && (pt_count <= ATLAS_VEL_OFFSET);
-	uint atlas_pos_base = write_atlas ? ((atlas_slot_plus_one - 1u) * ATLAS_SLOT_VEC4S) : 0u;
-	KnotWriteTarget dst = KnotWriteTarget(pos_base, vel_base, atlas_pos_base, write_atlas);
+	bool compact_tail_out = write_atlas && ((low_mode & 8u) != 0u);
+	uint pos_base = out_knot_base * 2u;
+	uint vel_base = pos_base + (compact_tail_out ? 1u : pt_count);
+	if (gid == 0u && out_knot_base > 0u) {
+		forecast_knots[0] = vec4(0.0);
+	}
+	uint atlas_slot = write_atlas ? (atlas_slot_plus_one - 1u) : 0u;
+	uint atlas_stride = write_atlas ? (uint(atlas_knots.length()) / ATLAS_SLOT_VEC4S) : 0u;
+	KnotWriteTarget dst = KnotWriteTarget(
+		pos_base,
+		vel_base,
+		atlas_slot,
+		atlas_stride,
+		steps,
+		write_atlas,
+		compact_tail_out
+	);
 
 	if (step_dt <= 0.0) {
 		for (uint k = 0u; k <= steps; k++) {
@@ -439,9 +574,32 @@ void main() {
 		return;
 	}
 
-	float mu_anchor = (anchor_idx >= 0 && uint(anchor_idx) < params.well_count)
-		? well_samples[uint(anchor_idx) * 2u].w
-		: 0.0;
+	uint mask_wells = min(params.well_count, MAX_CACHED_WELLS);
+	g_well_masks = 0u;
+	g_parent_nibbles_lo = 0u;
+	g_parent_nibbles_hi = 0u;
+	g_cull_threshold_sq = (params.well_count > 0u) ? well_samples[1].w : 0.0;
+	if (params.well_count > 0u && well_samples[0].w > 0.0) {
+		g_well_masks |= (1u << 16u);
+	}
+	for (uint w = 1u; w < mask_wells; w++) {
+		float mu_w = well_samples[w * 2u].w;
+		if (mu_w > 0.0) {
+			g_well_masks |= (1u << (16u + w));
+		}
+		int p_w = int(round(well_samples[w * 2u + 1u].z));
+		uint nib = uint(clamp(p_w + 1, 0, 15));
+		if (w < 8u) {
+			g_parent_nibbles_lo |= (nib << (w * 4u));
+		} else {
+			g_parent_nibbles_hi |= (nib << ((w - 8u) * 4u));
+		}
+		if (mu_w > 0.0 && p_w >= 0 && uint(p_w) < MAX_CACHED_WELLS) {
+			g_well_masks |= (1u << uint(p_w));
+		}
+	}
+
+	float mu_anchor = get_well_mu(anchor_idx);
 	bool has_thrust = dot(ext_accel, ext_accel) > 0.0;
 	bool pert_active = false;
 	vec3 pert_accel = compute_timeline_perturbing_gravity(
@@ -481,7 +639,7 @@ void main() {
 				int cand_anchor = anchor_idx;
 				vec3 r_soi = r_cand;
 				vec3 v_soi = v_cand;
-				if (!is_pinned) {
+				if (!is_pinned && (g_did_exit_anchor || g_entered_child_well != -1)) {
 					maybe_switch_forecast_anchor(r_soi, v_soi, cand_anchor, t_cand);
 				}
 				if (cand_anchor == anchor_idx) {
@@ -514,14 +672,12 @@ void main() {
 			}
 			v_rel += 0.5 * sub_dt * pert_accel;
 		}
-		if (!is_pinned) {
+		if (!is_pinned && (g_did_exit_anchor || g_entered_child_well != -1)) {
 			int prev_anchor = anchor_idx;
 			maybe_switch_forecast_anchor(r_rel, v_rel, anchor_idx, elapsed);
 			if (anchor_idx != prev_anchor) {
 				all_unperturbed = false;
-				mu_anchor = (anchor_idx >= 0 && uint(anchor_idx) < params.well_count)
-					? well_samples[uint(anchor_idx) * 2u].w
-					: 0.0;
+				mu_anchor = get_well_mu(anchor_idx);
 				pert_accel = compute_timeline_perturbing_gravity(
 					r_rel,
 					anchor_idx,

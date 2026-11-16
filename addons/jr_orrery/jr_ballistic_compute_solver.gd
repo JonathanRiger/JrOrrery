@@ -23,23 +23,44 @@ const RAIL_SPLINE_SHADER_PATH: String = "res://addons/jr_orrery/shaders/rail_spl
 ## Path to the parallel GPU Cubic Hermite trajectory-tape sampler compute shader.
 const TAPE_SAMPLE_SHADER_PATH: String = "res://addons/jr_orrery/shaders/ballistic_tape_sample.glsl";
 
-## Maximum knot capacity per body slot in the resident GPU trajectory-tape atlas (`136` knots).
-const GPU_TAPE_SLOT_KNOTS: int = 136;
+## Maximum knot capacity per body slot in the resident GPU trajectory-tape atlas (`264` knots).
+const GPU_TAPE_SLOT_KNOTS: int = 264;
 
-## Stride in `vec4` entries per body slot in `TapeAtlasBuffer` (`136 pos + 136 vel = 272 vec4s`).
-const GPU_TAPE_SLOT_VEC4S: int = 272;
+## Stride in `vec4` entries per body slot in `TapeAtlasBuffer` (`264 pos + 264 vel = 528 vec4s`).
+const GPU_TAPE_SLOT_VEC4S: int = 528;
 
-## Byte offset of `vel_flags[0]` inside a body's `TapeAtlasBuffer` slot (`136 * 16 = 2176 bytes`).
+## Byte offset of `vel_flags[0]` inside a body's `TapeAtlasBuffer` slot (`264 * 16 = 4224 bytes`).
 const GPU_TAPE_VEL_OFFSET_BYTES: int = GPU_TAPE_SLOT_KNOTS * 16;
 
-## Byte stride per body slot in `TapeAtlasBuffer` (`272 * 16 = 4352 bytes`).
+## Byte stride per body slot in `TapeAtlasBuffer` (`528 * 16 = 8448 bytes`).
 const GPU_TAPE_SLOT_BYTES: int = GPU_TAPE_SLOT_VEC4S * 16;
 
-## Minimum tracked body count at which GPU trajectory-tape sampling amortizes `submit + sync`.
-const MIN_GPU_TAPE_SAMPLE_BODIES: int = 512;
+## Minimum tracked body count at which `TapeAtlasBuffer` residence and fused GPU bake+sample are enabled.
+const MIN_GPU_TAPE_ATLAS_BODIES: int = 1024;
+
+## Minimum tracked body count at which standalone GPU trajectory-tape sampling amortizes `submit + sync`.
+const MIN_GPU_TAPE_SAMPLE_BODIES: int = 2048;
 
 ## Packed position byte stride per body in `TapeSampleOutputBuffer` (`3 x float32 = 12 bytes`).
 const TAPE_SAMPLE_POS_BYTES_PER_BODY: int = 12;
+
+## Number of `vec4` entries per sparse event in `TapeSampleOutputBuffer` (`5 x vec4 = 80 bytes`).
+const TAPE_SAMPLE_EVENT_VEC4S: int = 5;
+
+## Byte stride per sparse event in `TapeSampleOutputBuffer` (`5 x 16 = 80 bytes`).
+const TAPE_SAMPLE_EVENT_BYTES: int = 80;
+
+## Number of sparse event slots speculatively included in the primary single-call GPU readback (`32` events = `2560 bytes`).
+const INLINE_TAPE_EVENT_CAP: int = 32;
+
+## Event kind emitted by `ballistic_tape_sample.glsl` when a same-SOI segment switches anchor well.
+const TAPE_EVENT_WELL_SWITCH: int = 1;
+
+## Event kind emitted by `ballistic_tape_sample.glsl` with inline `(pa, pb, va, vb)` for a cross-SOI segment.
+const TAPE_EVENT_CROSS_SOI: int = 2;
+
+## Event kind emitted by `ballistic_tape_sample.glsl` when `knot_count < 2` (delegating to CPU-resident tape).
+const TAPE_EVENT_CPU_FALLBACK: int = 3;
 
 ## Byte stride of a single 256-segment baked B-spline table (`256 * sizeof(vec4) = 4096 bytes`).
 const BYTES_PER_RAIL_SPLINE: int = JrRailOrbiter.NU_SPLINE_SEGMENTS * BYTES_PER_VEC4;
@@ -262,8 +283,17 @@ var _tape_sample_out_rid := RID();
 ## Uniform set [RID] for `ballistic_tape_sample.glsl` bindings 0, 1, and 2.
 var _tape_sample_uniform_set_rid := RID();
 
-## Allocated body slot capacity of [member _tape_atlas_buffer_rid], [member _tape_meta_buffer_rid], and [member _tape_sample_out_rid].
+## Uniform set [RID] for `ballistic_forecast.glsl` writing compact tails directly into [member _tape_sample_out_rid].
+var _fused_forecast_uniform_set_rid := RID();
+
+## Allocated body slot capacity of [member _tape_atlas_buffer_rid] and [member _tape_meta_buffer_rid].
 var _tape_atlas_capacity: int = 0;
+
+## Allocated byte capacity of [member _tape_sample_out_rid].
+var _tape_sample_out_byte_capacity: int = 0;
+
+## Knot offset added to `offsets[i]` when packing `ForecastBodyInputBuffer` (`> 0` during fused single-readback passes).
+var _job_out_base_knot_offset: int = 0;
 
 ## CPU mirror of `TapeMetaBuffer` (`2 x Vector4` per body) relative to [member _tape_gpu_time_origin].
 var _tape_meta_vec4s: PackedVector4Array = PackedVector4Array();
@@ -277,11 +307,113 @@ var _tape_atlas_valid: bool = false;
 ## Whether [member _tape_meta_vec4s] has pending edits not yet uploaded to [member _tape_meta_buffer_rid].
 var _tape_meta_gpu_dirty: bool = false;
 
+## Lowest slot index in [member _tape_meta_vec4s] dirtied since the last GPU upload.
+var _tape_meta_dirty_min_slot: int = 0;
+
+## Highest slot index in [member _tape_meta_vec4s] dirtied since the last GPU upload.
+var _tape_meta_dirty_max_slot: int = -1;
+
+## Most recent GPU-sampled position buffer (`pos_vecs[seq_idx + 2]`) from [method _readback_unified_sample_and_bake_gpu].
+var _last_sampled_pos_vecs: PackedVector3Array = PackedVector3Array();
+
+## Cached gravity-well element list from the most recent [method _sample_well_timeline_bytes] call.
+var _tl_cached_wells: Array[JrOrreryElement] = [];
+
+## Cached root gravitational parameter (`mu`) for [member _tl_cached_wells].
+var _tl_cached_driver_mu: float = -1.0;
+
+## Cached [JrReferenceDirection] instance for [member _tl_cached_wells].
+var _tl_cached_ref_plane: JrReferenceDirection = null;
+
+## Cached per-well `binary_partner != null` flags (`0` or `1`) for [member _tl_cached_wells].
+var _tl_cached_has_partner: PackedByteArray = PackedByteArray();
+
+## Cached per-well gravitational parameters (`mu`) in 32-bit float for timeline buffer packing.
+var _tl_well_mu: PackedFloat32Array = PackedFloat32Array();
+
+## Cached per-well gravitational parameters (`mu`) in 64-bit float for exact cache validation.
+var _tl_well_mu_f64: PackedFloat64Array = PackedFloat64Array();
+
+## Cached per-well parent indices stored as floats for `well_samples`.
+var _tl_well_parent_float: PackedFloat32Array = PackedFloat32Array();
+
+## Cached per-well `HILL_ENTRY_MULTIPLIER * (mu / (3 * parent_mu))^(1/3)` factors.
+var _tl_well_entry_ratio: PackedFloat32Array = PackedFloat32Array();
+
+## Cached per-well `HILL_EXIT_MULTIPLIER * (mu / (3 * parent_mu))^(1/3)` factors.
+var _tl_well_exit_ratio: PackedFloat32Array = PackedFloat32Array();
+
+## Cached per-well fast-position eligibility flags (`1` when `sample_local_position_fast` is valid).
+var _tl_use_fast_pos: PackedByteArray = PackedByteArray();
+
+## Reusable staging buffer for [method _sample_well_timeline_bytes].
+var _tl_vec4s: PackedVector4Array = PackedVector4Array();
+
+## Cached per-well Keplerian parameter signature detecting runtime orbital element mutations.
+var _tl_well_orbital_sig: PackedFloat64Array = PackedFloat64Array();
+
+## Cached maximum `mean_motion` across active [JrRailOrbiter] wells in [member _tl_cached_wells].
+var _tl_max_mean_n: float = 0.0;
+
+## Whether [member _tl_grid_v4s] currently holds a valid power-of-two grid-aligned well timeline.
+var _tl_grid_valid: bool = false;
+
+## Power-of-two simulation step interval (`2^k`) of [member _tl_grid_v4s].
+var _tl_grid_step_dt: float = 0.0;
+
+## Squared tidal cull threshold stored in [member _tl_grid_v4s].
+var _tl_grid_cull_sq: float = -1.0;
+
+## Inclusive start integer grid index (`t = idx * _tl_grid_step_dt`) of [member _tl_grid_v4s].
+var _tl_grid_start_idx: int = 0;
+
+## Inclusive end integer grid index (`t = idx * _tl_grid_step_dt`) of [member _tl_grid_v4s].
+var _tl_grid_end_idx: int = -1;
+
+## Sliding-window cache of pre-sampled `well_samples` rows across `[ _tl_grid_start_idx .. _tl_grid_end_idx ]`.
+var _tl_grid_v4s: PackedVector4Array = PackedVector4Array();
+
+## Pre-serialized byte view of [member _tl_grid_v4s] for `O(1)` byte-range slicing on cache hits.
+var _tl_grid_bytes: PackedByteArray = PackedByteArray();
+
+## Whether [member _forecast_timeline_buffer_rid] needs to be updated before the next GPU forecast/bake dispatch.
+var _tl_gpu_dirty: bool = true;
+
+## Exact `1.0 / step_dt` computed by the most recent [method _sample_tape_timeline_cached] call.
+var _tl_last_inv_dt: float = 0.0;
+
+## Exact 64-bit evaluation timestamp passed to [method _execute_fused_bake_and_sample_gpu].
+var _fused_eval_time: float = 0.0;
+
 ## 64-bit simulation timestamp origin against which `t0_rel_hi / t0_rel_lo` in `TapeMetaBuffer` are measured.
 var _tape_gpu_time_origin: float = 0.0;
 
 ## Per-job flag (`1` when `ballistic_forecast.glsl` wrote the full tape directly into `TapeAtlasBuffer`).
 var _job_wrote_atlas_flags: PackedByteArray = PackedByteArray();
+
+## Per-job flag (`1` when `ballistic_forecast.glsl` wrote only a 2-`vec4` tail summary into `ForecastPointOutputBuffer`).
+var _job_compact_out_flags: PackedByteArray = PackedByteArray();
+
+## Cached `WeakRef` to `self` supplied to GPU-atlas-resident [JrBallisticTrajectoryTape] instances.
+var _self_weak_ref: WeakRef = null;
+
+## Whether the most recent [method bake_and_sample_tapes_gpu] call fused sampling into its single GPU submission.
+var _last_fused_bake_sampled: bool = false;
+
+## Whether a GPU tape sample or fused bake+sample submission is currently executing asynchronously.
+var _pending_gpu_sample_sync: bool = false;
+
+## Pending [JrBallisticForecastConfig] for an in-flight fused GPU bake+sample pass (`null` for standalone sample).
+var _pending_gpu_sample_config: JrBallisticForecastConfig = null;
+
+## Pending knot offset array for an in-flight fused GPU bake+sample pass.
+var _pending_gpu_sample_offsets: PackedInt32Array = PackedInt32Array();
+
+## Pending `tail_base_knot` offset in `TapeSampleOutputBuffer` for an in-flight GPU pass.
+var _pending_gpu_sample_tail_base: int = 0;
+
+## Whether `_tape_meta_vec4s` was pre-updated before dispatch during a fused GPU bake+sample pass.
+var _meta_precommitted_in_fused: bool = false;
 
 ## Current simulation timestamp supplied for the active stepping pass.
 var _step_current_time: float = 0.0
@@ -599,7 +731,55 @@ func is_tape_sample_gpu_active() -> bool:
 func invalidate_tape_atlas() -> void:
 	_tape_atlas_valid = false;
 	_tape_meta_gpu_dirty = false;
+	_tape_meta_dirty_min_slot = 0;
+	_tape_meta_dirty_max_slot = -1;
 	_tape_meta_body_count = 0;
+	_tl_grid_valid = false;
+	_tl_grid_bytes = PackedByteArray();
+	_tl_gpu_dirty = true;
+
+
+## Returns `true` when the VRAM `TapeAtlasBuffer` currently holds valid synchronized slot data.
+func has_valid_tape_atlas() -> bool:
+	return _tape_atlas_valid and _tape_atlas_buffer_rid.is_valid();
+
+
+## Returns `true` when the most recent [method bake_and_sample_tapes_gpu] call executed a fused GPU sample pass.
+func did_last_bake_fuse_sample() -> bool:
+	return _last_fused_bake_sampled;
+
+
+## Returns `true` when an asynchronous GPU tape sample or fused bake+sample submission is awaiting `_rd.sync()`.
+func has_pending_gpu_sample_sync() -> bool:
+	return _pending_gpu_sample_sync;
+
+
+## Waits for an in-flight GPU tape sample or fused bake+sample submission, unpacks compact tails, and returns sparse events.
+func sync_and_readback_pending_gpu_sample(bodies: Array[JrBallisticOrbiter]) -> PackedVector4Array:
+	if not _pending_gpu_sample_sync:
+		return PackedVector4Array();
+	_pending_gpu_sample_sync = false;
+	var cfg: JrBallisticForecastConfig = _pending_gpu_sample_config;
+	var offs: PackedInt32Array = _pending_gpu_sample_offsets;
+	var tail_base: int = _pending_gpu_sample_tail_base;
+	_pending_gpu_sample_config = null;
+	_pending_gpu_sample_offsets = PackedInt32Array();
+
+	var rec_tel: bool = _telemetry != null;
+	var t0: int = Time.get_ticks_usec() if rec_tel else 0;
+	_rd.sync();
+	var t1: int = Time.get_ticks_usec() if rec_tel else 0;
+	if rec_tel:
+		if cfg != null:
+			_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_SOLVER_FORECAST_SUBMIT_SYNC, t1 - t0);
+		else:
+			_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_BALLISTIC_ANCHOR_POST, t1 - t0);
+	return _readback_unified_sample_and_bake_gpu(bodies, cfg, offs, tail_base);
+
+
+## Returns the native `PackedVector3Array` (`pos_vecs[seq_idx + 2]`) read back by the latest GPU tape sample pass.
+func get_last_sampled_pos_vecs() -> PackedVector3Array:
+	return _last_sampled_pos_vecs;
 
 
 ## Updates `expected_well_idx` (`m1.w`) for [param slot_idx] in [member _tape_meta_vec4s] after an SOI adoption.
@@ -610,7 +790,106 @@ func update_body_expected_well_in_atlas(slot_idx: int, well_idx: int) -> void:
 		if int(roundf(m1.w)) != well_idx:
 			m1.w = float(well_idx);
 			_tape_meta_vec4s[meta_idx] = m1;
-			_tape_meta_gpu_dirty = true;
+			_mark_tape_meta_slot_dirty(slot_idx);
+
+
+## Clears `loop_period` (`m1.z`) for [param slot_idx] in [member _tape_meta_vec4s] if a speculated periodic loop was perturbed.
+func clear_body_periodic_loop_in_atlas(slot_idx: int) -> void:
+	var meta_idx: int = slot_idx * 2 + 1;
+	if meta_idx >= 0 and meta_idx < _tape_meta_vec4s.size():
+		var m1: Vector4 = _tape_meta_vec4s[meta_idx];
+		if m1.z != 0.0:
+			m1.z = 0.0;
+			_tape_meta_vec4s[meta_idx] = m1;
+			_mark_tape_meta_slot_dirty(slot_idx);
+
+
+## Downloads a single body's `pos_anchor` and `vel_flags` arrays from Knot-Major SoA VRAM `TapeAtlasBuffer` on demand.
+func materialize_tape_from_gpu_atlas(tape: JrBallisticTrajectoryTape) -> void:
+	if tape == null or tape.cpu_knots_resident:
+		return;
+	if _pending_gpu_sample_sync and _rd != null:
+		_rd.sync();
+		_pending_gpu_sample_sync = false;
+		_pending_gpu_sample_config = null;
+		_pending_gpu_sample_offsets = PackedInt32Array();
+	var slot_idx: int = tape.atlas_slot_index;
+	var k_count: int = tape.knot_count;
+	var stride: int = _tape_atlas_capacity;
+	if (
+			_rd == null
+			or not _tape_atlas_buffer_rid.is_valid()
+			or slot_idx < 0
+			or slot_idx >= stride
+			or k_count <= 0
+			or k_count > GPU_TAPE_SLOT_KNOTS
+	):
+		tape.cpu_knots_resident = true;
+		return;
+
+	var span_vec4s: int = (k_count - 1) * stride + slot_idx + 1;
+	var span_bytes: int = span_vec4s * BYTES_PER_VEC4;
+	var vel_base_bytes: int = GPU_TAPE_SLOT_KNOTS * stride * BYTES_PER_VEC4;
+	var pos_v4: PackedVector4Array = _rd.buffer_get_data(_tape_atlas_buffer_rid, 0, span_bytes).to_vector4_array();
+	var vel_v4: PackedVector4Array = _rd.buffer_get_data(
+			_tape_atlas_buffer_rid,
+			vel_base_bytes,
+			span_bytes
+	).to_vector4_array();
+	var pos_out := PackedVector4Array();
+	var vel_out := PackedVector4Array();
+	pos_out.resize(k_count);
+	vel_out.resize(k_count);
+	for k: int in range(k_count):
+		var idx: int = k * stride + slot_idx;
+		pos_out[k] = pos_v4[idx];
+		vel_out[k] = vel_v4[idx];
+	tape.pos_anchor = pos_out;
+	tape.vel_flags = vel_out;
+	tape.cpu_knots_resident = true;
+
+
+## Materializes all non-CPU-resident tapes in [param tapes] from Knot-Major SoA VRAM `TapeAtlasBuffer` in one readback.
+func materialize_all_tapes_from_gpu_atlas(tapes: Array[JrBallisticTrajectoryTape]) -> void:
+	if _rd == null or not _tape_atlas_buffer_rid.is_valid() or tapes.is_empty():
+		return;
+	if _pending_gpu_sample_sync:
+		_rd.sync();
+		_pending_gpu_sample_sync = false;
+		_pending_gpu_sample_config = null;
+		_pending_gpu_sample_offsets = PackedInt32Array();
+
+	var max_slot: int = -1;
+	for i: int in range(tapes.size()):
+		var t: JrBallisticTrajectoryTape = tapes[i];
+		if t != null and t.is_valid and not t.cpu_knots_resident and t.atlas_slot_index >= 0:
+			max_slot = maxi(max_slot, t.atlas_slot_index);
+
+	var stride: int = _tape_atlas_capacity;
+	if max_slot < 0 or max_slot >= stride:
+		return;
+
+	var all_v4: PackedVector4Array = _rd.buffer_get_data(_tape_atlas_buffer_rid).to_vector4_array();
+	var vel_row_base: int = GPU_TAPE_SLOT_KNOTS * stride;
+
+	for i: int in range(tapes.size()):
+		var t: JrBallisticTrajectoryTape = tapes[i];
+		if t == null or not t.is_valid or t.cpu_knots_resident:
+			continue;
+		var s_idx: int = t.atlas_slot_index;
+		var k_count: int = t.knot_count;
+		if s_idx >= 0 and s_idx <= max_slot and k_count > 0 and k_count <= GPU_TAPE_SLOT_KNOTS:
+			var pos_out := PackedVector4Array();
+			var vel_out := PackedVector4Array();
+			pos_out.resize(k_count);
+			vel_out.resize(k_count);
+			for k: int in range(k_count):
+				var off: int = k * stride + s_idx;
+				pos_out[k] = all_v4[off];
+				vel_out[k] = all_v4[vel_row_base + off];
+			t.pos_anchor = pos_out;
+			t.vel_flags = vel_out;
+		t.cpu_knots_resident = true;
 
 
 ## Bakes 256-segment periodic cubic B-spline lookup tables (`M -> nu(M) - M`) for all
@@ -694,6 +973,12 @@ func dispose() -> void:
 		_gpu_init_attempted = false;
 		return;
 
+	if _pending_gpu_sample_sync:
+		_rd.sync();
+		_pending_gpu_sample_sync = false;
+		_pending_gpu_sample_config = null;
+		_pending_gpu_sample_offsets = PackedInt32Array();
+
 	_dispose_stepping_rids();
 	_dispose_forecast_rids();
 	_dispose_tape_sample_rids();
@@ -721,9 +1006,19 @@ func dispose() -> void:
 	_forecast_output_capacity = 0;
 	_rail_spline_capacity = 0;
 	_tape_atlas_capacity = 0;
+	_tape_sample_out_byte_capacity = 0;
 	_tape_atlas_valid = false;
 	_tape_meta_gpu_dirty = false;
+	_tape_meta_dirty_min_slot = 0;
+	_tape_meta_dirty_max_slot = -1;
 	_tape_meta_body_count = 0;
+	_last_sampled_pos_vecs = PackedVector3Array();
+	_tl_cached_wells.clear();
+	_tl_cached_driver_mu = -1.0;
+	_tl_cached_ref_plane = null;
+	_tl_grid_valid = false;
+	_tl_grid_v4s = PackedVector4Array();
+	_tl_grid_bytes = PackedByteArray();
 	_gpu_available = false;
 	_forecast_gpu_available = false;
 	_rail_spline_gpu_available = false;
@@ -801,9 +1096,9 @@ func compute_forecasts_anchor_relative(
 		return results;
 
 	var t0: int = Time.get_ticks_usec() if _telemetry != null else 0;
-	var well_list: Array[JrOrreryElement] = _build_forecast_well_list(config);
+	var well_list: Array[JrOrreryElement] = _resolve_forecast_well_list(config);
 	var segments: int = _compute_adaptive_timeline_segments(config, well_list, max_duration);
-	var timeline_floats: PackedFloat32Array = _sample_well_timeline(
+	var timeline_bytes: PackedByteArray = _sample_well_timeline_bytes(
 			config,
 			well_list,
 			max_duration,
@@ -817,41 +1112,120 @@ func compute_forecasts_anchor_relative(
 	var inv_timeline_dt: float = float(segments) / max_duration if max_duration > 1e-12 else 0.0;
 
 	if should_use_gpu_for_forecast(valid_bodies, well_list.size()):
-		return _compute_forecasts_gpu(valid_bodies, well_list, timeline_floats, inv_timeline_dt);
-	return _compute_forecasts_cpu(valid_bodies, well_list, timeline_floats, inv_timeline_dt);
+		return _compute_forecasts_gpu(valid_bodies, well_list, timeline_bytes, inv_timeline_dt);
+	return _compute_forecasts_cpu(
+			valid_bodies,
+			well_list,
+			timeline_bytes.to_float32_array(),
+			inv_timeline_dt
+	);
 
 
 ## Bakes or extends rolling Cubic Hermite [JrBallisticTrajectoryTape] horizons in parallel
 ## for all [JrBallisticOrbiter] jobs described in [param config].
 func bake_trajectory_tapes(config: JrBallisticForecastConfig) -> void:
+	_last_fused_bake_sampled = false;
 	if config == null or config.bodies.is_empty():
 		return;
 
 	var t0: int = Time.get_ticks_usec() if _telemetry != null else 0;
-	var well_list: Array[JrOrreryElement] = _build_forecast_well_list(config);
-	var max_duration: float = _resolve_tape_batch_duration(config);
-	var segments: int = _compute_adaptive_timeline_segments(config, well_list, max_duration);
-	var timeline_floats: PackedFloat32Array = _sample_well_timeline(
-			config,
-			well_list,
-			max_duration,
-			segments
-	);
+	var well_list: Array[JrOrreryElement] = _resolve_forecast_well_list(config);
+	var timeline_bytes: PackedByteArray;
+	var inv_timeline_dt: float;
+	if (
+			well_list.size() > 1
+			and config.job_start_times.size() == config.bodies.size()
+			and config.timeline_segments <= 0
+	):
+		timeline_bytes = _sample_tape_timeline_cached(config, well_list);
+		inv_timeline_dt = _tl_last_inv_dt;
+	else:
+		var max_duration: float = _resolve_tape_batch_duration(config);
+		var segments: int = _compute_adaptive_timeline_segments(config, well_list, max_duration);
+		timeline_bytes = _sample_well_timeline_bytes(
+				config,
+				well_list,
+				max_duration,
+				segments
+		);
+		inv_timeline_dt = float(segments) / max_duration if max_duration > 1e-12 else 0.0;
 	if _telemetry != null:
 		_telemetry.add_phase_usec(
 				JrOrreryTelemetry.PHASE_FORECAST_TIMELINE_SAMPLE,
 				Time.get_ticks_usec() - t0
 		);
 
-	var inv_timeline_dt: float = float(segments) / max_duration if max_duration > 1e-12 else 0.0;
-	var offsets: PackedInt32Array = _compute_tape_job_offsets(config);
 	var body_count: int = config.bodies.size();
-	var total_knots: int = offsets[body_count];
+	var total_knots: int = _compute_full_tape_knot_sum(config);
+	var bake_work: int = _compute_tape_bake_work(config, well_list.size());
 
-	if should_use_gpu_for_tape_bake(total_knots, body_count, well_list.size()):
-		_bake_tapes_gpu(config, well_list.size(), timeline_floats, inv_timeline_dt);
+	if should_use_gpu_for_tape_bake(total_knots, body_count, bake_work):
+		_bake_tapes_gpu(config, well_list.size(), timeline_bytes, inv_timeline_dt);
 	else:
-		_bake_tapes_cpu(config, well_list.size(), timeline_floats, inv_timeline_dt);
+		_bake_tapes_cpu(config, well_list.size(), timeline_bytes.to_float32_array(), inv_timeline_dt);
+
+
+## Executes trajectory-tape baking and parallel GPU Cubic Hermite sampling in a single
+## compute command list, single GPU fence wait, and single readback when all jobs write to `TapeAtlasBuffer`.
+func bake_and_sample_tapes_gpu(
+		config: JrBallisticForecastConfig,
+		all_bodies: Array[JrBallisticOrbiter],
+		eval_time: float
+) -> PackedVector4Array:
+	_last_fused_bake_sampled = false;
+	if config == null or config.bodies.is_empty():
+		return PackedVector4Array();
+
+	var t0: int = Time.get_ticks_usec() if _telemetry != null else 0;
+	var well_list: Array[JrOrreryElement] = _resolve_forecast_well_list(config);
+	var timeline_bytes: PackedByteArray;
+	var inv_timeline_dt: float;
+	if (
+			well_list.size() > 1
+			and config.job_start_times.size() == config.bodies.size()
+			and config.timeline_segments <= 0
+	):
+		timeline_bytes = _sample_tape_timeline_cached(config, well_list);
+		inv_timeline_dt = _tl_last_inv_dt;
+	else:
+		var max_duration: float = _resolve_tape_batch_duration(config);
+		var segments: int = _compute_adaptive_timeline_segments(config, well_list, max_duration);
+		timeline_bytes = _sample_well_timeline_bytes(
+				config,
+				well_list,
+				max_duration,
+				segments
+		);
+		inv_timeline_dt = float(segments) / max_duration if max_duration > 1e-12 else 0.0;
+	if _telemetry != null:
+		_telemetry.add_phase_usec(
+				JrOrreryTelemetry.PHASE_FORECAST_TIMELINE_SAMPLE,
+				Time.get_ticks_usec() - t0
+		);
+
+	var well_count: int = well_list.size();
+	if (
+			is_forecast_gpu_active()
+			and is_tape_sample_gpu_active()
+			and all_bodies.size() >= MIN_GPU_TAPE_ATLAS_BODIES
+			and _can_all_jobs_precommit_atlas(config)
+	):
+		_fused_eval_time = eval_time;
+		return _execute_fused_bake_and_sample_gpu(
+				config,
+				all_bodies,
+				timeline_bytes,
+				Vector3(inv_timeline_dt, float(well_count), eval_time - config.start_time)
+		);
+
+	var body_count: int = config.bodies.size();
+	var total_knots: int = _compute_full_tape_knot_sum(config);
+	var bake_work: int = _compute_tape_bake_work(config, well_count);
+	if should_use_gpu_for_tape_bake(total_knots, body_count, bake_work):
+		_bake_tapes_gpu(config, well_count, timeline_bytes, inv_timeline_dt);
+	else:
+		_bake_tapes_cpu(config, well_count, timeline_bytes.to_float32_array(), inv_timeline_dt);
+	return PackedVector4Array();
 
 
 ## Returns `true` when [param bodies] and [param well_count] amortize GPU forecast dispatch.
@@ -867,20 +1241,56 @@ func should_use_gpu_for_forecast(
 	return total_work >= MIN_GPU_FORECAST_WORK;
 
 
-## Returns `true` when [param total_knots] and [param body_count] amortize local
-## [RenderingDevice] fence submission for rolling trajectory-tape baking.
+## Returns `true` when [param total_knots], [param body_count], and [param total_substep_work]
+## amortize local [RenderingDevice] fence submission for rolling trajectory-tape baking.
 func should_use_gpu_for_tape_bake(
 		total_knots: int,
 		body_count: int,
-		_well_count: int
+		total_substep_work: int
 ) -> bool:
 	if not is_forecast_gpu_active() or body_count <= 0 or total_knots <= 0:
 		return false;
-	if body_count >= 8 and total_knots >= 256:
+	if body_count >= 4 and total_knots >= 128:
 		return true;
-	if body_count >= 4 and total_knots >= 1024:
+	if body_count >= 4 and total_substep_work >= 1536:
 		return true;
-	return total_knots >= 2048;
+	return total_substep_work >= 8192 or total_knots >= 2048;
+
+
+## Computes total `(steps * substeps * well_count)` integration work across all jobs in [param config].
+func _compute_tape_bake_work(config: JrBallisticForecastConfig, well_count: int) -> int:
+	var count: int = config.bodies.size();
+	var has_steps: bool = not config.job_step_counts.is_empty();
+	var has_subs: bool = not config.job_substeps.is_empty();
+	var total_substeps: int = 0;
+	for i: int in range(count):
+		var steps: int = (
+				maxi(1, config.job_step_counts[i])
+				if has_steps
+				else maxi(1, config.bodies[i].preview_steps)
+		);
+		var subs: int = (
+				maxi(1, config.job_substeps[i])
+				if has_subs
+				else FORECAST_INTERNAL_SUBSTEPS
+		);
+		total_substeps += steps * subs;
+	return total_substeps * maxi(1, well_count);
+
+
+## Computes the sum of `steps + 1` knots across all jobs in [param config].
+func _compute_full_tape_knot_sum(config: JrBallisticForecastConfig) -> int:
+	var count: int = config.bodies.size();
+	var has_steps: bool = not config.job_step_counts.is_empty();
+	var sum_knots: int = 0;
+	for i: int in range(count):
+		var steps: int = (
+				maxi(1, config.job_step_counts[i])
+				if has_steps
+				else maxi(1, config.bodies[i].preview_steps)
+		);
+		sum_knots += steps + 1;
+	return sum_knots;
 
 
 ## Computes forward-integrated inertial trajectory polylines for all [JrBallisticOrbiter]
@@ -891,7 +1301,7 @@ func compute_forecasts_inertial(
 	var rel_map: Dictionary[JrBallisticOrbiter, PackedVector4Array] = (
 			compute_forecasts_anchor_relative(config)
 	)
-	var well_list: Array[JrOrreryElement] = _build_forecast_well_list(config)
+	var well_list: Array[JrOrreryElement] = _resolve_forecast_well_list(config)
 	var inertial_results: Dictionary[JrBallisticOrbiter, PackedVector3Array] = {}
 
 	for body: JrBallisticOrbiter in rel_map.keys():
@@ -920,7 +1330,7 @@ func compute_forecasts_inertial(
 ## (index 0 = [member JrBallisticForecastConfig.driver_element], followed by valid
 ## [member JrBallisticForecastConfig.orbit_sequence]).
 func get_forecast_well_elements(config: JrBallisticForecastConfig) -> Array[JrOrreryElement]:
-	return _build_forecast_well_list(config)
+	return _resolve_forecast_well_list(config);
 
 
 ## Evaluates a single-body forward-integrated N-body trajectory preview in inertial
@@ -1151,6 +1561,7 @@ func _dispose_forecast_rids() -> void:
 	if _forecast_timeline_buffer_rid.is_valid():
 		_rd.free_rid(_forecast_timeline_buffer_rid)
 		_forecast_timeline_buffer_rid = RID()
+	_tl_gpu_dirty = true;
 	if _forecast_output_buffer_rid.is_valid():
 		_rd.free_rid(_forecast_output_buffer_rid);
 		_forecast_output_buffer_rid = RID();
@@ -1173,6 +1584,7 @@ func _dispose_rail_spline_rids() -> void:
 func _dispose_tape_sample_rids() -> void:
 	_tape_atlas_valid = false;
 	_tape_meta_gpu_dirty = false;
+	_tape_sample_out_byte_capacity = 0;
 	_free_forecast_uniform_set();
 	if _tape_sample_uniform_set_rid.is_valid() and _rd.uniform_set_is_valid(_tape_sample_uniform_set_rid):
 		_rd.free_rid(_tape_sample_uniform_set_rid);
@@ -1204,12 +1616,42 @@ func _ensure_tape_atlas_capacities(required_slots: int) -> void:
 	_tape_atlas_capacity = _next_power_of_two(target);
 	_tape_atlas_buffer_rid = _rd.storage_buffer_create(_tape_atlas_capacity * GPU_TAPE_SLOT_BYTES);
 	_tape_meta_buffer_rid = _rd.storage_buffer_create(_tape_atlas_capacity * 2 * BYTES_PER_VEC4);
-	_tape_sample_out_rid = _rd.storage_buffer_create(
-			STEP_OUT_HEADER_BYTES
-			+ _tape_atlas_capacity * (TAPE_SAMPLE_POS_BYTES_PER_BODY + STEP_OUT_EVENT_BYTES)
+	var default_out_bytes: int = (
+			64
+			+ _tape_atlas_capacity
+			* (TAPE_SAMPLE_POS_BYTES_PER_BODY + 32 + TAPE_SAMPLE_EVENT_BYTES)
 	);
+	_ensure_tape_sample_out_bytes(default_out_bytes);
 
-	if _tape_sample_gpu_available and _tape_sample_shader_rid.is_valid():
+
+## Ensures [member _tape_sample_out_rid] has at least [param required_bytes] and refreshes bound uniform sets.
+func _ensure_tape_sample_out_bytes(required_bytes: int) -> void:
+	if (
+			required_bytes <= _tape_sample_out_byte_capacity
+			and _tape_sample_out_rid.is_valid()
+			and (not _tape_sample_gpu_available or _tape_sample_uniform_set_rid.is_valid())
+	):
+		return;
+
+	if _tape_sample_uniform_set_rid.is_valid() and _rd.uniform_set_is_valid(_tape_sample_uniform_set_rid):
+		_rd.free_rid(_tape_sample_uniform_set_rid);
+	_tape_sample_uniform_set_rid = RID();
+	if _fused_forecast_uniform_set_rid.is_valid():
+		_rd.free_rid(_fused_forecast_uniform_set_rid);
+	_fused_forecast_uniform_set_rid = RID();
+	if _tape_sample_out_rid.is_valid():
+		_rd.free_rid(_tape_sample_out_rid);
+		_tape_sample_out_rid = RID();
+
+	_tape_sample_out_byte_capacity = _next_power_of_two(maxi(256, required_bytes));
+	_tape_sample_out_rid = _rd.storage_buffer_create(_tape_sample_out_byte_capacity);
+
+	if (
+			_tape_sample_gpu_available
+			and _tape_sample_shader_rid.is_valid()
+			and _tape_atlas_buffer_rid.is_valid()
+			and _tape_meta_buffer_rid.is_valid()
+	):
 		var u_atlas := RDUniform.new();
 		u_atlas.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER;
 		u_atlas.binding = 0;
@@ -1241,26 +1683,28 @@ func _ensure_tape_atlas_capacities(required_slots: int) -> void:
 
 
 ## Samples all [param bodies] in parallel on the GPU at [param eval_time] via [constant TAPE_SAMPLE_SHADER_PATH],
-## writing `body._anchor_relative_position` in-place and returning sparse `(body_idx, ev_code)` pairs.
-func sample_tapes_gpu(bodies: Array[JrBallisticOrbiter], eval_time: float) -> PackedInt32Array:
+## writing `body._anchor_relative_position` in-place and returning sparse `5-vec4` event records.
+func sample_tapes_gpu(bodies: Array[JrBallisticOrbiter], eval_time: float) -> PackedVector4Array:
 	var count: int = bodies.size();
 	if count <= 0 or not is_tape_sample_gpu_active():
-		return PackedInt32Array();
+		return PackedVector4Array();
 
 	_ensure_tape_atlas_capacities(count);
+	var pos_end_bytes: int = STEP_OUT_HEADER_BYTES + count * TAPE_SAMPLE_POS_BYTES_PER_BODY;
+	var tail_base_knot: int = int(ceili(float(pos_end_bytes) / 32.0));
+	_ensure_tape_sample_out_bytes(tail_base_knot * 32 + count * TAPE_SAMPLE_EVENT_BYTES);
+
 	if not _tape_atlas_valid or _tape_meta_body_count != count:
 		_sync_all_tapes_to_gpu_atlas(bodies, eval_time);
 	elif absf(eval_time - _tape_gpu_time_origin) > MAX_GPU_TIME_ORIGIN_SPAN:
 		_rebase_tape_meta_time_origin(bodies, eval_time);
 	elif _tape_meta_gpu_dirty:
-		var dirty_meta_bytes: PackedByteArray = _tape_meta_vec4s.to_byte_array();
-		_rd.buffer_update(_tape_meta_buffer_rid, 0, dirty_meta_bytes.size(), dirty_meta_bytes);
-		_tape_meta_gpu_dirty = false;
+		_flush_dirty_tape_meta_to_gpu();
 
 	_rd.buffer_update(_tape_sample_out_rid, 0, 4, _zero_u32_bytes);
 
 	var rel_pair: Vector2 = _split_float64_to_f32_pair(eval_time - _tape_gpu_time_origin);
-	var events_word_offset: int = 6 + count * 3;
+	var events_word_offset: int = tail_base_knot * 8;
 	var push_bytes := PackedByteArray();
 	push_bytes.resize(PUSH_CONSTANT_BYTES);
 	push_bytes.encode_float(0, rel_pair.x);
@@ -1277,44 +1721,84 @@ func sample_tapes_gpu(bodies: Array[JrBallisticOrbiter], eval_time: float) -> Pa
 	_rd.compute_list_end();
 
 	_rd.submit();
-	_rd.sync();
+	_pending_gpu_sample_sync = true;
+	_pending_gpu_sample_config = null;
+	_pending_gpu_sample_offsets = PackedInt32Array();
+	_pending_gpu_sample_tail_base = tail_base_knot;
+	return PackedVector4Array();
 
-	var head_bytes: PackedByteArray = _rd.buffer_get_data(
-			_tape_sample_out_rid,
-			0,
-			STEP_OUT_HEADER_BYTES + count * TAPE_SAMPLE_POS_BYTES_PER_BODY
-	);
-	var event_count: int = mini(head_bytes.decode_u32(0), count);
-	var pos_vecs: PackedVector3Array = head_bytes.to_vector3_array();
+
+## Performs a single primary `_rd.buffer_get_data` readback on [member _tape_sample_out_rid] to unpack
+## sampled positions, optional fused compact-tail knots, and inline `5-vec4` SOI/fallback events.
+func _readback_unified_sample_and_bake_gpu(
+		bodies: Array[JrBallisticOrbiter],
+		config: JrBallisticForecastConfig,
+		offsets: PackedInt32Array,
+		tail_base_knot: int
+) -> PackedVector4Array:
+	var count: int = bodies.size();
+	var pos_end_bytes: int = STEP_OUT_HEADER_BYTES + count * TAPE_SAMPLE_POS_BYTES_PER_BODY;
+	var bake_knots: int = offsets[config.bodies.size()] if config != null else 0;
+	var tail_byte_offset: int = tail_base_knot * 32;
+	var events_byte_offset: int = (tail_base_knot + bake_knots) * 32;
+	var inline_ev_cap: int = mini(count, INLINE_TAPE_EVENT_CAP);
+	var read_bytes: int = events_byte_offset + inline_ev_cap * TAPE_SAMPLE_EVENT_BYTES;
+
+	var rec_tel: bool = _telemetry != null;
+	var t_rb0: int = Time.get_ticks_usec() if rec_tel else 0;
+	var raw_bytes: PackedByteArray = _rd.buffer_get_data(_tape_sample_out_rid, 0, read_bytes);
+
+	if config != null:
+		if bake_knots > 0:
+			var bake_vec4s: PackedVector4Array = (
+					raw_bytes.slice(tail_byte_offset, events_byte_offset).to_vector4_array()
+			);
+			_apply_unpacked_tape_slices(config, offsets, bake_vec4s);
+		else:
+			_apply_unpacked_tape_slices(config, offsets, PackedVector4Array());
+		_meta_precommitted_in_fused = false;
+		if rec_tel:
+			_telemetry.add_phase_usec(
+					JrOrreryTelemetry.PHASE_SOLVER_FORECAST_READBACK_UNPACK,
+					Time.get_ticks_usec() - t_rb0
+			);
+
+	var t_post0: int = (Time.get_ticks_usec() if config != null else t_rb0) if rec_tel else 0;
+	var event_count: int = mini(raw_bytes.decode_u32(0), count);
+	_last_sampled_pos_vecs = raw_bytes.slice(0, pos_end_bytes).to_vector3_array();
 	if event_count == 0:
-		for i: int in range(count):
-			bodies[i]._anchor_relative_position = pos_vecs[i + 2];
-		return PackedInt32Array();
+		if rec_tel:
+			_telemetry.add_phase_usec(
+					JrOrreryTelemetry.PHASE_BALLISTIC_ANCHOR_POST,
+					Time.get_ticks_usec() - t_post0
+			);
+		return PackedVector4Array();
 
-	var ev_offset: int = STEP_OUT_HEADER_BYTES + count * TAPE_SAMPLE_POS_BYTES_PER_BODY;
-	var ev_bytes: PackedByteArray = _rd.buffer_get_data(
-			_tape_sample_out_rid,
-			ev_offset,
-			event_count * STEP_OUT_EVENT_BYTES
-	);
-	var ev_words: PackedInt32Array = ev_bytes.to_int32_array();
+	var ev_bytes: PackedByteArray;
+	if event_count <= inline_ev_cap:
+		ev_bytes = raw_bytes.slice(
+				events_byte_offset,
+				events_byte_offset + event_count * TAPE_SAMPLE_EVENT_BYTES
+		);
+	else:
+		ev_bytes = raw_bytes.slice(
+				events_byte_offset,
+				events_byte_offset + inline_ev_cap * TAPE_SAMPLE_EVENT_BYTES
+		);
+		var extra_bytes: PackedByteArray = _rd.buffer_get_data(
+				_tape_sample_out_rid,
+				events_byte_offset + inline_ev_cap * TAPE_SAMPLE_EVENT_BYTES,
+				(event_count - inline_ev_cap) * TAPE_SAMPLE_EVENT_BYTES
+		);
+		ev_bytes.append_array(extra_bytes);
 
-	var saved_indices := PackedInt32Array();
-	var saved_positions := PackedVector3Array();
-	for e: int in range(event_count):
-		var b_idx: int = ev_words[e * 2];
-		var code: int = ev_words[e * 2 + 1];
-		if code == -1 and b_idx >= 0 and b_idx < count and not bodies[b_idx]._trajectory_tape.is_valid:
-			saved_indices.append(b_idx);
-			saved_positions.append(bodies[b_idx]._anchor_relative_position);
-
-	for i: int in range(count):
-		bodies[i]._anchor_relative_position = pos_vecs[i + 2];
-
-	for s: int in range(saved_indices.size()):
-		bodies[saved_indices[s]]._anchor_relative_position = saved_positions[s];
-
-	return ev_words;
+	var ev_vec4s: PackedVector4Array = ev_bytes.to_vector4_array();
+	if rec_tel:
+		_telemetry.add_phase_usec(
+				JrOrreryTelemetry.PHASE_BALLISTIC_ANCHOR_POST,
+				Time.get_ticks_usec() - t_post0
+		);
+	return ev_vec4s;
 
 
 ## Ensures rail spline baker SSBOs and uniform set have capacity for [param required_curves].
@@ -1750,6 +2234,8 @@ func _write_body_vec4s(
 		var ext: Vector3 = body.get_scaled_external_acceleration();
 		thrust_v4 = Vector4(ext.x, ext.y, ext.z, frame_pin_w);
 
+	if body.is_tape_position_pending():
+		body.ensure_tape_position();
 	if body.is_tape_velocity_pending():
 		body.ensure_tape_velocity();
 	var pos: Vector3 = body._anchor_relative_position;
@@ -2353,6 +2839,7 @@ func _ensure_forecast_capacities(
 		_forecast_timeline_buffer_rid = _rd.storage_buffer_create(
 				_forecast_timeline_capacity * BYTES_PER_VEC4
 		);
+		_tl_gpu_dirty = true;
 		recreated = true;
 
 	if target_output > _forecast_output_capacity or not _forecast_output_buffer_rid.is_valid():
@@ -2365,11 +2852,15 @@ func _ensure_forecast_capacities(
 		);
 		recreated = true;
 
-	if recreated or not _forecast_uniform_set_rid.is_valid():
+	if (
+			recreated
+			or not _forecast_uniform_set_rid.is_valid()
+			or (_tape_sample_out_rid.is_valid() and not _fused_forecast_uniform_set_rid.is_valid())
+	):
 		_rebuild_forecast_uniform_set();
 
 
-## Rebuilds [member _forecast_uniform_set_rid] binding forecast Bindings 0, 1, 2, and 3.
+## Rebuilds [member _forecast_uniform_set_rid] and [member _fused_forecast_uniform_set_rid].
 func _rebuild_forecast_uniform_set() -> void:
 	_free_forecast_uniform_set();
 
@@ -2399,12 +2890,27 @@ func _rebuild_forecast_uniform_set() -> void:
 			0
 	);
 
+	if _tape_sample_out_rid.is_valid():
+		var u_fused_out := RDUniform.new();
+		u_fused_out.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER;
+		u_fused_out.binding = 2;
+		u_fused_out.add_id(_tape_sample_out_rid);
 
-## Safely frees [member _forecast_uniform_set_rid] if still valid on [member _rd].
+		_fused_forecast_uniform_set_rid = _rd.uniform_set_create(
+				[u_bodies, u_timeline, u_fused_out, u_atlas],
+				_forecast_shader_rid,
+				0
+		);
+
+
+## Safely frees [member _forecast_uniform_set_rid] and [member _fused_forecast_uniform_set_rid].
 func _free_forecast_uniform_set() -> void:
 	if _rd != null and _forecast_uniform_set_rid.is_valid():
-		_rd.free_rid(_forecast_uniform_set_rid)
-	_forecast_uniform_set_rid = RID()
+		_rd.free_rid(_forecast_uniform_set_rid);
+	_forecast_uniform_set_rid = RID();
+	if _rd != null and _fused_forecast_uniform_set_rid.is_valid():
+		_rd.free_rid(_fused_forecast_uniform_set_rid);
+	_fused_forecast_uniform_set_rid = RID();
 
 
 ## Dispatches [code]ballistic_forecast.glsl[/code] on [member _rd] to integrate future
@@ -2412,14 +2918,14 @@ func _free_forecast_uniform_set() -> void:
 func _compute_forecasts_gpu(
 		bodies: Array[JrBallisticOrbiter],
 		well_list: Array[JrOrreryElement],
-		timeline_floats: PackedFloat32Array,
+		timeline_bytes: PackedByteArray,
 		inv_timeline_dt: float
 ) -> Dictionary[JrBallisticOrbiter, PackedVector4Array]:
 	if _telemetry != null:
 		return _compute_forecasts_gpu_instrumented(
 				bodies,
 				well_list,
-				timeline_floats,
+				timeline_bytes,
 				inv_timeline_dt
 		);
 
@@ -2429,7 +2935,7 @@ func _compute_forecasts_gpu(
 	var total_knots: int = offsets[body_count];
 	var total_vec4s: int = total_knots * 2;
 	@warning_ignore("integer_division")
-	var timeline_vec4_entries: int = timeline_floats.size() / FLOATS_PER_VEC4;
+	var timeline_vec4_entries: int = timeline_bytes.size() / BYTES_PER_VEC4;
 	@warning_ignore("integer_division")
 	var timeline_segments: int = (
 			maxi(1, (timeline_vec4_entries / maxi(1, well_count * 2)) - 1)
@@ -2444,9 +2950,9 @@ func _compute_forecasts_gpu(
 	);
 	_rd.buffer_update(_forecast_body_buffer_rid, 0, body_bytes.size(), body_bytes);
 
-	if not timeline_floats.is_empty():
-		var tl_bytes: PackedByteArray = timeline_floats.to_byte_array();
-		_rd.buffer_update(_forecast_timeline_buffer_rid, 0, tl_bytes.size(), tl_bytes);
+	if not timeline_bytes.is_empty():
+		_rd.buffer_update(_forecast_timeline_buffer_rid, 0, timeline_bytes.size(), timeline_bytes);
+		_tl_gpu_dirty = true;
 
 	var push_bytes: PackedByteArray = _build_forecast_push_constants(
 			inv_timeline_dt,
@@ -2479,7 +2985,7 @@ func _compute_forecasts_gpu(
 func _compute_forecasts_gpu_instrumented(
 		bodies: Array[JrBallisticOrbiter],
 		well_list: Array[JrOrreryElement],
-		timeline_floats: PackedFloat32Array,
+		timeline_bytes: PackedByteArray,
 		inv_timeline_dt: float
 ) -> Dictionary[JrBallisticOrbiter, PackedVector4Array]:
 	var body_count: int = bodies.size();
@@ -2495,7 +3001,7 @@ func _compute_forecasts_gpu_instrumented(
 	var t1: int = Time.get_ticks_usec();
 
 	@warning_ignore("integer_division")
-	var timeline_vec4_entries: int = timeline_floats.size() / FLOATS_PER_VEC4;
+	var timeline_vec4_entries: int = timeline_bytes.size() / BYTES_PER_VEC4;
 	@warning_ignore("integer_division")
 	var timeline_segments: int = (
 			maxi(1, (timeline_vec4_entries / maxi(1, well_count * 2)) - 1)
@@ -2505,9 +3011,9 @@ func _compute_forecasts_gpu_instrumented(
 
 	_ensure_forecast_capacities(body_count, timeline_vec4_entries, total_vec4s);
 	_rd.buffer_update(_forecast_body_buffer_rid, 0, body_bytes.size(), body_bytes);
-	if not timeline_floats.is_empty():
-		var tl_bytes: PackedByteArray = timeline_floats.to_byte_array();
-		_rd.buffer_update(_forecast_timeline_buffer_rid, 0, tl_bytes.size(), tl_bytes);
+	if not timeline_bytes.is_empty():
+		_rd.buffer_update(_forecast_timeline_buffer_rid, 0, timeline_bytes.size(), timeline_bytes);
+		_tl_gpu_dirty = true;
 
 	var push_bytes: PackedByteArray = _build_forecast_push_constants(
 			inv_timeline_dt,
@@ -2553,19 +3059,21 @@ func _compute_forecasts_gpu_instrumented(
 func _bake_tapes_gpu(
 		config: JrBallisticForecastConfig,
 		well_count: int,
-		timeline_floats: PackedFloat32Array,
+		timeline_bytes: PackedByteArray,
 		inv_timeline_dt: float
 ) -> void:
 	if _telemetry != null:
-		_bake_tapes_gpu_instrumented(config, well_count, timeline_floats, inv_timeline_dt);
+		_bake_tapes_gpu_instrumented(config, well_count, timeline_bytes, inv_timeline_dt);
 		return;
 
 	var body_count: int = config.bodies.size();
+	_meta_precommitted_in_fused = false;
+	_job_out_base_knot_offset = 0;
 	_prepare_tape_atlas_for_gpu_bake(config);
-	var offsets: PackedInt32Array = _compute_tape_job_offsets(config);
+	var offsets: PackedInt32Array = _plan_gpu_tape_job_layout(config);
 	var total_vec4s: int = offsets[body_count] * 2;
 	@warning_ignore("integer_division")
-	var timeline_vec4_entries: int = timeline_floats.size() / FLOATS_PER_VEC4;
+	var timeline_vec4_entries: int = timeline_bytes.size() / BYTES_PER_VEC4;
 	@warning_ignore("integer_division")
 	var timeline_segments: int = (
 			maxi(1, (timeline_vec4_entries / maxi(1, well_count * 2)) - 1)
@@ -2574,16 +3082,11 @@ func _bake_tapes_gpu(
 	);
 
 	_ensure_forecast_capacities(body_count, timeline_vec4_entries, total_vec4s);
-	var body_bytes: PackedByteArray = _pack_tape_jobs_buffer(
-			config,
-			offsets,
-			timeline_floats,
-			well_count
-	);
+	var body_bytes: PackedByteArray = _pack_tape_jobs_buffer(config, offsets, well_count);
 	_rd.buffer_update(_forecast_body_buffer_rid, 0, body_bytes.size(), body_bytes);
-	if not timeline_floats.is_empty():
-		var tl_bytes: PackedByteArray = timeline_floats.to_byte_array();
-		_rd.buffer_update(_forecast_timeline_buffer_rid, 0, tl_bytes.size(), tl_bytes);
+	if _tl_gpu_dirty and not timeline_bytes.is_empty():
+		_rd.buffer_update(_forecast_timeline_buffer_rid, 0, timeline_bytes.size(), timeline_bytes);
+		_tl_gpu_dirty = false;
 
 	var push_bytes: PackedByteArray = _build_forecast_push_constants(
 			inv_timeline_dt,
@@ -2616,25 +3119,22 @@ func _bake_tapes_gpu(
 func _bake_tapes_gpu_instrumented(
 		config: JrBallisticForecastConfig,
 		well_count: int,
-		timeline_floats: PackedFloat32Array,
+		timeline_bytes: PackedByteArray,
 		inv_timeline_dt: float
 ) -> void:
 	var body_count: int = config.bodies.size();
 
 	var t0: int = Time.get_ticks_usec();
+	_meta_precommitted_in_fused = false;
+	_job_out_base_knot_offset = 0;
 	_prepare_tape_atlas_for_gpu_bake(config);
-	var offsets: PackedInt32Array = _compute_tape_job_offsets(config);
+	var offsets: PackedInt32Array = _plan_gpu_tape_job_layout(config);
 	var total_vec4s: int = offsets[body_count] * 2;
-	var body_bytes: PackedByteArray = _pack_tape_jobs_buffer(
-			config,
-			offsets,
-			timeline_floats,
-			well_count
-	);
+	var body_bytes: PackedByteArray = _pack_tape_jobs_buffer(config, offsets, well_count);
 	var t1: int = Time.get_ticks_usec();
 
 	@warning_ignore("integer_division")
-	var timeline_vec4_entries: int = timeline_floats.size() / FLOATS_PER_VEC4;
+	var timeline_vec4_entries: int = timeline_bytes.size() / BYTES_PER_VEC4;
 	@warning_ignore("integer_division")
 	var timeline_segments: int = (
 			maxi(1, (timeline_vec4_entries / maxi(1, well_count * 2)) - 1)
@@ -2644,9 +3144,9 @@ func _bake_tapes_gpu_instrumented(
 
 	_ensure_forecast_capacities(body_count, timeline_vec4_entries, total_vec4s);
 	_rd.buffer_update(_forecast_body_buffer_rid, 0, body_bytes.size(), body_bytes);
-	if not timeline_floats.is_empty():
-		var tl_bytes: PackedByteArray = timeline_floats.to_byte_array();
-		_rd.buffer_update(_forecast_timeline_buffer_rid, 0, tl_bytes.size(), tl_bytes);
+	if _tl_gpu_dirty and not timeline_bytes.is_empty():
+		_rd.buffer_update(_forecast_timeline_buffer_rid, 0, timeline_bytes.size(), timeline_bytes);
+		_tl_gpu_dirty = false;
 
 	var push_bytes: PackedByteArray = _build_forecast_push_constants(
 			inv_timeline_dt,
@@ -2682,6 +3182,148 @@ func _bake_tapes_gpu_instrumented(
 	_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_SOLVER_FORECAST_READBACK_UNPACK, t4 - t3);
 
 
+## Returns `true` when every job in [param config] either writes directly to `TapeAtlasBuffer`
+## or exceeds `GPU_TAPE_SLOT_KNOTS` (delegating to sparse CPU fallback without atlas upload).
+func _can_all_jobs_precommit_atlas(config: JrBallisticForecastConfig) -> bool:
+	var count: int = config.bodies.size();
+	var total_slots: int = config.total_driver_bodies;
+	if total_slots < MIN_GPU_TAPE_ATLAS_BODIES:
+		return false;
+
+	var has_modes: bool = not config.job_append_mode.is_empty();
+	var has_steps: bool = not config.job_step_counts.is_empty();
+	for i: int in range(count):
+		var body: JrBallisticOrbiter = config.bodies[i];
+		var slot_idx: int = body._ballistic_seq_index;
+		if slot_idx < 0 or slot_idx >= total_slots:
+			return false;
+		var steps: int = maxi(1, config.job_step_counts[i] if has_steps else body.preview_steps);
+		if (steps + 1) > GPU_TAPE_SLOT_KNOTS:
+			continue;
+		var mode: int = config.job_append_mode[i] if has_modes else JrBallisticForecastConfig.JOB_RESET;
+		var tail_tol: float = maxf(1e-7, 1e-4 * body._trajectory_tape.knot_dt);
+		if (
+				mode == JrBallisticForecastConfig.JOB_APPEND_TAIL
+				and body._trajectory_tape.is_valid
+				and config.trim_before_time < body._trajectory_tape.get_end_time() - tail_tol
+		):
+			return false;
+	return true;
+
+
+## Records `ballistic_forecast.glsl` -> memory barrier -> `ballistic_tape_sample.glsl` in a single
+## compute list and performs a single unified SSBO readback (`timing_params = Vector3(inv_timeline_dt, well_count, eval_dt)`).
+func _execute_fused_bake_and_sample_gpu(
+		config: JrBallisticForecastConfig,
+		all_bodies: Array[JrBallisticOrbiter],
+		timeline_bytes: PackedByteArray,
+		timing_params: Vector3
+) -> PackedVector4Array:
+	var record_tel: bool = _telemetry != null;
+	var t0: int = Time.get_ticks_usec() if record_tel else 0;
+
+	var inv_timeline_dt: float = timing_params.x;
+	var well_count: int = int(roundf(timing_params.y));
+	var eval_time: float = _fused_eval_time;
+	var total_count: int = all_bodies.size();
+	var job_count: int = config.bodies.size();
+
+	_ensure_tape_atlas_capacities(total_count);
+	if not _tape_atlas_valid or _tape_meta_body_count != total_count:
+		if job_count < total_count:
+			_sync_all_tapes_to_gpu_atlas(all_bodies, config.start_time);
+		else:
+			_tape_gpu_time_origin = config.start_time;
+			_tape_meta_body_count = total_count;
+			_tape_meta_vec4s.resize(total_count * 2);
+			_tape_meta_vec4s.fill(Vector4.ZERO);
+			_mark_tape_meta_slot_dirty(0);
+			_mark_tape_meta_slot_dirty(maxi(0, total_count - 1));
+	elif absf(eval_time - _tape_gpu_time_origin) > MAX_GPU_TIME_ORIGIN_SPAN:
+		_rebase_tape_meta_time_origin(all_bodies, eval_time);
+
+	var pos_end_bytes: int = STEP_OUT_HEADER_BYTES + total_count * TAPE_SAMPLE_POS_BYTES_PER_BODY;
+	var tail_base_knot: int = int(ceili(float(pos_end_bytes) / 32.0));
+
+	_meta_precommitted_in_fused = true;
+	var offsets: PackedInt32Array = _plan_gpu_tape_job_layout(config);
+	var bake_knots: int = offsets[job_count];
+	_job_out_base_knot_offset = tail_base_knot;
+	var body_bytes: PackedByteArray = _pack_tape_jobs_buffer(config, offsets, well_count);
+	_job_out_base_knot_offset = 0;
+	_tape_atlas_valid = true;
+	var t1: int = Time.get_ticks_usec() if record_tel else 0;
+
+	@warning_ignore("integer_division")
+	var timeline_vec4_entries: int = timeline_bytes.size() / BYTES_PER_VEC4;
+	@warning_ignore("integer_division")
+	var timeline_segments: int = (
+			maxi(1, (timeline_vec4_entries / maxi(1, well_count * 2)) - 1)
+			if well_count > 0
+			else 1
+	);
+
+	var events_word_offset: int = (tail_base_knot + bake_knots) * 8;
+	var required_sample_out_bytes: int = (
+			(tail_base_knot + bake_knots) * 32
+			+ total_count * TAPE_SAMPLE_EVENT_BYTES
+	);
+	_ensure_tape_sample_out_bytes(required_sample_out_bytes);
+	_ensure_forecast_capacities(job_count, timeline_vec4_entries, 2);
+
+	_rd.buffer_update(_forecast_body_buffer_rid, 0, body_bytes.size(), body_bytes);
+	if _tl_gpu_dirty and not timeline_bytes.is_empty():
+		_rd.buffer_update(_forecast_timeline_buffer_rid, 0, timeline_bytes.size(), timeline_bytes);
+		_tl_gpu_dirty = false;
+
+	_flush_dirty_tape_meta_to_gpu();
+
+	var bake_push: PackedByteArray = _build_forecast_push_constants(
+			inv_timeline_dt,
+			job_count,
+			well_count,
+			timeline_segments
+	);
+	var rel_pair: Vector2 = _split_float64_to_f32_pair(eval_time - _tape_gpu_time_origin);
+	var sample_push := PackedByteArray();
+	sample_push.resize(PUSH_CONSTANT_BYTES);
+	sample_push.encode_float(0, rel_pair.x);
+	sample_push.encode_float(4, rel_pair.y);
+	sample_push.encode_u32(8, total_count);
+	sample_push.encode_u32(12, events_word_offset);
+
+	var bake_groups: int = int(ceili(float(job_count) / float(WORKGROUP_SIZE_X)));
+	var sample_groups: int = int(ceili(float(total_count) / float(WORKGROUP_SIZE_X)));
+
+	var cl: int = _rd.compute_list_begin();
+	_rd.compute_list_bind_compute_pipeline(cl, _forecast_pipeline_rid);
+	_rd.compute_list_bind_uniform_set(cl, _fused_forecast_uniform_set_rid, 0);
+	_rd.compute_list_set_push_constant(cl, bake_push, PUSH_CONSTANT_BYTES);
+	_rd.compute_list_dispatch(cl, bake_groups, 1, 1);
+	_rd.compute_list_add_barrier(cl);
+	_rd.compute_list_bind_compute_pipeline(cl, _tape_sample_pipeline_rid);
+	_rd.compute_list_bind_uniform_set(cl, _tape_sample_uniform_set_rid, 0);
+	_rd.compute_list_set_push_constant(cl, sample_push, PUSH_CONSTANT_BYTES);
+	_rd.compute_list_dispatch(cl, sample_groups, 1, 1);
+	_rd.compute_list_end();
+	var t2: int = Time.get_ticks_usec() if record_tel else 0;
+
+	_rd.submit();
+	var t3: int = Time.get_ticks_usec() if record_tel else 0;
+
+	if record_tel:
+		_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_SOLVER_FORECAST_PACK, t1 - t0);
+		_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_SOLVER_FORECAST_UPLOAD_DISPATCH, t2 - t1);
+		_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_SOLVER_FORECAST_SUBMIT_SYNC, t3 - t2);
+
+	_last_fused_bake_sampled = true;
+	_pending_gpu_sample_sync = true;
+	_pending_gpu_sample_config = config;
+	_pending_gpu_sample_offsets = offsets;
+	_pending_gpu_sample_tail_base = tail_base_knot;
+	return PackedVector4Array();
+
+
 ## Computes prefix-sum output start offsets (and total point count at index
 ## [code]bodies.size()[/code]).
 func _compute_forecast_output_offsets(bodies: Array[JrBallisticOrbiter]) -> PackedInt32Array:
@@ -2696,21 +3338,62 @@ func _compute_forecast_output_offsets(bodies: Array[JrBallisticOrbiter]) -> Pack
 	return offsets;
 
 
-## Computes prefix-sum knot offsets across all trajectory-tape jobs in [param config].
-func _compute_tape_job_offsets(config: JrBallisticForecastConfig) -> PackedInt32Array:
+## Plans per-job VRAM atlas write flags, compact 2-`vec4` tail-summary flags, and output knot offsets.
+func _plan_gpu_tape_job_layout(config: JrBallisticForecastConfig) -> PackedInt32Array:
 	var count: int = config.bodies.size();
 	var offsets := PackedInt32Array();
 	offsets.resize(count + 1);
-	var has_custom_steps: bool = not config.job_step_counts.is_empty();
+	_job_wrote_atlas_flags.resize(count);
+	_job_wrote_atlas_flags.fill(0);
+	_job_compact_out_flags.resize(count);
+	_job_compact_out_flags.fill(0);
+
+	var use_gpu_atlas: bool = (
+			_tape_sample_gpu_available
+			and config.total_driver_bodies >= MIN_GPU_TAPE_ATLAS_BODIES
+	);
+	var has_steps: bool = not config.job_step_counts.is_empty();
+	var has_modes: bool = not config.job_append_mode.is_empty();
 	var running_total: int = 0;
+
 	for i: int in range(count):
 		offsets[i] = running_total;
+		var body: JrBallisticOrbiter = config.bodies[i];
 		var steps: int = (
 				maxi(1, config.job_step_counts[i])
-				if has_custom_steps
-				else maxi(1, config.bodies[i].preview_steps)
+				if has_steps
+				else maxi(1, body.preview_steps)
 		);
-		running_total += steps + 1;
+		var pt_count: int = steps + 1;
+		var slot_idx: int = body._ballistic_seq_index;
+		var mode: int = config.job_append_mode[i] if has_modes else JrBallisticForecastConfig.JOB_RESET;
+		var tail_tol: float = maxf(1e-7, 1e-4 * body._trajectory_tape.knot_dt);
+
+		if (
+				use_gpu_atlas
+				and slot_idx >= 0
+				and slot_idx < config.total_driver_bodies
+				and pt_count <= GPU_TAPE_SLOT_KNOTS
+				and (
+						mode != JrBallisticForecastConfig.JOB_APPEND_TAIL
+						or not body._trajectory_tape.is_valid
+						or config.trim_before_time >= body._trajectory_tape.get_end_time() - tail_tol
+				)
+		):
+			_job_wrote_atlas_flags[i] = 1;
+			if (
+					not (config.enable_forecasts and body.runtime_forecast_enabled)
+					and (
+							mode != JrBallisticForecastConfig.JOB_PERIODIC_LOOP
+							or config.total_driver_bodies >= MIN_GPU_TAPE_SAMPLE_BODIES
+					)
+			):
+				_job_compact_out_flags[i] = 1;
+				running_total += 1;
+				continue;
+
+		running_total += pt_count;
+
 	offsets[count] = running_total;
 	return offsets;
 
@@ -2760,9 +3443,14 @@ func _compute_adaptive_timeline_segments(
 			max_mean_n = maxf(max_mean_n, orb.mean_motion);
 
 	var arc_rad: float = max_mean_n * max_duration;
-	var needed: int = int(ceili(arc_rad / 0.10));
+	var max_step_rad: float = (
+			0.03
+			if (config.enable_forecasts or config.job_step_counts.is_empty())
+			else 0.05
+	);
+	var needed: int = int(ceili(arc_rad / max_step_rad));
 	var min_segs: int = maxi(8, config.timeline_segments) if config.timeline_segments > 0 else 8;
-	var max_cap: int = clampi(32768 / well_count, 16, 256);
+	var max_cap: int = clampi(65536 / maxi(1, well_count), 32, 1024);
 	return clampi(maxi(min_segs, needed), 8, max_cap);
 
 
@@ -2832,18 +3520,11 @@ func _pack_forecast_bodies_buffer(
 func _pack_tape_jobs_buffer(
 		config: JrBallisticForecastConfig,
 		offsets: PackedInt32Array,
-		timeline_floats: PackedFloat32Array,
 		well_count: int
 ) -> PackedByteArray:
 	var count: int = config.bodies.size();
 	var vec4s := PackedVector4Array();
 	vec4s.resize(count * VEC4S_PER_BODY);
-	_job_wrote_atlas_flags.resize(count);
-	_job_wrote_atlas_flags.fill(0);
-	var use_gpu_atlas: bool = (
-			_tape_sample_gpu_available
-			and config.total_driver_bodies >= MIN_GPU_TAPE_SAMPLE_BODIES
-	);
 
 	var has_modes: bool = not config.job_append_mode.is_empty();
 	var has_t0s: bool = not config.job_start_times.is_empty();
@@ -2853,18 +3534,18 @@ func _pack_tape_jobs_buffer(
 
 	for i: int in range(count):
 		var body: JrBallisticOrbiter = config.bodies[i];
+		var tape: JrBallisticTrajectoryTape = body._trajectory_tape;
 		var mode: int = config.job_append_mode[i] if has_modes else JrBallisticForecastConfig.JOB_RESET;
 		var job_t0: float = config.job_start_times[i] if has_t0s else config.start_time;
 		var pos: Vector3;
 		var vel: Vector3;
 		var anchor_idx: int;
-		if mode == JrBallisticForecastConfig.JOB_APPEND_TAIL and body._trajectory_tape.is_valid:
-			var tape: JrBallisticTrajectoryTape = body._trajectory_tape;
+		if mode == JrBallisticForecastConfig.JOB_APPEND_TAIL and tape.is_valid:
 			if body.runtime_forecast_enabled and tape.epoch_unperturbed and not body._has_external_thrust:
 				anchor_idx = tape.epoch_well_idx;
 				var mu_ep: float = (
-						timeline_floats[anchor_idx * FLOATS_PER_TIMELINE_WELL + 3]
-						if (anchor_idx >= 0 and anchor_idx < well_count and not timeline_floats.is_empty())
+						_tl_well_mu[anchor_idx]
+						if (anchor_idx >= 0 and anchor_idx < well_count and anchor_idx < _tl_well_mu.size())
 						else 0.0
 				);
 				if mu_ep > 0.0:
@@ -2875,15 +3556,25 @@ func _pack_tape_jobs_buffer(
 					pos = tape.get_tail_position();
 					vel = tape.get_tail_velocity();
 			else:
-				pos = tape.get_tail_position();
-				vel = tape.get_tail_velocity();
-				anchor_idx = tape.get_tail_well_index();
+				var tp: Vector4 = tape.tail_pos_anchor;
+				var tv: Vector4 = tape.tail_vel_flags;
+				pos = Vector3(tp.x, tp.y, tp.z);
+				vel = Vector3(tv.x, tv.y, tv.z);
+				anchor_idx = int(roundf(tp.w));
 		else:
+			if body.is_tape_position_pending():
+				body.ensure_tape_position();
 			if body.is_tape_velocity_pending():
 				body.ensure_tape_velocity();
 			pos = body._anchor_relative_position;
 			vel = body._anchor_relative_velocity;
 			anchor_idx = body.get_anchor_well_index();
+			if (
+					body._tape_anchor_idx < 0
+					and body._anchor_element != null
+					and body._anchor_element._runtime_well_index == anchor_idx
+			):
+				body._tape_anchor_idx = anchor_idx;
 
 		var steps: int = maxi(1, config.job_step_counts[i] if has_steps else body.preview_steps);
 		var step_dt: float = (
@@ -2911,32 +3602,83 @@ func _pack_tape_jobs_buffer(
 		if body.pinned_anchor != null:
 			mode_bits |= 4;
 		var slot_idx: int = body._ballistic_seq_index;
-		if (
-				use_gpu_atlas
-				and slot_idx >= 0
-				and slot_idx < config.total_driver_bodies
-				and (steps + 1) <= GPU_TAPE_SLOT_KNOTS
-				and (
-						mode != JrBallisticForecastConfig.JOB_APPEND_TAIL
-						or not body._trajectory_tape.is_valid
-						or config.trim_before_time >= body._trajectory_tape.get_end_time() - 1e-7
-				)
-		):
-			mode_bits |= ((slot_idx + 1) << 3);
-			_job_wrote_atlas_flags[i] = 1;
+		if i < _job_compact_out_flags.size() and _job_compact_out_flags[i] != 0:
+			mode_bits |= 8;
+		if i < _job_wrote_atlas_flags.size() and _job_wrote_atlas_flags[i] != 0:
+			mode_bits |= ((slot_idx + 1) << 4);
+
+		if _meta_precommitted_in_fused:
+			_precommit_job_tape_meta(config, i, step_dt, steps);
 
 		var base: int = i * VEC4S_PER_BODY;
 		vec4s[base] = Vector4(pos.x, pos.y, pos.z, step_dt);
 		vec4s[base + 1] = Vector4(vel.x, vel.y, vel.z, float(steps));
 		vec4s[base + 2] = Vector4(ext.x, ext.y, ext.z, start_offset);
 		vec4s[base + 3] = Vector4(
-				float(offsets[i]),
+				float(offsets[i] + _job_out_base_knot_offset),
 				float(anchor_idx),
 				float(mode_bits),
 				float(substeps)
 		);
 
 	return vec4s.to_byte_array();
+
+
+## Pre-updates `TapeMetaBuffer` slot metadata for job [param idx] prior to a fused GPU bake+sample dispatch.
+func _precommit_job_tape_meta(
+		config: JrBallisticForecastConfig,
+		idx: int,
+		step_dt: float,
+		steps: int
+) -> void:
+	var body: JrBallisticOrbiter = config.bodies[idx];
+	var slot_idx: int = body._ballistic_seq_index;
+	var base: int = slot_idx * 2;
+	if base < 0 or base + 1 >= _tape_meta_vec4s.size():
+		return;
+
+	var knot_count: int = steps + 1;
+	if knot_count < 2 or knot_count > GPU_TAPE_SLOT_KNOTS:
+		_tape_meta_vec4s[base] = Vector4.ZERO;
+		_tape_meta_vec4s[base + 1] = Vector4(float(slot_idx), 0.0, 0.0, float(body._tape_anchor_idx));
+		_mark_tape_meta_slot_dirty(slot_idx);
+		return;
+
+	var tape: JrBallisticTrajectoryTape = body._trajectory_tape;
+	var mode: int = (
+			config.job_append_mode[idx]
+			if idx < config.job_append_mode.size()
+			else JrBallisticForecastConfig.JOB_RESET
+	);
+	var new_t0: float;
+	var eff_dt: float;
+	var loop_p: float = 0.0;
+	if mode == JrBallisticForecastConfig.JOB_APPEND_TAIL and tape.is_valid:
+		new_t0 = tape.get_end_time();
+		eff_dt = tape.knot_dt;
+	else:
+		new_t0 = (
+				config.job_start_times[idx]
+				if idx < config.job_start_times.size()
+				else config.start_time
+		);
+		eff_dt = maxf(1e-7, step_dt);
+		if (
+				mode == JrBallisticForecastConfig.JOB_PERIODIC_LOOP
+				and idx < config.job_loop_periods.size()
+				and config.job_loop_periods[idx] > 0.0
+		):
+			loop_p = config.job_loop_periods[idx];
+
+	var t0_pair: Vector2 = _split_float64_to_f32_pair(new_t0 - _tape_gpu_time_origin);
+	_tape_meta_vec4s[base] = Vector4(t0_pair.x, t0_pair.y, 1.0 / eff_dt, eff_dt);
+	_tape_meta_vec4s[base + 1] = Vector4(
+			float(slot_idx),
+			float(knot_count),
+			loop_p,
+			float(body._tape_anchor_idx)
+	);
+	_mark_tape_meta_slot_dirty(slot_idx);
 
 
 ## Slices contiguous `pos_anchor` arrays out of [param all_vec4s] in native C++.
@@ -2954,23 +3696,99 @@ func _unpack_forecast_output(
 	return results;
 
 
-## Slices contiguous `[pos_anchor | vel_flags]` spans out of [param all_vec4s] and commits them
-## into each body's [JrBallisticTrajectoryTape].
+## Slices contiguous `[pos_anchor | vel_flags]` spans (or 2-`vec4` compact tail summaries) out of
+## [param all_vec4s] and commits them into each body's [JrBallisticTrajectoryTape].
 func _apply_unpacked_tape_slices(
 		config: JrBallisticForecastConfig,
 		offsets: PackedInt32Array,
 		all_vec4s: PackedVector4Array
 ) -> void:
+	if _self_weak_ref == null:
+		_self_weak_ref = weakref(self);
+
 	var count: int = config.bodies.size();
+	var has_compact: bool = _job_compact_out_flags.size() == count;
 	for i: int in range(count):
 		var start_knot: int = offsets[i];
-		var pt_count: int = offsets[i + 1] - start_knot;
 		var pos_base: int = start_knot * 2;
+		if has_compact and _job_compact_out_flags[i] != 0:
+			_commit_body_compact_atlas_job(
+					config,
+					i,
+					all_vec4s[pos_base],
+					all_vec4s[pos_base + 1]
+			);
+			continue;
+
+		var pt_count: int = offsets[i + 1] - start_knot;
 		var vel_base: int = pos_base + pt_count;
 		var pos_slice: PackedVector4Array = all_vec4s.slice(pos_base, vel_base);
 		var vel_slice: PackedVector4Array = all_vec4s.slice(vel_base, vel_base + pt_count);
 		_commit_body_tape_job(config, i, pos_slice, vel_slice);
+
 	_finalize_tape_atlas_after_bake(config, true);
+
+
+## Commits a compact 2-`vec4` GPU-atlas tail summary into `config.bodies[idx]` without CPU knot slicing.
+func _commit_body_compact_atlas_job(
+		config: JrBallisticForecastConfig,
+		idx: int,
+		tail_pos: Vector4,
+		tail_vel: Vector4
+) -> void:
+	var body: JrBallisticOrbiter = config.bodies[idx];
+	var tape: JrBallisticTrajectoryTape = body._trajectory_tape;
+	var mode: int = (
+			config.job_append_mode[idx]
+			if idx < config.job_append_mode.size()
+			else JrBallisticForecastConfig.JOB_RESET
+	);
+	var steps: int = maxi(
+			1,
+			config.job_step_counts[idx] if idx < config.job_step_counts.size() else body.preview_steps
+	);
+	var slot_idx: int = body._ballistic_seq_index;
+
+	if mode == JrBallisticForecastConfig.JOB_APPEND_TAIL and tape.is_valid:
+		var prev_unpert: bool = tape.epoch_unperturbed;
+		var new_t0: float = tape.get_end_time();
+		tape.reset_gpu_atlas_grid(new_t0, tape.knot_dt, steps + 1);
+		tape.bind_gpu_atlas_tail(tail_pos, tail_vel, slot_idx, _self_weak_ref);
+		tape.epoch_unperturbed = prev_unpert and (tail_vel.w > 0.5);
+	else:
+		var knot_dt: float = (
+				config.job_knot_dts[idx]
+				if idx < config.job_knot_dts.size()
+				else (maxf(1e-6, body.preview_duration) / float(steps))
+		);
+		var job_t0: float = (
+				config.job_start_times[idx]
+				if idx < config.job_start_times.size()
+				else config.start_time
+		);
+		if body.is_tape_position_pending():
+			body.ensure_tape_position();
+		if body.is_tape_velocity_pending():
+			body.ensure_tape_velocity();
+		tape.reset_gpu_atlas_grid(job_t0, knot_dt, steps + 1);
+		tape.bind_gpu_atlas_tail(tail_pos, tail_vel, slot_idx, _self_weak_ref);
+		tape.epoch_pos = body._anchor_relative_position;
+		tape.epoch_vel = body._anchor_relative_velocity;
+		tape.epoch_time = job_t0;
+		tape.epoch_well_idx = body.get_anchor_well_index();
+		if (
+				body._tape_anchor_idx < 0
+				and body._anchor_element != null
+				and body._anchor_element._runtime_well_index == tape.epoch_well_idx
+		):
+			body._tape_anchor_idx = tape.epoch_well_idx;
+		tape.epoch_unperturbed = tail_vel.w > 0.5;
+		if mode == JrBallisticForecastConfig.JOB_PERIODIC_LOOP and idx < config.job_loop_periods.size():
+			tape.mark_periodic_loop(config.job_loop_periods[idx]);
+
+	body._is_on_rails = tape.epoch_unperturbed;
+	if not _meta_precommitted_in_fused and slot_idx >= 0 and slot_idx < config.total_driver_bodies:
+		_write_tape_meta_entry(slot_idx, body, tape);
 
 
 ## Commits a newly integrated `(pos_slice, vel_slice)` job output into `config.bodies[idx]`.
@@ -3003,6 +3821,8 @@ func _commit_body_tape_job(
 				if idx < config.job_start_times.size()
 				else config.start_time
 		);
+		if body.is_tape_position_pending():
+			body.ensure_tape_position();
 		if body.is_tape_velocity_pending():
 			body.ensure_tape_velocity();
 		tape.reset_with_knots(job_t0, knot_dt, pos_slice, vel_slice);
@@ -3022,11 +3842,12 @@ func _commit_body_tape_job(
 
 	body._is_on_rails = tape.epoch_unperturbed;
 
-	if _tape_sample_gpu_available and config.total_driver_bodies >= MIN_GPU_TAPE_SAMPLE_BODIES:
+	if _tape_sample_gpu_available and config.total_driver_bodies >= MIN_GPU_TAPE_ATLAS_BODIES:
 		var slot_idx: int = body._ballistic_seq_index;
 		var wrote_direct: bool = idx < _job_wrote_atlas_flags.size() and _job_wrote_atlas_flags[idx] != 0;
 		if slot_idx >= 0 and slot_idx < config.total_driver_bodies:
-			_write_tape_meta_entry(slot_idx, body, tape);
+			if not _meta_precommitted_in_fused:
+				_write_tape_meta_entry(slot_idx, body, tape);
 			if (
 					(_tape_atlas_valid or config.bodies.size() == config.total_driver_bodies)
 					and not wrote_direct
@@ -3038,8 +3859,9 @@ func _commit_body_tape_job(
 
 ## Prepares resident GPU trajectory-tape atlas and metadata storage before a GPU bake pass.
 func _prepare_tape_atlas_for_gpu_bake(config: JrBallisticForecastConfig) -> void:
-	if not _tape_sample_gpu_available or config.total_driver_bodies < MIN_GPU_TAPE_SAMPLE_BODIES:
+	if not _tape_sample_gpu_available or config.total_driver_bodies < MIN_GPU_TAPE_ATLAS_BODIES:
 		_job_wrote_atlas_flags.clear();
+		_job_compact_out_flags.clear();
 		return;
 
 	var total_slots: int = config.total_driver_bodies;
@@ -3050,6 +3872,8 @@ func _prepare_tape_atlas_for_gpu_bake(config: JrBallisticForecastConfig) -> void
 		_tape_gpu_time_origin = config.start_time;
 		_tape_meta_vec4s.resize(total_slots * 2);
 		_tape_meta_vec4s.fill(Vector4.ZERO);
+		_mark_tape_meta_slot_dirty(0);
+		_mark_tape_meta_slot_dirty(maxi(0, total_slots - 1));
 	elif not _tape_atlas_valid and config.bodies.size() == total_slots:
 		_tape_gpu_time_origin = config.start_time;
 
@@ -3059,22 +3883,50 @@ func _finalize_tape_atlas_after_bake(
 		config: JrBallisticForecastConfig,
 		is_gpu_bake: bool
 ) -> void:
-	if (
-			not is_gpu_bake
-			or not _tape_sample_gpu_available
-			or config.total_driver_bodies < MIN_GPU_TAPE_SAMPLE_BODIES
-	):
-		if not is_gpu_bake:
-			_tape_atlas_valid = false;
+	if not _tape_sample_gpu_available or config.total_driver_bodies < MIN_GPU_TAPE_ATLAS_BODIES:
+		_tape_atlas_valid = false;
 		return;
 
-	if not _tape_atlas_valid and config.bodies.size() == config.total_driver_bodies:
+	if not is_gpu_bake and not _tape_atlas_valid:
+		return;
+
+	if is_gpu_bake and not _tape_atlas_valid and config.bodies.size() == config.total_driver_bodies:
 		_tape_atlas_valid = true;
 
-	if _tape_atlas_valid and _tape_meta_gpu_dirty and _tape_meta_buffer_rid.is_valid():
-		var meta_bytes: PackedByteArray = _tape_meta_vec4s.to_byte_array();
-		_rd.buffer_update(_tape_meta_buffer_rid, 0, meta_bytes.size(), meta_bytes);
+	if _tape_atlas_valid and _tape_meta_gpu_dirty:
+		_flush_dirty_tape_meta_to_gpu();
+
+
+## Marks [param slot_idx] dirty within [member _tape_meta_vec4s] for partial `TapeMetaBuffer` uploads.
+func _mark_tape_meta_slot_dirty(slot_idx: int) -> void:
+	if not _tape_meta_gpu_dirty:
+		_tape_meta_gpu_dirty = true;
+		_tape_meta_dirty_min_slot = slot_idx;
+		_tape_meta_dirty_max_slot = slot_idx;
+	else:
+		_tape_meta_dirty_min_slot = mini(_tape_meta_dirty_min_slot, slot_idx);
+		_tape_meta_dirty_max_slot = maxi(_tape_meta_dirty_max_slot, slot_idx);
+
+
+## Uploads only the dirty `[min_slot .. max_slot]` byte span of [member _tape_meta_vec4s] to VRAM.
+func _flush_dirty_tape_meta_to_gpu() -> void:
+	if not _tape_meta_gpu_dirty or not _tape_meta_buffer_rid.is_valid():
 		_tape_meta_gpu_dirty = false;
+		_tape_meta_dirty_min_slot = 0;
+		_tape_meta_dirty_max_slot = -1;
+		return;
+
+	var max_valid_slot: int = (_tape_meta_vec4s.size() >> 1) - 1;
+	if max_valid_slot >= 0:
+		var lo: int = clampi(_tape_meta_dirty_min_slot, 0, max_valid_slot);
+		var hi: int = clampi(_tape_meta_dirty_max_slot, lo, max_valid_slot);
+		if hi >= lo:
+			var slice_bytes: PackedByteArray = _tape_meta_vec4s.slice(lo * 2, (hi + 1) * 2).to_byte_array();
+			_rd.buffer_update(_tape_meta_buffer_rid, lo * 32, slice_bytes.size(), slice_bytes);
+
+	_tape_meta_gpu_dirty = false;
+	_tape_meta_dirty_min_slot = 0;
+	_tape_meta_dirty_max_slot = -1;
 
 
 ## Writes `(m0, m1)` metadata for [param slot_idx] into [member _tape_meta_vec4s].
@@ -3090,7 +3942,7 @@ func _write_tape_meta_entry(
 	if not tape.is_valid or tape.knot_count < 2 or tape.knot_count > GPU_TAPE_SLOT_KNOTS:
 		_tape_meta_vec4s[base] = Vector4.ZERO;
 		_tape_meta_vec4s[base + 1] = Vector4(float(slot_idx), 0.0, 0.0, float(body._tape_anchor_idx));
-		_tape_meta_gpu_dirty = true;
+		_mark_tape_meta_slot_dirty(slot_idx);
 		return;
 
 	var t0_pair: Vector2 = _split_float64_to_f32_pair(tape.start_time - _tape_gpu_time_origin);
@@ -3102,36 +3954,70 @@ func _write_tape_meta_entry(
 			loop_p,
 			float(body._tape_anchor_idx)
 	);
-	_tape_meta_gpu_dirty = true;
+	_mark_tape_meta_slot_dirty(slot_idx);
 
 
-## Uploads CPU-integrated or trimmed [param tape] knots into `TapeAtlasBuffer` at [param slot_idx].
+## Uploads CPU-integrated or trimmed [param tape] knots into Knot-Major SoA `TapeAtlasBuffer` at [param slot_idx].
 func _upload_single_tape_to_atlas(slot_idx: int, tape: JrBallisticTrajectoryTape) -> void:
-	if not _tape_atlas_buffer_rid.is_valid() or slot_idx < 0 or slot_idx >= _tape_atlas_capacity:
+	var stride: int = _tape_atlas_capacity;
+	if not _tape_atlas_buffer_rid.is_valid() or slot_idx < 0 or slot_idx >= stride:
 		return;
 	if not tape.is_valid or tape.knot_count < 2 or tape.knot_count > GPU_TAPE_SLOT_KNOTS:
 		return;
+	if not tape.cpu_knots_resident:
+		if _tape_atlas_valid and tape.atlas_slot_index == slot_idx:
+			return;
+		tape.ensure_cpu_knots();
+		if not tape.cpu_knots_resident:
+			return;
 
-	var base_bytes: int = slot_idx * GPU_TAPE_SLOT_BYTES;
-	var copy_bytes: int = tape.knot_count * BYTES_PER_VEC4;
 	var pos_bytes: PackedByteArray = tape.pos_anchor.to_byte_array();
 	var vel_bytes: PackedByteArray = tape.vel_flags.to_byte_array();
-	_rd.buffer_update(_tape_atlas_buffer_rid, base_bytes, mini(copy_bytes, pos_bytes.size()), pos_bytes);
-	_rd.buffer_update(
-			_tape_atlas_buffer_rid,
-			base_bytes + GPU_TAPE_VEL_OFFSET_BYTES,
-			mini(copy_bytes, vel_bytes.size()),
-			vel_bytes
-	);
+	var k_count: int = mini(tape.knot_count, mini(tape.pos_anchor.size(), tape.vel_flags.size()));
+	var vel_row_base: int = GPU_TAPE_SLOT_KNOTS * stride;
+	for k: int in range(k_count):
+		var src_off: int = k * BYTES_PER_VEC4;
+		var p_slice: PackedByteArray = pos_bytes.slice(src_off, src_off + BYTES_PER_VEC4);
+		var v_slice: PackedByteArray = vel_bytes.slice(src_off, src_off + BYTES_PER_VEC4);
+		_rd.buffer_update(
+				_tape_atlas_buffer_rid,
+				(k * stride + slot_idx) * BYTES_PER_VEC4,
+				BYTES_PER_VEC4,
+				p_slice
+		);
+		_rd.buffer_update(
+				_tape_atlas_buffer_rid,
+				(vel_row_base + k * stride + slot_idx) * BYTES_PER_VEC4,
+				BYTES_PER_VEC4,
+				v_slice
+		);
 
 
-## Synchronizes all [param bodies] tapes and metadata into `TapeAtlasBuffer` and `TapeMetaBuffer`.
+## Synchronizes all [param bodies] tapes and metadata into Knot-Major SoA `TapeAtlasBuffer` and `TapeMetaBuffer`.
 func _sync_all_tapes_to_gpu_atlas(bodies: Array[JrBallisticOrbiter], eval_time: float) -> void:
 	var count: int = bodies.size();
 	_ensure_tape_atlas_capacities(count);
+	var stride: int = _tape_atlas_capacity;
 	_tape_gpu_time_origin = eval_time;
 	_tape_meta_body_count = count;
 	_tape_meta_vec4s.resize(count * 2);
+
+	var any_cpu_knots: bool = false;
+	for i: int in range(count):
+		var t_chk: JrBallisticTrajectoryTape = bodies[i]._trajectory_tape;
+		if (
+				t_chk.is_valid
+				and t_chk.knot_count >= 2
+				and t_chk.knot_count <= GPU_TAPE_SLOT_KNOTS
+				and t_chk.cpu_knots_resident
+		):
+			any_cpu_knots = true;
+			break;
+
+	var atlas_v4s := PackedVector4Array();
+	var vel_row_base: int = GPU_TAPE_SLOT_KNOTS * stride;
+	if any_cpu_knots:
+		atlas_v4s.resize(GPU_TAPE_SLOT_VEC4S * stride);
 
 	for i: int in range(count):
 		var body: JrBallisticOrbiter = bodies[i];
@@ -3143,13 +4029,31 @@ func _sync_all_tapes_to_gpu_atlas(bodies: Array[JrBallisticOrbiter], eval_time: 
 				and body._anchor_element._runtime_well_index == tape.epoch_well_idx
 		):
 			body._tape_anchor_idx = tape.epoch_well_idx;
-		_upload_single_tape_to_atlas(i, tape);
+		if (
+				any_cpu_knots
+				and tape.is_valid
+				and tape.knot_count >= 2
+				and tape.knot_count <= GPU_TAPE_SLOT_KNOTS
+				and tape.cpu_knots_resident
+		):
+			var k_lim: int = mini(tape.knot_count, mini(tape.pos_anchor.size(), tape.vel_flags.size()));
+			for k: int in range(k_lim):
+				var off: int = k * stride + i;
+				atlas_v4s[off] = tape.pos_anchor[k];
+				atlas_v4s[vel_row_base + off] = tape.vel_flags[k];
+			tape.atlas_slot_index = i;
 		_write_tape_meta_entry(i, body, tape);
+
+	if any_cpu_knots and _tape_atlas_buffer_rid.is_valid():
+		var atlas_bytes: PackedByteArray = atlas_v4s.to_byte_array();
+		_rd.buffer_update(_tape_atlas_buffer_rid, 0, atlas_bytes.size(), atlas_bytes);
 
 	if count > 0 and _tape_meta_buffer_rid.is_valid():
 		var meta_bytes: PackedByteArray = _tape_meta_vec4s.to_byte_array();
 		_rd.buffer_update(_tape_meta_buffer_rid, 0, meta_bytes.size(), meta_bytes);
 	_tape_meta_gpu_dirty = false;
+	_tape_meta_dirty_min_slot = 0;
+	_tape_meta_dirty_max_slot = -1;
 	_tape_atlas_valid = true;
 
 
@@ -3164,6 +4068,8 @@ func _rebase_tape_meta_time_origin(bodies: Array[JrBallisticOrbiter], new_origin
 		var meta_bytes: PackedByteArray = _tape_meta_vec4s.to_byte_array();
 		_rd.buffer_update(_tape_meta_buffer_rid, 0, meta_bytes.size(), meta_bytes);
 	_tape_meta_gpu_dirty = false;
+	_tape_meta_dirty_min_slot = 0;
+	_tape_meta_dirty_max_slot = -1;
 
 
 ## Encodes the 16-byte push constant payload for [code]ballistic_forecast.glsl[/code].
@@ -3226,7 +4132,9 @@ func _bake_tapes_cpu(
 		inv_timeline_dt: float
 ) -> void:
 	var t0: int = Time.get_ticks_usec() if _telemetry != null else 0;
+	_meta_precommitted_in_fused = false;
 	_job_wrote_atlas_flags.clear();
+	_job_compact_out_flags.clear();
 	_prepare_cpu_forecast_tables(well_count, timeline_floats);
 	for i: int in range(config.bodies.size()):
 		_integrate_single_tape_job_cpu(config, i, inv_timeline_dt);
@@ -3296,6 +4204,8 @@ func _integrate_single_tape_job_cpu(
 			v_rel = tape_in.get_tail_velocity();
 			anchor_idx = tape_in.get_tail_well_index();
 	else:
+		if body.is_tape_position_pending():
+			body.ensure_tape_position();
 		if body.is_tape_velocity_pending():
 			body.ensure_tape_velocity();
 		r_rel = body._anchor_relative_position;
@@ -3672,10 +4582,7 @@ func _maybe_switch_fc_anchor_fast(sample_coord: float, inv_timeline_dt: float) -
 		var parent_idx: int = _fc_well_parent[_fc_cur_anchor];
 		if parent_idx >= 0 and exit_r > 0.0 and _fc_cur_r.length_squared() > exit_r * exit_r:
 			_fc_cur_r += _sample_fc_well_pos(_fc_cur_anchor, idx_a, idx_b, frac);
-			if idx_a != idx_b:
-				var p_a: Vector3 = _sample_fc_well_pos(_fc_cur_anchor, idx_a, idx_a, 0.0);
-				var p_b: Vector3 = _sample_fc_well_pos(_fc_cur_anchor, idx_b, idx_b, 0.0);
-				_fc_cur_v += (p_b - p_a) * inv_timeline_dt;
+			_fc_cur_v += _sample_fc_well_vel(_fc_cur_anchor, idx_a, frac, inv_timeline_dt);
 			_fc_cur_anchor = parent_idx;
 		else:
 			break;
@@ -3696,10 +4603,7 @@ func _maybe_switch_fc_anchor_fast(sample_coord: float, inv_timeline_dt: float) -
 			var diff_to_child: Vector3 = _fc_cur_r - child_pos;
 			if diff_to_child.length_squared() < entry_r * entry_r:
 				_fc_cur_r = diff_to_child;
-				if idx_a != idx_b:
-					var c_a: Vector3 = _sample_fc_well_pos(w, idx_a, idx_a, 0.0);
-					var c_b: Vector3 = _sample_fc_well_pos(w, idx_b, idx_b, 0.0);
-					_fc_cur_v -= (c_b - c_a) * inv_timeline_dt;
+				_fc_cur_v -= _sample_fc_well_vel(w, idx_a, frac, inv_timeline_dt);
 				_fc_cur_anchor = w;
 				entered_child = true;
 				break;
@@ -3707,6 +4611,53 @@ func _maybe_switch_fc_anchor_fast(sample_coord: float, inv_timeline_dt: float) -
 			break;
 
 	return _fc_cur_anchor != start_anchor;
+
+
+## Evaluates 2nd-order finite-difference local velocity of [param well_idx] at timeline knot [param seg_idx].
+func _sample_fc_well_knot_vel(well_idx: int, seg_idx: int, inv_timeline_dt: float) -> Vector3:
+	if well_idx <= 0 or well_idx >= _fc_well_count or _fc_max_seg <= 0:
+		return Vector3.ZERO;
+	if _fc_max_seg == 1:
+		var p0_1: Vector3 = _sample_fc_well_pos(well_idx, 0, 0, 0.0);
+		var p1_1: Vector3 = _sample_fc_well_pos(well_idx, 1, 1, 0.0);
+		return (p1_1 - p0_1) * inv_timeline_dt;
+	if seg_idx <= 0:
+		var p0: Vector3 = _sample_fc_well_pos(well_idx, 0, 0, 0.0);
+		var p1: Vector3 = _sample_fc_well_pos(well_idx, 1, 1, 0.0);
+		var p2: Vector3 = _sample_fc_well_pos(well_idx, 2, 2, 0.0);
+		return (-1.5 * p0 + 2.0 * p1 - 0.5 * p2) * inv_timeline_dt;
+	if seg_idx >= _fc_max_seg:
+		var pn: Vector3 = _sample_fc_well_pos(well_idx, _fc_max_seg, _fc_max_seg, 0.0);
+		var pn1: Vector3 = _sample_fc_well_pos(well_idx, _fc_max_seg - 1, _fc_max_seg - 1, 0.0);
+		var pn2: Vector3 = _sample_fc_well_pos(well_idx, _fc_max_seg - 2, _fc_max_seg - 2, 0.0);
+		return (1.5 * pn - 2.0 * pn1 + 0.5 * pn2) * inv_timeline_dt;
+	var p_prev: Vector3 = _sample_fc_well_pos(well_idx, seg_idx - 1, seg_idx - 1, 0.0);
+	var p_next: Vector3 = _sample_fc_well_pos(well_idx, seg_idx + 1, seg_idx + 1, 0.0);
+	return (p_next - p_prev) * (0.5 * inv_timeline_dt);
+
+
+## Samples interpolated 2nd-order local velocity of [param well_idx] at `idx_a + frac`.
+func _sample_fc_well_vel(
+		well_idx: int,
+		idx_a: int,
+		frac: float,
+		inv_timeline_dt: float
+) -> Vector3:
+	if well_idx <= 0 or well_idx >= _fc_well_count or _fc_max_seg <= 0:
+		return Vector3.ZERO;
+	var va: Vector3 = _sample_fc_well_knot_vel(well_idx, idx_a, inv_timeline_dt);
+	var idx_b: int = mini(idx_a + 1, _fc_max_seg);
+	if idx_a == idx_b or frac <= 0.0:
+		return va;
+	return va.lerp(_sample_fc_well_knot_vel(well_idx, idx_b, inv_timeline_dt), frac);
+
+
+## Returns [member JrBallisticForecastConfig.prebuilt_wells] when populated by [JrOrbitDriver],
+## or builds the ordered gravity-well list from [param config].
+func _resolve_forecast_well_list(config: JrBallisticForecastConfig) -> Array[JrOrreryElement]:
+	if not config.prebuilt_wells.is_empty():
+		return config.prebuilt_wells;
+	return _build_forecast_well_list(config);
 
 
 ## Builds the ordered list of all gravity-well elements (root driver at index 0,
@@ -3745,39 +4696,126 @@ func _evaluate_well_inertial_origin_at(
 	return origin;
 
 
-## Pre-samples parent-relative positions, gravitational parameters, parent well indices,
-## and Hill-sphere switch radii across [code]segments + 1[/code] uniform timestamps.
-func _sample_well_timeline(
-		config: JrBallisticForecastConfig,
-		well_list: Array[JrOrreryElement],
-		max_duration: float,
-		segments: int
-) -> PackedFloat32Array:
-	var well_count: int = well_list.size();
-	if well_count == 0:
-		return PackedFloat32Array();
-
-	var well_mu := PackedFloat32Array();
-	var well_parent_float := PackedFloat32Array();
-	var well_entry_ratio := PackedFloat32Array();
-	var well_exit_ratio := PackedFloat32Array();
-	var eff_mu_by_idx := PackedFloat32Array();
-	well_mu.resize(well_count);
-	well_parent_float.resize(well_count);
-	well_entry_ratio.resize(well_count);
-	well_exit_ratio.resize(well_count);
-	eff_mu_by_idx.resize(well_count);
-	eff_mu_by_idx[0] = (
-			config.driver_element.get_effective_parent_mu()
-			if config.driver_element != null
-			else config.driver_gravity_strength
+## Computes a compact floating-point signature of [param orb]'s Keplerian orbital elements
+## to detect runtime rail mutations and invalidate [member _tl_grid_v4s].
+static func _compute_well_orbital_sig(orb: JrRailOrbiter) -> float:
+	return (
+			orb.periapsis * 1.0001
+			+ orb.eccentricity * 13.0007
+			+ orb.mean_motion * 7.0003
+			+ orb.mean_anomaly_at_epoch * 3.0011
+			+ orb.inclination * 5.0013
+			+ orb.argument_of_periapsis * 11.0017
+			+ orb.longitude_of_the_ascending_node * 17.0019
 	);
+
+
+## Validates or rebuilds the static per-well `mu`, parent index, and Hill-radius multipliers
+## cached for [method _sample_well_timeline_bytes].
+func _ensure_timeline_well_cache(
+		config: JrBallisticForecastConfig,
+		well_list: Array[JrOrreryElement]
+) -> void:
+	var well_count: int = well_list.size();
+	var has_prebuilt: bool = not config.prebuilt_wells.is_empty();
+	var cache_valid: bool = (
+			_tl_cached_wells.size() == well_count
+			and _tl_well_mu_f64.size() == well_count
+			and _tl_well_orbital_sig.size() == well_count
+			and _tl_cached_driver_mu == config.driver_gravity_strength
+			and _tl_cached_ref_plane == config.reference_plane
+	);
+	if cache_valid:
+		if well_count > 0 and _tl_cached_wells[0] != well_list[0]:
+			cache_valid = false;
+		for w: int in range(1, well_count):
+			if not cache_valid:
+				break;
+			var orb := well_list[w] as JrRailOrbiter;
+			if orb != _tl_cached_wells[w] or orb.needs_nu_spline_bake():
+				cache_valid = false;
+				break;
+			var partner_flag: int = 1 if orb.binary_partner != null else 0;
+			var fast_flag: int = (
+					1
+					if (
+							orb._has_ref_frame_cache
+							and (config.reference_plane == null or config.reference_plane == orb._reference_plane)
+					)
+					else 0
+			);
+			var p_elem: JrOrreryElement = (
+					orb._tracked_scene_parent
+					if (has_prebuilt and orb._tracked_scene_parent != null)
+					else config.orbiter_parents.get(orb, config.driver_element)
+			);
+			var p_idx: int = (
+					p_elem._runtime_well_index
+					if (p_elem != null and p_elem._runtime_well_index >= 0 and p_elem._runtime_well_index < w)
+					else 0
+			);
+			if (
+					partner_flag != _tl_cached_has_partner[w]
+					or fast_flag != _tl_use_fast_pos[w]
+					or float(p_idx) != _tl_well_parent_float[w]
+					or orb.get_gravity_strength() != _tl_well_mu_f64[w]
+					or _compute_well_orbital_sig(orb) != _tl_well_orbital_sig[w]
+			):
+				cache_valid = false;
+				break;
+
+	if cache_valid:
+		return;
+
+	_tl_grid_valid = false;
+	_tl_grid_bytes = PackedByteArray();
+	_tl_cached_wells = well_list.duplicate();
+	_tl_cached_driver_mu = config.driver_gravity_strength;
+	_tl_cached_ref_plane = config.reference_plane;
+	_tl_cached_has_partner.resize(well_count);
+	_tl_well_mu.resize(well_count);
+	_tl_well_mu_f64.resize(well_count);
+	_tl_well_parent_float.resize(well_count);
+	_tl_well_entry_ratio.resize(well_count);
+	_tl_well_exit_ratio.resize(well_count);
+	_tl_use_fast_pos.resize(well_count);
+	_tl_well_orbital_sig.resize(well_count);
+	_tl_max_mean_n = 0.0;
+
+	var eff_mu_by_idx := PackedFloat32Array();
+	var unbaked_wells: Array[JrRailOrbiter] = [];
+	eff_mu_by_idx.resize(well_count);
+	if well_count > 0:
+		_tl_well_mu[0] = config.driver_gravity_strength;
+		_tl_well_mu_f64[0] = config.driver_gravity_strength;
+		_tl_well_parent_float[0] = -1.0;
+		_tl_well_entry_ratio[0] = 0.0;
+		_tl_well_exit_ratio[0] = 0.0;
+		_tl_use_fast_pos[0] = 0;
+		_tl_cached_has_partner[0] = 0;
+		_tl_well_orbital_sig[0] = 0.0;
+		eff_mu_by_idx[0] = (
+				config.driver_element.get_effective_parent_mu()
+				if config.driver_element != null
+				else config.driver_gravity_strength
+		);
 
 	for w: int in range(1, well_count):
 		var orbiter := well_list[w] as JrRailOrbiter;
+		if orbiter._reference_plane == null and config.reference_plane != null:
+			orbiter.set_reference_plane(config.reference_plane);
+		if orbiter.needs_nu_spline_bake():
+			unbaked_wells.append(orbiter);
+		_tl_cached_has_partner[w] = 1 if orbiter.binary_partner != null else 0;
+		_tl_well_orbital_sig[w] = _compute_well_orbital_sig(orbiter);
+		_tl_max_mean_n = maxf(_tl_max_mean_n, orbiter.mean_motion);
 		eff_mu_by_idx[w] = orbiter.get_effective_parent_mu();
 		var mu: float = orbiter.get_gravity_strength();
-		var parent_elem: JrOrreryElement = config.orbiter_parents.get(orbiter, config.driver_element);
+		var parent_elem: JrOrreryElement = (
+				orbiter._tracked_scene_parent
+				if (has_prebuilt and orbiter._tracked_scene_parent != null)
+				else config.orbiter_parents.get(orbiter, config.driver_element)
+		);
 		var parent_idx: int = (
 				parent_elem._runtime_well_index
 				if (
@@ -3793,50 +4831,205 @@ func _sample_well_timeline(
 				if (mu > 0.0 and parent_mu > 0.0)
 				else 0.0
 		);
-		well_mu[w] = mu;
-		well_parent_float[w] = float(parent_idx);
-		well_entry_ratio[w] = cube_root_ratio * HILL_ENTRY_MULTIPLIER;
-		well_exit_ratio[w] = cube_root_ratio * HILL_EXIT_MULTIPLIER;
+		_tl_well_mu[w] = mu;
+		_tl_well_mu_f64[w] = mu;
+		_tl_well_parent_float[w] = float(parent_idx);
+		_tl_well_entry_ratio[w] = cube_root_ratio * HILL_ENTRY_MULTIPLIER;
+		_tl_well_exit_ratio[w] = cube_root_ratio * HILL_EXIT_MULTIPLIER;
+
+	if not unbaked_wells.is_empty():
+		bake_rail_splines(unbaked_wells);
+
+	for w: int in range(1, well_count):
+		var orbiter := well_list[w] as JrRailOrbiter;
+		_tl_use_fast_pos[w] = (
+				1
+				if (
+						orbiter._has_ref_frame_cache
+						and (config.reference_plane == null or config.reference_plane == orbiter._reference_plane)
+				)
+				else 0
+		);
+
+
+## Evaluates and writes `[idx_range.x .. idx_range.y]` grid rows into [member _tl_grid_v4s] at [param step_dt].
+func _populate_timeline_grid_range(
+		config: JrBallisticForecastConfig,
+		well_list: Array[JrOrreryElement],
+		idx_range: Vector2i,
+		step_dt: float
+) -> void:
+	var well_count: int = well_list.size();
+	var cull_sq: float = _tl_grid_cull_sq;
+	var root_v0 := Vector4(0.0, 0.0, 0.0, config.driver_gravity_strength);
+	var root_v1 := Vector4(0.0, 0.0, -1.0, cull_sq);
+	var grid_v4s: PackedVector4Array = _tl_grid_v4s;
+	_tl_grid_v4s = PackedVector4Array();
+	var v_idx: int = (idx_range.x - _tl_grid_start_idx) * well_count * 2;
+
+	for g_idx: int in range(idx_range.x, idx_range.y + 1):
+		var eval_time: float = float(g_idx) * step_dt;
+		grid_v4s[v_idx] = root_v0;
+		grid_v4s[v_idx + 1] = root_v1;
+		v_idx += 2;
+		for w: int in range(1, well_count):
+			var orbiter := well_list[w] as JrRailOrbiter;
+			var local_pos: Vector3 = (
+					orbiter.sample_local_position_fast(eval_time)
+					if _tl_use_fast_pos[w] != 0
+					else orbiter.get_relative_position(eval_time, config.reference_plane)
+			);
+			var e_ratio: float = _tl_well_entry_ratio[w];
+			var dist: float = local_pos.length() if e_ratio > 0.0 else 0.0;
+			grid_v4s[v_idx] = Vector4(local_pos.x, local_pos.y, local_pos.z, _tl_well_mu[w]);
+			grid_v4s[v_idx + 1] = Vector4(
+					dist * e_ratio,
+					dist * _tl_well_exit_ratio[w],
+					_tl_well_parent_float[w],
+					cull_sq
+			);
+			v_idx += 2;
+
+	_tl_grid_v4s = grid_v4s;
+	_tl_grid_bytes = grid_v4s.to_byte_array();
+	_tl_gpu_dirty = true;
+
+
+## Samples `well_samples` over a binary power-of-two timestamp grid (`step_dt = 2^k`), reusing
+## overlapping slices from [member _tl_grid_v4s] across staggered cohort refills.
+func _sample_tape_timeline_cached(
+		config: JrBallisticForecastConfig,
+		well_list: Array[JrOrreryElement]
+) -> PackedByteArray:
+	_ensure_timeline_well_cache(config, well_list);
+	var well_count: int = well_list.size();
+	var raw_end: float = (
+			config.timeline_end_time
+			if config.timeline_end_time > config.start_time
+			else (config.start_time + _resolve_tape_batch_duration(config))
+	);
+	var raw_dur: float = raw_end - config.start_time;
+	if well_count <= 1 or raw_dur <= 1e-9 or _tl_max_mean_n <= 1e-9:
+		var fallback_segs: int = _compute_adaptive_timeline_segments(config, well_list, raw_dur);
+		_tl_last_inv_dt = float(fallback_segs) / raw_dur if raw_dur > 1e-12 else 0.0;
+		return _sample_well_timeline_bytes(config, well_list, raw_dur, fallback_segs);
+
+	var max_step_rad: float = 0.03 if config.enable_forecasts else 0.05;
+	var desired_dt: float = max_step_rad / _tl_max_mean_n;
+	var exp2_val: float = floorf(log(maxf(1e-9, desired_dt)) / 0.6931471805599453);
+	var step_dt: float = pow(2.0, exp2_val);
+	var max_cap: int = clampi(65536 / maxi(1, well_count), 32, 1024);
+	var ref_span: float = maxf(raw_dur, 2.0);
+	while int(ceili(ref_span / step_dt)) + 2 > max_cap:
+		step_dt *= 2.0;
+
+	var inv_dt: float = 1.0 / step_dt;
+	if absf(config.start_time) * inv_dt > 1.0e8 or absf(raw_end) * inv_dt > 1.0e8:
+		var fb_segs: int = _compute_adaptive_timeline_segments(config, well_list, raw_dur);
+		_tl_last_inv_dt = float(fb_segs) / raw_dur if raw_dur > 1e-12 else 0.0;
+		return _sample_well_timeline_bytes(config, well_list, raw_dur, fb_segs);
+
+	var req_idx0: int = int(floor(config.start_time * inv_dt));
+	var req_idx1: int = maxi(req_idx0 + 8, int(ceil(raw_end * inv_dt)));
+	_tl_last_inv_dt = inv_dt;
 
 	var cull_sq: float = config.tidal_cull_threshold * config.tidal_cull_threshold;
-	var floats := PackedFloat32Array();
-	floats.resize((segments + 1) * well_count * FLOATS_PER_TIMELINE_WELL);
+	var row_stride: int = well_count * 2;
+	var lookahead: int = 256;
+	var max_window: int = maxi(req_idx1 - req_idx0 + lookahead, mini(max_cap, 768));
+
+	if _tl_grid_valid and _tl_grid_step_dt == step_dt and _tl_grid_cull_sq == cull_sq:
+		if req_idx0 >= _tl_grid_start_idx and req_idx1 <= _tl_grid_end_idx:
+			config.start_time = float(_tl_grid_start_idx) * step_dt;
+			return _tl_grid_bytes;
+		if (
+				req_idx0 >= _tl_grid_start_idx
+				and req_idx0 <= _tl_grid_end_idx
+				and req_idx1 > _tl_grid_end_idx
+				and (req_idx1 - _tl_grid_end_idx) <= 512
+		):
+			var prev_end: int = _tl_grid_end_idx;
+			var new_end: int = req_idx1 + lookahead;
+			var keep_start: int = maxi(_tl_grid_start_idx, mini(req_idx0, new_end - max_window));
+			var keep_v4s: PackedVector4Array = _tl_grid_v4s.slice(
+					(keep_start - _tl_grid_start_idx) * row_stride,
+					(prev_end - _tl_grid_start_idx + 1) * row_stride
+			);
+			keep_v4s.resize((new_end - keep_start + 1) * row_stride);
+			_tl_grid_start_idx = keep_start;
+			_tl_grid_end_idx = new_end;
+			_tl_grid_v4s = keep_v4s;
+			_populate_timeline_grid_range(config, well_list, Vector2i(prev_end + 1, new_end), step_dt);
+			config.start_time = float(_tl_grid_start_idx) * step_dt;
+			return _tl_grid_bytes;
+
+	var full_end: int = req_idx1 + lookahead;
+	_tl_grid_valid = true;
+	_tl_grid_step_dt = step_dt;
+	_tl_grid_cull_sq = cull_sq;
+	_tl_grid_start_idx = req_idx0;
+	_tl_grid_end_idx = full_end;
+	_tl_grid_v4s.resize((full_end - req_idx0 + 1) * row_stride);
+	_populate_timeline_grid_range(config, well_list, Vector2i(req_idx0, full_end), step_dt);
+	config.start_time = float(_tl_grid_start_idx) * step_dt;
+	return _tl_grid_bytes;
+
+
+## Pre-samples parent-relative positions, gravitational parameters, parent well indices,
+## and Hill-sphere switch radii across `segments + 1` uniform timestamps directly as raw bytes.
+func _sample_well_timeline_bytes(
+		config: JrBallisticForecastConfig,
+		well_list: Array[JrOrreryElement],
+		max_duration: float,
+		segments: int
+) -> PackedByteArray:
+	var well_count: int = well_list.size();
+	if well_count == 0:
+		return PackedByteArray();
+
+	_ensure_timeline_well_cache(config, well_list);
+
+	var cull_sq: float = config.tidal_cull_threshold * config.tidal_cull_threshold;
+	var root_v0 := Vector4(0.0, 0.0, 0.0, config.driver_gravity_strength);
+	var root_v1 := Vector4(0.0, 0.0, -1.0, cull_sq);
+	var vec4s: PackedVector4Array = _tl_vec4s;
+	_tl_vec4s = PackedVector4Array();
+	var req_v4s: int = (segments + 1) * well_count * 2;
+	if vec4s.size() != req_v4s:
+		vec4s.resize(req_v4s);
+
 	var step_time: float = max_duration / float(segments);
-	var write_idx: int = 0;
+	var v_idx: int = 0;
 
 	for seg_idx: int in range(segments + 1):
 		var eval_time: float = config.start_time + step_time * float(seg_idx);
-
-		floats[write_idx] = 0.0;
-		floats[write_idx + 1] = 0.0;
-		floats[write_idx + 2] = 0.0;
-		floats[write_idx + 3] = config.driver_gravity_strength;
-		floats[write_idx + 4] = 0.0;
-		floats[write_idx + 5] = 0.0;
-		floats[write_idx + 6] = -1.0;
-		floats[write_idx + 7] = cull_sq;
-		write_idx += FLOATS_PER_TIMELINE_WELL;
+		vec4s[v_idx] = root_v0;
+		vec4s[v_idx + 1] = root_v1;
+		v_idx += 2;
 
 		for w: int in range(1, well_count):
 			var orbiter := well_list[w] as JrRailOrbiter;
-			var local_pos: Vector3 = orbiter.get_relative_position(
-					eval_time,
-					config.reference_plane
+			var local_pos: Vector3 = (
+					orbiter.sample_local_position_fast(eval_time)
+					if _tl_use_fast_pos[w] != 0
+					else orbiter.get_relative_position(eval_time, config.reference_plane)
 			);
-			var e_ratio: float = well_entry_ratio[w];
+			var e_ratio: float = _tl_well_entry_ratio[w];
 			var dist: float = local_pos.length() if e_ratio > 0.0 else 0.0;
+			vec4s[v_idx] = Vector4(local_pos.x, local_pos.y, local_pos.z, _tl_well_mu[w]);
+			vec4s[v_idx + 1] = Vector4(
+					dist * e_ratio,
+					dist * _tl_well_exit_ratio[w],
+					_tl_well_parent_float[w],
+					cull_sq
+			);
+			v_idx += 2;
 
-			floats[write_idx] = local_pos.x;
-			floats[write_idx + 1] = local_pos.y;
-			floats[write_idx + 2] = local_pos.z;
-			floats[write_idx + 3] = well_mu[w];
-			floats[write_idx + 4] = dist * e_ratio;
-			floats[write_idx + 5] = dist * well_exit_ratio[w];
-			floats[write_idx + 6] = well_parent_float[w];
-			floats[write_idx + 7] = cull_sq;
-			write_idx += FLOATS_PER_TIMELINE_WELL;
-
-	return floats;
+	var out_bytes: PackedByteArray = vec4s.to_byte_array();
+	_tl_vec4s = vec4s;
+	_tl_grid_valid = false;
+	_tl_gpu_dirty = true;
+	return out_bytes;
 
 
 ## Samples all active gravity wells in [param config] at timestamp [param eval_time].

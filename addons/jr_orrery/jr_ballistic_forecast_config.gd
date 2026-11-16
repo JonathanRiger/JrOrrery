@@ -74,3 +74,10 @@ var job_loop_periods: PackedFloat64Array = PackedFloat64Array();
 ## Total tracked [JrBallisticOrbiter] count on the owning [JrOrbitDriver] (`> 0` enables resident GPU tape-atlas writes).
 var total_driver_bodies: int = 0;
 
+## Whether runtime polyline forecasting (`enable_ballistic_forecasts`) is active on the owning [JrOrbitDriver].
+var enable_forecasts: bool = false;
+
+## Optional pre-validated ordered gravity-well list from [JrOrbitDriver] (`[driver, ...orbiters]`).
+var prebuilt_wells: Array[JrOrreryElement] = [];
+
+

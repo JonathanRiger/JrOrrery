@@ -29,7 +29,10 @@ enum PerspectiveRotationMode {
 const HILL_ENTRY_MULTIPLIER: float = 0.98
 
 ## Hysteresis multiplier on the current anchor's Hill radius for exiting to its parent well.
-const HILL_EXIT_MULTIPLIER: float = 1.05
+const HILL_EXIT_MULTIPLIER: float = 1.05;
+
+## Number of staggered trajectory-tape refill cohorts partitioning [member _ballistic_sequence].
+const TAPE_COHORT_COUNT: int = 64;
 
 @export_group("Reference Frame")
 ## Euler rotation of the reference frame from the default orientation
@@ -282,17 +285,65 @@ var _ballistic_tapes: Array[JrBallisticTrajectoryTape] = [];
 ## Shared 2-float `[eval_time, pass_id]` cell supplied downward to tracked [JrBallisticOrbiter] nodes.
 var _sampled_time_cell: PackedFloat64Array = PackedFloat64Array([0.0, 0.0]);
 
-## 4-bucket staggered refill cohort lists partitioning [member _ballistic_sequence].
-var _tape_cohorts: Array[Array] = [[], [], [], []];
+## Shared single-element holder `[PackedVector3Array]` exposing GPU-sampled positions to tracked [JrBallisticOrbiter] nodes.
+var _sampled_pos_holder: Array = [PackedVector3Array()];
+
+## 64-bucket staggered refill cohort lists partitioning [member _ballistic_sequence].
+var _tape_cohorts: Array[Array] = [
+	[], [], [], [], [], [], [], [],
+	[], [], [], [], [], [], [], [],
+	[], [], [], [], [], [], [], [],
+	[], [], [], [], [], [], [], [],
+	[], [], [], [], [], [], [], [],
+	[], [], [], [], [], [], [], [],
+	[], [], [], [], [], [], [], [],
+	[], [], [], [], [], [], [], [],
+];
 
 ## Earliest [member JrBallisticOrbiter._next_refill_time] per cohort in [member _tape_cohorts].
-var _cohort_min_refill: PackedFloat64Array = PackedFloat64Array([INF, INF, INF, INF]);
+var _cohort_min_refill: PackedFloat64Array = PackedFloat64Array([
+	INF, INF, INF, INF, INF, INF, INF, INF,
+	INF, INF, INF, INF, INF, INF, INF, INF,
+	INF, INF, INF, INF, INF, INF, INF, INF,
+	INF, INF, INF, INF, INF, INF, INF, INF,
+	INF, INF, INF, INF, INF, INF, INF, INF,
+	INF, INF, INF, INF, INF, INF, INF, INF,
+	INF, INF, INF, INF, INF, INF, INF, INF,
+	INF, INF, INF, INF, INF, INF, INF, INF,
+]);
 
 ## Absolute `dt` of the most recent steady-state forward trajectory-tape scheduling pass.
 var _last_schedule_abs_dt: float = 0.0;
 
 ## Sparse list of [JrBallisticOrbiter] nodes not currently in the root-parent/root-anchor fast sync state.
 var _non_root_sync_ballistics: Array[JrBallisticOrbiter] = [];
+
+## Preallocated batch job list reused across [_bake_scheduled_candidate_batch] calls.
+var _batch_jobs: Array[JrBallisticOrbiter] = [];
+
+## Preallocated SIMT coasting partition scratch buffer.
+var _batch_coasting_buf: Array[JrBallisticOrbiter] = [];
+
+## Preallocated SIMT perturbed partition scratch buffer.
+var _batch_perturbed_buf: Array[JrBallisticOrbiter] = [];
+
+## Preallocated per-job start timestamps reused across [_bake_scheduled_candidate_batch] calls.
+var _batch_start_times := PackedFloat64Array();
+
+## Preallocated per-job knot intervals reused across [_bake_scheduled_candidate_batch] calls.
+var _batch_knot_dts := PackedFloat32Array();
+
+## Preallocated per-job step counts reused across [_bake_scheduled_candidate_batch] calls.
+var _batch_step_counts := PackedInt32Array();
+
+## Preallocated per-job substep counts reused across [_bake_scheduled_candidate_batch] calls.
+var _batch_substeps := PackedInt32Array();
+
+## Preallocated per-job append modes reused across [_bake_scheduled_candidate_batch] calls.
+var _batch_modes := PackedByteArray();
+
+## Preallocated per-job loop periods reused across [_bake_scheduled_candidate_batch] calls.
+var _batch_loop_periods := PackedFloat64Array();
 
 ## Sparse list of tracked [JrBallisticOrbiter] nodes with [member JrBallisticOrbiter.runtime_forecast_enabled] set.
 var _forecast_enabled_ballistics: Array[JrBallisticOrbiter] = [];
@@ -416,6 +467,9 @@ var _tip_common_id: int = 0;
 
 ## Cached synodic inverse rotation bases across the active forecast grid.
 var _fc_proj_synodic_bases: Array[Basis] = [];
+
+## Pending batch jobs awaiting deferred finalization after an asynchronous GPU bake+sample pass.
+var _pending_gpu_finalize_jobs: Array[JrBallisticOrbiter] = [];
 
 ## Cached common ancestor gravity well per forecast well index.
 var _fc_proj_well_common: Array[JrOrreryElement] = [];
@@ -552,8 +606,11 @@ func end_batch_updates() -> void:
 		_persp_cache_epoch += 1;
 		_pending_ballistic_init = true;
 		_ballistic_anchors_dirty = true;
+		if not _ballistic_sequence.is_empty():
+			_rebuild_ballistic_tape_cohorts();
+			_recompute_tape_schedule_bounds();
 		_ballistic_solver.invalidate_resident_step_buffer();
-		_ballistic_solver.invalidate_tape_atlas();
+		_invalidate_solver_tape_atlas_safely();
 		_propagate_units_and_parent_mu();
 		update_orbits();
 
@@ -689,14 +746,14 @@ func update_orbits() -> void:
 	_local_orbital_transform = driver_system_transform;
 	_driver_relative_transform = Transform3D.IDENTITY;
 	_system_transform = driver_system_transform;
-	emit_signal(&"transform_updated");
+	transform_updated.emit();
 
 	if _persp_is_heliocentric and is_identity_basis:
 		var r_seq: Array[JrRailOrbiter] = _orbit_sequence;
 		for r_idx: int in range(r_seq.size()):
 			var orbiter: JrRailOrbiter = r_seq[r_idx];
 			orbiter._system_transform = orbiter._driver_relative_transform;
-			orbiter.emit_signal(&"transform_updated");
+			orbiter.transform_updated.emit();
 	else:
 		var r_seq: Array[JrRailOrbiter] = _orbit_sequence;
 		for r_idx: int in range(r_seq.size()):
@@ -714,7 +771,7 @@ func update_orbits() -> void:
 						persp_basis * drv_xf.basis,
 						persp_basis * rel_pos
 				);
-			orbiter.emit_signal(&"transform_updated");
+			orbiter.transform_updated.emit();
 
 	if not Engine.is_editor_hint():
 		_update_runtime_ballistic_forecasts(persp_basis);
@@ -722,12 +779,19 @@ func update_orbits() -> void:
 	var use_direct_ballistic_xf: bool = _persp_is_heliocentric and is_identity_basis;
 	_sync_ballistic_direct_system_xf_flag(use_direct_ballistic_xf);
 	if use_direct_ballistic_xf:
+		if not _ballistic_sequence.is_empty() and (
+				not _non_root_sync_ballistics.is_empty()
+				or _ballistic_sequence[0].has_connections(&"transform_updated")
+		):
+			_flush_pending_gpu_tape_sample();
 		for nr_idx: int in range(_non_root_sync_ballistics.size()):
 			var nr_b: JrBallisticOrbiter = _non_root_sync_ballistics[nr_idx];
 			nr_b._system_transform = nr_b._driver_relative_transform;
 		for i: int in range(_ballistic_sequence.size()):
-			_ballistic_sequence[i].emit_signal(&"transform_updated");
+			_ballistic_sequence[i].transform_updated.emit();
+		_flush_pending_gpu_tape_sample();
 	else:
+		_flush_pending_gpu_tape_sample();
 		for ballistic: JrBallisticOrbiter in _ballistic_sequence:
 			var rel_pos: Vector3 = _lookup_ballistic_perspective_offset(ballistic);
 			var drv_basis: Basis = ballistic._driver_relative_basis;
@@ -738,7 +802,7 @@ func update_orbits() -> void:
 						persp_basis * drv_basis,
 						persp_basis * rel_pos
 				);
-			ballistic.emit_signal(&"transform_updated");
+			ballistic.transform_updated.emit();
 
 	if Engine.is_editor_hint():
 		_update_editor_ghosts();
@@ -828,11 +892,32 @@ func invalidate_all_ballistic_trajectories() -> void:
 	_persp_cache_epoch += 1;
 	_earliest_tape_refill_time = -INF;
 	_last_schedule_abs_dt = 0.0;
-	_cohort_min_refill = PackedFloat64Array([-INF, -INF, -INF, -INF]);
-	_ballistic_solver.invalidate_tape_atlas();
+	_reset_cohort_min_refill(-INF);
 	for ballistic: JrBallisticOrbiter in _ballistic_sequence:
 		ballistic.invalidate_trajectory();
 		_queue_dirty_trajectory_ballistic(ballistic);
+	_ballistic_solver.invalidate_tape_atlas();
+
+
+## Materializes any GPU-atlas-only tapes back to CPU memory before invalidating the solver atlas.
+func _invalidate_solver_tape_atlas_safely() -> void:
+	if _ballistic_solver.has_valid_tape_atlas() and not _ballistic_tapes.is_empty():
+		_ballistic_solver.materialize_all_tapes_from_gpu_atlas(_ballistic_tapes);
+	_ballistic_solver.invalidate_tape_atlas();
+
+
+## Resets all [constant TAPE_COHORT_COUNT] entries in [member _cohort_min_refill] to [param fill_val].
+func _reset_cohort_min_refill(fill_val: float) -> void:
+	_cohort_min_refill.resize(TAPE_COHORT_COUNT);
+	_cohort_min_refill.fill(fill_val);
+
+
+## Returns the minimum refill timestamp across all [constant TAPE_COHORT_COUNT] entries in [member _cohort_min_refill].
+func _min_across_cohort_refills() -> float:
+	var min_t: float = INF;
+	for c: int in range(TAPE_COHORT_COUNT):
+		min_t = minf(min_t, _cohort_min_refill[c]);
+	return min_t;
 
 
 ## Attaches or detaches a [JrOrreryTelemetry] collector for microsecond profiling of this driver
@@ -1032,13 +1117,24 @@ func _evaluate_runtime_system_state(playing: bool) -> void:
 			):
 				_schedule_and_bake_trajectory_tapes(0.0, prev_local_positions);
 		else:
+			var sampled_in_bake: bool = false;
 			if (
 					not _dirty_trajectory_ballistics.is_empty()
 					or time >= _earliest_tape_refill_time
 					or time < _latest_tape_start_time
 			):
-				_schedule_and_bake_trajectory_tapes(dt, prev_local_positions);
-			_sample_all_ballistics_from_tapes();
+				var want_fuse: bool = (
+						_ballistic_sequence.size() >= JrBallisticComputeSolver.MIN_GPU_TAPE_ATLAS_BODIES
+						and (_reference_plane == null or not _reference_plane.lock_to_ecliptic)
+						and _ballistic_solver.is_tape_sample_gpu_active()
+				);
+				sampled_in_bake = _schedule_and_bake_trajectory_tapes(
+						dt,
+						prev_local_positions,
+						want_fuse
+				);
+			if not sampled_in_bake:
+				_sample_all_ballistics_from_tapes();
 
 	_last_stepped_time = time;
 	_sync_all_ballistics_transforms(playing);
@@ -1124,17 +1220,17 @@ func _apply_driver_and_rail_system_transforms_instrumented() -> Basis:
 	var t_math1: int = Time.get_ticks_usec();
 
 	_system_transform = driver_system_transform;
-	emit_signal(&"transform_updated");
+	transform_updated.emit();
 	if use_direct_driver_xf:
 		for i: int in range(rail_count):
 			var orbiter: JrRailOrbiter = r_seq[i];
 			orbiter._system_transform = orbiter._driver_relative_transform;
-			orbiter.emit_signal(&"transform_updated");
+			orbiter.transform_updated.emit();
 	else:
 		for i: int in range(rail_count):
 			var orbiter: JrRailOrbiter = r_seq[i];
 			orbiter._system_transform = rail_transforms[i];
-			orbiter.emit_signal(&"transform_updated");
+			orbiter.transform_updated.emit();
 	var t_sig1: int = Time.get_ticks_usec();
 
 	_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_SYSTEM_LCA_MATH, t_math1 - t_math0);
@@ -1154,6 +1250,9 @@ func _apply_ballistic_system_transforms_instrumented(persp_basis: Basis) -> void
 	var is_identity_basis: bool = (persp_basis == Basis.IDENTITY);
 	var use_direct_driver_xf: bool = _persp_is_heliocentric and is_identity_basis;
 	_sync_ballistic_direct_system_xf_flag(use_direct_driver_xf);
+	if not use_direct_driver_xf or not _non_root_sync_ballistics.is_empty() or b_seq[0].has_connections(&"transform_updated"):
+		_flush_pending_gpu_tape_sample();
+		t_math0 = Time.get_ticks_usec();
 	var ballistic_transforms: Array[Transform3D] = [];
 	if use_direct_driver_xf:
 		for nr_idx: int in range(_non_root_sync_ballistics.size()):
@@ -1176,16 +1275,17 @@ func _apply_ballistic_system_transforms_instrumented(persp_basis: Basis) -> void
 
 	if use_direct_driver_xf:
 		for i: int in range(b_count):
-			b_seq[i].emit_signal(&"transform_updated");
+			b_seq[i].transform_updated.emit();
 	else:
 		for i: int in range(b_count):
 			var ballistic: JrBallisticOrbiter = b_seq[i];
 			ballistic._system_transform = ballistic_transforms[i];
-			ballistic.emit_signal(&"transform_updated");
+			ballistic.transform_updated.emit();
 	var t_sig1: int = Time.get_ticks_usec();
 
 	_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_SYSTEM_LCA_MATH, t_math1 - t_math0);
 	_telemetry.add_phase_usec(JrOrreryTelemetry.PHASE_TRANSFORM_SIGNAL_EMIT, t_sig1 - t_math1);
+	_flush_pending_gpu_tape_sample();
 
 
 ## Broadcasts [param use_direct_xf] downward to tracked ballistics only when perspective mode changes.
@@ -1326,18 +1426,29 @@ func _evaluate_runtime_system_state_instrumented(playing: bool) -> void:
 			):
 				_schedule_and_bake_trajectory_tapes(0.0, prev_local_positions);
 		else:
+			var sampled_in_bake: bool = false;
 			if (
 					not _dirty_trajectory_ballistics.is_empty()
 					or time >= _earliest_tape_refill_time
 					or time < _latest_tape_start_time
 			):
-				_schedule_and_bake_trajectory_tapes(dt, prev_local_positions);
-			var t_samp0: int = Time.get_ticks_usec();
-			_sample_all_ballistics_from_tapes();
-			_telemetry.add_phase_usec(
-					JrOrreryTelemetry.PHASE_BALLISTIC_ANCHOR_POST,
-					Time.get_ticks_usec() - t_samp0
-			);
+				var want_fuse: bool = (
+						_ballistic_sequence.size() >= JrBallisticComputeSolver.MIN_GPU_TAPE_ATLAS_BODIES
+						and (_reference_plane == null or not _reference_plane.lock_to_ecliptic)
+						and _ballistic_solver.is_tape_sample_gpu_active()
+				);
+				sampled_in_bake = _schedule_and_bake_trajectory_tapes(
+						dt,
+						prev_local_positions,
+						want_fuse
+				);
+			if not sampled_in_bake:
+				var t_samp0: int = Time.get_ticks_usec();
+				_sample_all_ballistics_from_tapes();
+				_telemetry.add_phase_usec(
+						JrOrreryTelemetry.PHASE_BALLISTIC_ANCHOR_POST,
+						Time.get_ticks_usec() - t_samp0
+				);
 
 	_last_stepped_time = time;
 	var t_sync0: int = Time.get_ticks_usec();
@@ -1477,8 +1588,11 @@ func _sync_all_ballistics_transforms(_playing: bool) -> void:
 	var nr_count: int = _non_root_sync_ballistics.size();
 	if nr_count == 0:
 		return;
+	_flush_pending_gpu_tape_sample();
 
 	var self_elem: JrOrreryElement = self;
+	var cur_pass: float = _sampled_time_cell[1];
+	var pos_vecs: PackedVector3Array = _sampled_pos_holder[0] as PackedVector3Array;
 	var write_idx: int = 0;
 
 	for r: int in range(nr_count):
@@ -1488,53 +1602,14 @@ func _sync_all_ballistics_transforms(_playing: bool) -> void:
 				ballistic._in_non_root_sync_list = false;
 			continue;
 
-		var scene_parent: JrOrreryElement = ballistic._tracked_scene_parent;
-		if (
-				(scene_parent != self_elem and scene_parent != null)
-				or ballistic._driver_basis_dirty
-				or not ballistic._parent_basis_is_identity
-		):
+		var sync_res: int = ballistic.sync_non_root_fast(self_elem, cur_pass, pos_vecs);
+		if sync_res == 2:
+			continue;
+		if sync_res == 0:
 			_sync_single_ballistic_transforms(ballistic);
 			ballistic._in_non_root_sync_list = true;
-			_non_root_sync_ballistics[write_idx] = ballistic;
-			write_idx += 1;
-			continue;
-
-		var anchor: JrOrreryElement = ballistic._anchor_element;
-		if anchor != null and anchor != self_elem and anchor._owning_driver == self_elem:
-			var anchor_pos: Vector3 = anchor.get_driver_relative_transform().origin;
-			var anchor_vel: Vector3 = anchor.get_global_velocity();
-			var pos: Vector3 = anchor_pos + ballistic._anchor_relative_position;
-			ballistic._last_parent_origin = Vector3.ZERO;
-			ballistic._last_parent_velocity = Vector3.ZERO;
-			ballistic._anchor_to_parent_offset = anchor_pos;
-			ballistic._anchor_to_parent_velocity = anchor_vel;
-			ballistic._last_anchor_origin = anchor_pos;
-			ballistic._last_anchor_velocity = anchor_vel;
-			ballistic._root_zero_offsets_cached = false;
-			var xf := Transform3D(ballistic._driver_relative_basis, pos);
-			ballistic._focus_relative_position = pos;
-			ballistic._inertial_position = pos;
-			if not ballistic.is_tape_velocity_pending():
-				var vel: Vector3 = anchor_vel + ballistic._anchor_relative_velocity;
-				ballistic._relative_velocity = vel;
-				ballistic._global_velocity = vel;
-			ballistic._local_orbital_transform = xf;
-			ballistic._driver_relative_transform = xf;
-			ballistic._in_non_root_sync_list = true;
-			_non_root_sync_ballistics[write_idx] = ballistic;
-			write_idx += 1;
-		else:
-			if not ballistic._root_zero_offsets_cached:
-				ballistic._last_parent_origin = Vector3.ZERO;
-				ballistic._last_parent_velocity = Vector3.ZERO;
-				ballistic._anchor_to_parent_offset = Vector3.ZERO;
-				ballistic._anchor_to_parent_velocity = Vector3.ZERO;
-				ballistic._last_anchor_origin = Vector3.ZERO;
-				ballistic._last_anchor_velocity = Vector3.ZERO;
-				ballistic._root_zero_offsets_cached = true;
-			ballistic._in_non_root_sync_list = false;
-			ballistic._fast_root_sync_ready = true;
+		_non_root_sync_ballistics[write_idx] = ballistic;
+		write_idx += 1;
 
 	if write_idx != nr_count:
 		_non_root_sync_ballistics.resize(write_idx);
@@ -1820,6 +1895,8 @@ func _try_compute_periodic_loop_period(ballistic: JrBallisticOrbiter) -> float:
 	if mu_anchor <= 0.0:
 		return 0.0;
 
+	if ballistic.is_tape_position_pending():
+		ballistic.ensure_tape_position();
 	if ballistic.is_tape_velocity_pending():
 		ballistic.ensure_tape_velocity();
 	var r_vec: Vector3 = ballistic._anchor_relative_position;
@@ -1885,11 +1962,13 @@ func _does_orbit_overlap_well_soi(anchor_idx: int, r_peri: float, r_apo: float) 
 
 
 ## Schedules and executes batched GPU/CPU trajectory-horizon bakes for dirty, expiring,
-## scrubbed, or reverse-stepping [JrBallisticOrbiter] cohorts.
+## scrubbed, or reverse-stepping [JrBallisticOrbiter] cohorts. Returns `true` when all bodies
+## were also sampled at [member time] via a fused single-submit GPU pass.
 func _schedule_and_bake_trajectory_tapes(
 		dt: float,
-		prev_local_positions: Dictionary[JrRailOrbiter, Vector3]
-) -> void:
+		prev_local_positions: Dictionary[JrRailOrbiter, Vector3],
+		fuse_gpu_sample: bool = false
+) -> bool:
 	if dt < 0.0:
 		_handle_reverse_time_tapes(dt, prev_local_positions);
 
@@ -1918,39 +1997,93 @@ func _schedule_and_bake_trajectory_tapes(
 			_bridge_integrate_bodies_to_now(bridge_bodies);
 
 	var candidates: Array[JrBallisticOrbiter] = _collect_scheduled_tape_candidates(dt, abs_dt);
+	var did_fuse_sample: bool = false;
+	if enable_ballistic_forecasts and not candidates.is_empty():
+		var fc_candidates: Array[JrBallisticOrbiter] = [];
+		var active_candidates: Array[JrBallisticOrbiter] = [];
+		for i: int in range(candidates.size()):
+			var c_body: JrBallisticOrbiter = candidates[i];
+			if c_body.runtime_forecast_enabled:
+				fc_candidates.append(c_body);
+			else:
+				active_candidates.append(c_body);
+		if not fc_candidates.is_empty() and not active_candidates.is_empty():
+			_bake_scheduled_candidate_batch(fc_candidates, dt, false);
+			did_fuse_sample = _bake_scheduled_candidate_batch(
+					active_candidates,
+					dt,
+					fuse_gpu_sample
+			);
+		else:
+			did_fuse_sample = _bake_scheduled_candidate_batch(candidates, dt, fuse_gpu_sample);
+	elif not candidates.is_empty():
+		did_fuse_sample = _bake_scheduled_candidate_batch(candidates, dt, fuse_gpu_sample);
+
+	if not _ballistic_solver.has_pending_gpu_sample_sync():
+		if not _dirty_trajectory_ballistics.is_empty():
+			_earliest_tape_refill_time = -INF;
+		else:
+			_earliest_tape_refill_time = _min_across_cohort_refills();
+	return did_fuse_sample;
+
+
+## Builds and executes a trajectory-tape bake (or fused GPU bake+sample) for [param candidates].
+func _bake_scheduled_candidate_batch(
+		candidates: Array[JrBallisticOrbiter],
+		dt: float,
+		fuse_gpu_sample: bool
+) -> bool:
+	var abs_dt: float = absf(dt);
 	var use_gpu: bool = _ballistic_solver.is_forecast_gpu_active();
-	var jobs: Array[JrBallisticOrbiter] = [];
-	var start_times := PackedFloat64Array();
-	var knot_dts := PackedFloat32Array();
-	var step_counts := PackedInt32Array();
-	var job_subs := PackedInt32Array();
-	var modes := PackedByteArray();
-	var loop_periods := PackedFloat64Array();
+	var ordered: Array[JrBallisticOrbiter] = (
+			_partition_candidates_for_simt_coherence(candidates)
+			if (use_gpu and candidates.size() >= 64)
+			else candidates
+	);
+
+	var cand_n: int = ordered.size();
+	_batch_jobs.resize(cand_n);
+	_batch_start_times.resize(cand_n);
+	_batch_knot_dts.resize(cand_n);
+	_batch_step_counts.resize(cand_n);
+	_batch_substeps.resize(cand_n);
+	_batch_modes.resize(cand_n);
+	_batch_loop_periods.resize(cand_n);
+
+	var out_idx: int = 0;
 	var batch_t0: float = INF;
 	var batch_t1: float = -INF;
-	var any_still_dirty: bool = false;
 	var dt_is_zero: bool = is_zero_approx(dt);
 
-	for b: JrBallisticOrbiter in candidates:
+	for i: int in range(cand_n):
+		var b: JrBallisticOrbiter = ordered[i];
 		b._in_dirty_trajectory_queue = false;
 		var is_fc: bool = enable_ballistic_forecasts and b.runtime_forecast_enabled;
 		var needs_reset: bool = b._trajectory_dirty or not b._trajectory_tape.is_valid;
+		var is_reschedule: bool = false;
 
 		if needs_reset and dt_is_zero and not is_fc:
 			b._in_dirty_trajectory_queue = true;
 			_dirty_trajectory_ballistics.append(b);
-			any_still_dirty = true;
 			continue;
 
 		if not needs_reset and not is_fc and abs_dt > 0.0:
-			var desired_dt: float = _compute_active_knot_dt(b, abs_dt);
+			var desired_dt: float = _compute_tail_desired_knot_dt(b._trajectory_tape, abs_dt);
 			if desired_dt > 4.0 * b._trajectory_tape.knot_dt or desired_dt < 0.2 * b._trajectory_tape.knot_dt:
-				var clamp_t: float = minf(time, b._trajectory_tape.get_end_time());
-				var sw: int = b.sample_tape_same_soi(clamp_t);
-				if sw == -2:
-					_sample_ballistic_cross_soi_at(b, clamp_t);
-				elif sw != b._tape_anchor_idx and sw >= 0 and sw < _runtime_well_elements.size():
-					b.adopt_tape_anchor_element(_runtime_well_elements[sw], sw);
+				var end_t: float = b._trajectory_tape.get_end_time();
+				var tail_tol: float = maxf(1e-6, 1e-4 * b._trajectory_tape.knot_dt);
+				if time >= end_t - tail_tol:
+					var tw: int = b.apply_tape_tail_state(end_t);
+					if tw != b._tape_anchor_idx and tw >= 0 and tw < _runtime_well_elements.size():
+						b.adopt_tape_anchor_element(_runtime_well_elements[tw], tw);
+					is_reschedule = true;
+				else:
+					var clamp_t: float = minf(time, end_t);
+					var sw: int = b.sample_tape_same_soi(clamp_t);
+					if sw == -2:
+						_sample_ballistic_cross_soi_at(b, clamp_t);
+					elif sw != b._tape_anchor_idx and sw >= 0 and sw < _runtime_well_elements.size():
+						b.adopt_tape_anchor_element(_runtime_well_elements[sw], sw);
 				needs_reset = true;
 
 		if needs_reset:
@@ -1958,16 +2091,17 @@ func _schedule_and_bake_trajectory_tapes(
 			if period > 0.0:
 				var l_steps: int = 128 if use_gpu else 96;
 				var l_dt: float = period / float(l_steps);
-				var j_t0: float = b.get_effective_state_time();
-				jobs.append(b);
-				start_times.append(j_t0);
-				knot_dts.append(l_dt);
-				step_counts.append(l_steps);
-				job_subs.append(1);
-				modes.append(JrBallisticForecastConfig.JOB_PERIODIC_LOOP);
-				loop_periods.append(period);
-				batch_t0 = minf(batch_t0, j_t0);
-				batch_t1 = maxf(batch_t1, j_t0 + period);
+				var j_t0_loop: float = b.get_effective_state_time();
+				_batch_jobs[out_idx] = b;
+				_batch_start_times[out_idx] = j_t0_loop;
+				_batch_knot_dts[out_idx] = l_dt;
+				_batch_step_counts[out_idx] = l_steps;
+				_batch_substeps[out_idx] = 1;
+				_batch_modes[out_idx] = JrBallisticForecastConfig.JOB_PERIODIC_LOOP;
+				_batch_loop_periods[out_idx] = period;
+				out_idx += 1;
+				batch_t0 = minf(batch_t0, j_t0_loop);
+				batch_t1 = maxf(batch_t1, j_t0_loop + period);
 				continue;
 
 			var j_t0: float = b.get_effective_state_time();
@@ -1980,25 +2114,43 @@ func _schedule_and_bake_trajectory_tapes(
 				var p_steps: int = maxi(8, b.preview_steps);
 				k_dt = maxf(1e-6, b.preview_duration) / float(p_steps);
 				var full_chunk: int = _compute_forecast_chunk_steps(p_steps, k_dt, abs_dt, use_gpu);
-				var extra: int = maxi(4, int(roundf(float(full_chunk * (cohort + 1)) * 0.25)));
+				var extra: int = 8 + int(roundf(float(full_chunk * cohort) / float(TAPE_COHORT_COUNT)));
 				steps = p_steps + int(ceili(lead_in / k_dt)) + extra;
 				subs = maxi(JrBallisticComputeSolver.FORECAST_INTERNAL_SUBSTEPS, ballistic_substeps);
 			else:
 				k_dt = _compute_active_knot_dt(b, abs_dt);
+				var full_chunk_r: int = _compute_active_chunk_steps(k_dt, abs_dt);
 				if dt < 0.0:
 					steps = maxi(2, int(ceili(lead_in / k_dt)) + 2);
+				elif is_reschedule:
+					var needed_r: float = maxf(0.0, (time - j_t0) - 0.05 * k_dt);
+					steps = int(ceili(needed_r / k_dt)) + full_chunk_r;
 				else:
-					var stag_t: float = float((cohort + 1) * (8 if use_gpu else 2)) * abs_dt;
-					steps = int(ceili(lead_in / k_dt)) + maxi(2, int(roundf(stag_t / maxf(1e-9, k_dt))));
-				subs = maxi(1, ballistic_substeps);
+					var one_dt: float = maxf(1e-9, abs_dt);
+					var chunk_frames: int = clampi(
+							int(roundf((float(full_chunk_r) * k_dt) / one_dt)),
+							1,
+							TAPE_COHORT_COUNT
+					);
+					var frame_steps: int = (
+							int(ceili((lead_in - 1e-6 * abs_dt) / one_dt))
+							+ (cohort % chunk_frames)
+							+ 1
+					);
+					var total_span: float = float(frame_steps) * one_dt;
+					steps = maxi(2, int(roundf(total_span / maxf(1e-9, k_dt))));
+				if use_gpu:
+					steps = mini(steps, JrBallisticComputeSolver.GPU_TAPE_SLOT_KNOTS - 1);
+				subs = _compute_active_substeps_for_body(b, abs_dt, false);
 
-			jobs.append(b);
-			start_times.append(j_t0);
-			knot_dts.append(k_dt);
-			step_counts.append(steps);
-			job_subs.append(subs);
-			modes.append(JrBallisticForecastConfig.JOB_RESET);
-			loop_periods.append(0.0);
+			_batch_jobs[out_idx] = b;
+			_batch_start_times[out_idx] = j_t0;
+			_batch_knot_dts[out_idx] = k_dt;
+			_batch_step_counts[out_idx] = steps;
+			_batch_substeps[out_idx] = subs;
+			_batch_modes[out_idx] = JrBallisticForecastConfig.JOB_RESET;
+			_batch_loop_periods[out_idx] = 0.0;
+			out_idx += 1;
 			batch_t0 = minf(batch_t0, j_t0);
 			batch_t1 = maxf(batch_t1, j_t0 + float(steps) * k_dt);
 		else:
@@ -2008,52 +2160,99 @@ func _schedule_and_bake_trajectory_tapes(
 			var subs: int;
 			if is_fc:
 				var p_steps: int = maxi(8, b.preview_steps);
-				var full_chunk: int = _compute_forecast_chunk_steps(p_steps, k_dt, abs_dt, use_gpu);
+				var full_chunk: int = _compute_forecast_chunk_steps(
+						p_steps,
+						k_dt,
+						abs_dt,
+						use_gpu and cand_n >= 4
+				);
 				var needed: float = maxf(0.0, (time + b.preview_duration) - tail_t0);
 				steps = int(ceili(needed / k_dt)) + full_chunk;
 				subs = maxi(JrBallisticComputeSolver.FORECAST_INTERNAL_SUBSTEPS, ballistic_substeps);
 			else:
-				var full_chunk: int = _compute_active_chunk_steps(k_dt, abs_dt, use_gpu);
-				var needed: float = maxf(0.0, time - tail_t0);
+				var full_chunk: int = _compute_active_chunk_steps(k_dt, abs_dt);
+				var needed: float = maxf(0.0, (time - tail_t0) - 0.05 * k_dt);
 				steps = int(ceili(needed / k_dt)) + full_chunk;
-				subs = maxi(1, ballistic_substeps);
+				if use_gpu:
+					steps = mini(steps, JrBallisticComputeSolver.GPU_TAPE_SLOT_KNOTS - 1);
+				subs = _compute_active_substeps_for_body(b, abs_dt, true);
 
-			jobs.append(b);
-			start_times.append(tail_t0);
-			knot_dts.append(k_dt);
-			step_counts.append(steps);
-			job_subs.append(subs);
-			modes.append(JrBallisticForecastConfig.JOB_APPEND_TAIL);
-			loop_periods.append(0.0);
+			_batch_jobs[out_idx] = b;
+			_batch_start_times[out_idx] = tail_t0;
+			_batch_knot_dts[out_idx] = k_dt;
+			_batch_step_counts[out_idx] = steps;
+			_batch_substeps[out_idx] = subs;
+			_batch_modes[out_idx] = JrBallisticForecastConfig.JOB_APPEND_TAIL;
+			_batch_loop_periods[out_idx] = 0.0;
+			out_idx += 1;
 			batch_t0 = minf(batch_t0, tail_t0);
 			batch_t1 = maxf(batch_t1, tail_t0 + float(steps) * k_dt);
 
-	if not jobs.is_empty():
-		var cfg: JrBallisticForecastConfig = _build_forecast_config(jobs, batch_t0);
-		cfg.total_driver_bodies = _ballistic_sequence.size();
-		cfg.timeline_end_time = maxf(batch_t0, batch_t1);
-		cfg.trim_before_time = time;
-		cfg.timeline_segments = 0;
-		cfg.job_start_times = start_times;
-		cfg.job_knot_dts = knot_dts;
-		cfg.job_step_counts = step_counts;
-		cfg.job_substeps = job_subs;
-		cfg.job_append_mode = modes;
-		cfg.job_loop_periods = loop_periods;
-		_ballistic_solver.bake_trajectory_tapes(cfg);
-		_finalize_baked_tape_jobs(jobs, dt_is_zero);
+	if out_idx != cand_n:
+		_batch_jobs.resize(out_idx);
+		_batch_start_times.resize(out_idx);
+		_batch_knot_dts.resize(out_idx);
+		_batch_step_counts.resize(out_idx);
+		_batch_substeps.resize(out_idx);
+		_batch_modes.resize(out_idx);
+		_batch_loop_periods.resize(out_idx);
 
-	if any_still_dirty:
-		_earliest_tape_refill_time = -INF;
-	else:
-		_earliest_tape_refill_time = minf(
-				minf(_cohort_min_refill[0], _cohort_min_refill[1]),
-				minf(_cohort_min_refill[2], _cohort_min_refill[3])
+	if _batch_jobs.is_empty():
+		return false;
+
+	var cfg: JrBallisticForecastConfig = _build_forecast_config(_batch_jobs, batch_t0);
+	cfg.total_driver_bodies = _ballistic_sequence.size();
+	cfg.enable_forecasts = enable_ballistic_forecasts;
+	cfg.timeline_end_time = maxf(batch_t0, batch_t1);
+	cfg.trim_before_time = time;
+	cfg.timeline_segments = 0;
+	cfg.job_start_times = _batch_start_times;
+	cfg.job_knot_dts = _batch_knot_dts;
+	cfg.job_step_counts = _batch_step_counts;
+	cfg.job_substeps = _batch_substeps;
+	cfg.job_append_mode = _batch_modes;
+	cfg.job_loop_periods = _batch_loop_periods;
+	if fuse_gpu_sample and not dt_is_zero:
+		_ballistic_solver.bake_and_sample_tapes_gpu(
+				cfg,
+				_ballistic_sequence,
+				time
 		);
+		if _ballistic_solver.did_last_bake_fuse_sample():
+			_sampled_time_cell[0] = time;
+			_sampled_time_cell[1] += 1.0;
+			_pending_gpu_finalize_jobs = _batch_jobs;
+			return true;
+		_finalize_baked_tape_jobs(_batch_jobs, false);
+		return false;
+
+	_ballistic_solver.bake_trajectory_tapes(cfg);
+	_finalize_baked_tape_jobs(_batch_jobs, dt_is_zero);
+	return false;
+
+
+## Partitions [param candidates] so root-anchored coasting bodies precede child-well or thrusting
+## bodies, packing perturbed KDK threads into contiguous GPU SIMT waves.
+func _partition_candidates_for_simt_coherence(
+		candidates: Array[JrBallisticOrbiter]
+) -> Array[JrBallisticOrbiter]:
+	var self_elem: JrOrreryElement = self;
+	_batch_coasting_buf.clear();
+	_batch_perturbed_buf.clear();
+	for i: int in range(candidates.size()):
+		var b: JrBallisticOrbiter = candidates[i];
+		if b._anchor_element == self_elem and not b._has_external_thrust:
+			_batch_coasting_buf.append(b);
+		else:
+			_batch_perturbed_buf.append(b);
+	if _batch_coasting_buf.is_empty() or _batch_perturbed_buf.is_empty():
+		return candidates;
+	_batch_coasting_buf.append_array(_batch_perturbed_buf);
+	return _batch_coasting_buf;
 
 
 ## Collects dirty and refill-ready [JrBallisticOrbiter] bodies, scanning only expiring cohorts
-## (`~1/4` of the swarm) during steady-state forward playback.
+## (`~1/16` of the swarm) during steady-state forward playback.
 func _collect_scheduled_tape_candidates(
 		dt: float,
 		abs_dt: float
@@ -2071,7 +2270,7 @@ func _collect_scheduled_tape_candidates(
 		_last_schedule_abs_dt = abs_dt;
 		var dirty_snapshot: Array[JrBallisticOrbiter] = _dirty_trajectory_ballistics.duplicate();
 		_dirty_trajectory_ballistics.clear();
-		for c: int in range(4):
+		for c: int in range(TAPE_COHORT_COUNT):
 			if time < _cohort_min_refill[c]:
 				continue;
 			_cohort_min_refill[c] = INF;
@@ -2093,7 +2292,7 @@ func _collect_scheduled_tape_candidates(
 		return candidates;
 
 	_dirty_trajectory_ballistics.clear();
-	_cohort_min_refill = PackedFloat64Array([INF, INF, INF, INF]);
+	_reset_cohort_min_refill(INF);
 	_latest_tape_start_time = -INF;
 	_last_schedule_abs_dt = abs_dt if (dt > 0.0 and dt <= 0.1) else 0.0;
 
@@ -2128,11 +2327,12 @@ func _finalize_baked_tape_jobs(jobs: Array[JrBallisticOrbiter], dt_is_zero: bool
 			else:
 				tape.is_periodic_loop = false;
 				tape.loop_period = 0.0;
-				b.mark_trajectory_clean(tape.get_end_time());
+				_ballistic_solver.clear_body_periodic_loop_in_atlas(b._ballistic_seq_index);
+				b.mark_trajectory_clean(tape.get_end_time() - 1e-4 * tape.knot_dt);
 		elif enable_ballistic_forecasts and b.runtime_forecast_enabled:
 			b.mark_trajectory_clean(tape.get_end_time() - b.preview_duration);
 		else:
-			b.mark_trajectory_clean(tape.get_end_time());
+			b.mark_trajectory_clean(tape.get_end_time() - 1e-4 * tape.knot_dt);
 
 		var c_idx: int = b._tape_cohort;
 		_cohort_min_refill[c_idx] = minf(_cohort_min_refill[c_idx], b._next_refill_time);
@@ -2141,6 +2341,7 @@ func _finalize_baked_tape_jobs(jobs: Array[JrBallisticOrbiter], dt_is_zero: bool
 		if tape.is_valid:
 			b._obeying_shared_tape_clock = true;
 			if dt_is_zero:
+				b._pos_materialized_pass_id = cur_pass;
 				b._vel_materialized_pass_id = cur_pass;
 
 	_latest_tape_start_time = max_start;
@@ -2289,29 +2490,54 @@ func _bridge_integrate_bodies_to_now(bodies: Array[JrBallisticOrbiter]) -> void:
 		b.invalidate_trajectory();
 
 
-## Chooses power-of-two quantized knot spacing (`{2.0, 1.0, 0.5, 0.25} * abs_dt`) for a
-## non-forecasted active body so cohorts expire in lockstep and land on exact knots.
-func _compute_active_knot_dt(ballistic: JrBallisticOrbiter, abs_dt: float) -> float:
+## Chooses frame-aligned knot spacing (`abs_dt`) for a non-forecasted active body so all cohorts
+## share uniform knot counts (`steps = TAPE_COHORT_COUNT`) and land on exact knots each tick.
+func _compute_active_knot_dt(_ballistic: JrBallisticOrbiter, abs_dt: float) -> float:
 	if abs_dt <= 1e-9:
 		return 1e-3;
-	if ballistic.is_tape_velocity_pending():
-		ballistic.ensure_tape_velocity();
-	var r_len: float = maxf(1e-6, ballistic._anchor_relative_position.length());
-	var omega: float = ballistic._anchor_relative_velocity.length() / r_len;
-	var step_angle: float = omega * abs_dt;
-	if step_angle <= 0.16:
-		return 2.0 * abs_dt;
-	if step_angle <= 0.40:
-		return abs_dt;
-	if step_angle <= 0.80:
-		return 0.5 * abs_dt;
-	return 0.25 * abs_dt;
+	return abs_dt;
 
 
-## Chooses tail-chunk step count covering an exact `32 * abs_dt` (GPU) or `8 * abs_dt` (CPU) span.
-func _compute_active_chunk_steps(knot_dt: float, abs_dt: float, use_gpu: bool) -> int:
-	var target_t: float = (32.0 if use_gpu else 8.0) * abs_dt;
-	return maxi(2, int(roundf(target_t / maxf(1e-9, knot_dt))));
+## Evaluates desired knot spacing (`abs_dt`) for an active tail extension.
+func _compute_tail_desired_knot_dt(_tape: JrBallisticTrajectoryTape, abs_dt: float) -> float:
+	if abs_dt <= 1e-9:
+		return 1e-3;
+	return abs_dt;
+
+
+## Chooses tail-chunk step count spanning `TAPE_COHORT_COUNT * abs_dt` (`64` frames).
+func _compute_active_chunk_steps(knot_dt: float, abs_dt: float) -> int:
+	var target_t: float = float(TAPE_COHORT_COUNT) * abs_dt;
+	return clampi(int(roundf(target_t / maxf(1e-9, knot_dt))), 2, 128);
+
+
+## Computes the adaptive KDK substep count (`{1, 2, 4}`) for [param ballistic] over `abs_dt`
+## from its `O(1)` tail summary (when [param from_tail] is `true`) or current state.
+func _compute_active_substeps_for_body(
+		ballistic: JrBallisticOrbiter,
+		abs_dt: float,
+		from_tail: bool
+) -> int:
+	var base_subs: int = maxi(1, ballistic_substeps);
+	if abs_dt <= 1e-9:
+		return base_subs;
+	var r_sq: float;
+	var v_sq: float;
+	if from_tail and ballistic._trajectory_tape.is_valid:
+		var tp: Vector4 = ballistic._trajectory_tape.tail_pos_anchor;
+		var tv: Vector4 = ballistic._trajectory_tape.tail_vel_flags;
+		r_sq = maxf(1e-12, tp.x * tp.x + tp.y * tp.y + tp.z * tp.z);
+		v_sq = tv.x * tv.x + tv.y * tv.y + tv.z * tv.z;
+	else:
+		if ballistic.is_tape_position_pending():
+			ballistic.ensure_tape_position();
+		if ballistic.is_tape_velocity_pending():
+			ballistic.ensure_tape_velocity();
+		r_sq = maxf(1e-12, ballistic._anchor_relative_position.length_squared());
+		v_sq = ballistic._anchor_relative_velocity.length_squared();
+	if v_sq * (abs_dt * abs_dt) <= 0.16 * r_sq:
+		return base_subs;
+	return maxi(2, base_subs);
 
 
 ## Chooses extra headroom knot count beyond `preview_steps` for a forecasted body.
@@ -2331,7 +2557,7 @@ func _compute_forecast_chunk_steps(
 ## Recomputes [member _earliest_tape_refill_time], [member _cohort_min_refill], and
 ## [member _latest_tape_start_time] across [member _ballistic_sequence].
 func _recompute_tape_schedule_bounds() -> void:
-	_cohort_min_refill = PackedFloat64Array([INF, INF, INF, INF]);
+	_reset_cohort_min_refill(INF);
 	var min_refill: float = INF;
 	var max_start: float = -INF;
 	for b: JrBallisticOrbiter in _ballistic_sequence:
@@ -2359,6 +2585,7 @@ func _sample_all_ballistics_from_tapes() -> void:
 	var eval_t: float = time;
 	_sampled_time_cell[0] = eval_t;
 	_sampled_time_cell[1] += 1.0;
+	var cur_pass: float = _sampled_time_cell[1];
 
 	var well_count: int = _runtime_well_elements.size();
 	var ref_plane: JrReferenceDirection = _reference_plane;
@@ -2369,33 +2596,17 @@ func _sample_all_ballistics_from_tapes() -> void:
 			and not lock_ecliptic
 			and _ballistic_solver.is_tape_sample_gpu_active()
 	):
-		var ev_words: PackedInt32Array = _ballistic_solver.sample_tapes_gpu(b_seq, eval_t);
-		@warning_ignore("integer_division")
-		var ev_count: int = ev_words.size() / 2;
-		for e: int in range(ev_count):
-			var b_idx: int = ev_words[e * 2];
-			if b_idx < 0 or b_idx >= count:
-				continue;
-			var code: int = ev_words[e * 2 + 1];
-			var b_ev: JrBallisticOrbiter = b_seq[b_idx];
-			if code == -1:
-				_sample_single_ballistic_from_tape(b_ev, eval_t);
-				_ballistic_solver.update_body_expected_well_in_atlas(b_idx, b_ev._tape_anchor_idx);
-			elif code >= 0 and code != b_ev._tape_anchor_idx:
-				var next_anchor: JrOrreryElement = (
-						_runtime_well_elements[code]
-						if code < well_count
-						else self
-				);
-				b_ev.adopt_tape_anchor_element(next_anchor, code);
-				_ballistic_solver.update_body_expected_well_in_atlas(b_idx, code);
+		_ballistic_solver.sample_tapes_gpu(b_seq, eval_t);
 		return;
 
+	_sampled_pos_holder[0] = PackedVector3Array();
 	var tapes: Array[JrBallisticTrajectoryTape] = _ballistic_tapes;
 	for i: int in range(count):
 		var tape: JrBallisticTrajectoryTape = tapes[i];
 		if not tape.is_valid:
 			continue;
+		if not tape.cpu_knots_resident:
+			tape.ensure_cpu_knots();
 
 		var rel_t: float = eval_t - tape.start_time;
 		if tape.is_periodic_loop:
@@ -2440,6 +2651,8 @@ func _sample_all_ballistics_from_tapes() -> void:
 		if lock_ecliptic:
 			r_rel = ref_plane.project_vector_to_ecliptic(r_rel);
 		ballistic._anchor_relative_position = r_rel;
+		ballistic._pos_materialized_pass_id = cur_pass;
+		ballistic._obeying_shared_tape_clock = true;
 		if w_idx != ballistic._tape_anchor_idx:
 			var new_anchor: JrOrreryElement = (
 					_runtime_well_elements[w_idx]
@@ -2449,12 +2662,125 @@ func _sample_all_ballistics_from_tapes() -> void:
 			ballistic.adopt_tape_anchor_element(new_anchor, w_idx);
 
 
+## Waits for an in-flight GPU tape sample or fused bake+sample pass, finalizes baked tape jobs,
+## and dispatches sparse SOI handoff events.
+func _flush_pending_gpu_tape_sample() -> void:
+	if not _ballistic_solver.has_pending_gpu_sample_sync():
+		return;
+	var ev_vec4s: PackedVector4Array = _ballistic_solver.sync_and_readback_pending_gpu_sample(
+			_ballistic_sequence
+	);
+	_sampled_pos_holder[0] = _ballistic_solver.get_last_sampled_pos_vecs();
+	if not _pending_gpu_finalize_jobs.is_empty():
+		var jobs_to_fin: Array[JrBallisticOrbiter] = _pending_gpu_finalize_jobs;
+		_pending_gpu_finalize_jobs = [];
+		_finalize_baked_tape_jobs(jobs_to_fin, false);
+		if not _dirty_trajectory_ballistics.is_empty():
+			_earliest_tape_refill_time = -INF;
+		else:
+			_earliest_tape_refill_time = _min_across_cohort_refills();
+	_apply_gpu_tape_sample_events(ev_vec4s, time);
+
+
+## Dispatches sparse SOI-handoff, inline cross-SOI, and CPU-fallback events returned by `ballistic_tape_sample.glsl`.
+func _apply_gpu_tape_sample_events(ev_vec4s: PackedVector4Array, eval_t: float) -> void:
+	if ev_vec4s.is_empty():
+		return;
+	var b_seq: Array[JrBallisticOrbiter] = _ballistic_sequence;
+	var count: int = b_seq.size();
+	var well_count: int = _runtime_well_elements.size();
+	var stride: int = JrBallisticComputeSolver.TAPE_SAMPLE_EVENT_VEC4S;
+	@warning_ignore("integer_division")
+	var ev_count: int = ev_vec4s.size() / stride;
+	for e: int in range(ev_count):
+		var base: int = e * stride;
+		var hdr: Vector4 = ev_vec4s[base];
+		var b_idx: int = int(roundf(hdr.x));
+		if b_idx < 0 or b_idx >= count:
+			continue;
+		var kind: int = int(roundf(hdr.y));
+		var b_ev: JrBallisticOrbiter = b_seq[b_idx];
+		if kind == JrBallisticComputeSolver.TAPE_EVENT_WELL_SWITCH:
+			var w_idx: int = int(roundf(hdr.z));
+			if w_idx >= 0 and w_idx != b_ev._tape_anchor_idx:
+				var next_anchor: JrOrreryElement = (
+						_runtime_well_elements[w_idx]
+						if w_idx < well_count
+						else self
+				);
+				b_ev.adopt_tape_anchor_element(next_anchor, w_idx);
+				_ballistic_solver.update_body_expected_well_in_atlas(b_idx, w_idx);
+		elif kind == JrBallisticComputeSolver.TAPE_EVENT_CROSS_SOI:
+			_apply_inline_gpu_cross_soi_event(b_ev, eval_t, ev_vec4s, base);
+		elif kind == JrBallisticComputeSolver.TAPE_EVENT_CPU_FALLBACK:
+			_sample_single_ballistic_from_tape(b_ev, eval_t);
+			_ballistic_solver.update_body_expected_well_in_atlas(b_idx, b_ev._tape_anchor_idx);
+
+
+## Evaluates Cubic Hermite `(r_rel, v_rel)` across a cross-SOI segment directly from inline GPU
+## event knots `(pa, pb, va, vb)` without downloading the body's 4,352-byte VRAM atlas slot.
+func _apply_inline_gpu_cross_soi_event(
+		ballistic: JrBallisticOrbiter,
+		eval_t: float,
+		ev_vec4s: PackedVector4Array,
+		ev_base: int
+) -> void:
+	var tape: JrBallisticTrajectoryTape = ballistic._trajectory_tape;
+	if not tape.is_valid:
+		return;
+	var hdr: Vector4 = ev_vec4s[ev_base];
+	var b_idx: int = int(roundf(hdr.x));
+	var idx_a: int = int(roundf(hdr.z));
+	var u: float = hdr.w;
+	var pa: Vector4 = ev_vec4s[ev_base + 1];
+	var pb: Vector4 = ev_vec4s[ev_base + 2];
+	var va: Vector4 = ev_vec4s[ev_base + 3];
+	var vb: Vector4 = ev_vec4s[ev_base + 4];
+
+	var well_limit: int = maxi(0, _runtime_well_elements.size() - 1);
+	var well_a_idx: int = clampi(int(roundf(pa.w)), 0, well_limit);
+	var well_b_idx: int = clampi(int(roundf(pb.w)), 0, well_limit);
+	var well_a: JrOrreryElement = _runtime_well_elements[well_a_idx];
+	var well_b: JrOrreryElement = _runtime_well_elements[well_b_idx];
+
+	var t_a: float = tape.start_time + float(idx_a) * tape.knot_dt;
+	var pa_aligned := Vector3(pa.x, pa.y, pa.z) + _compute_lca_well_position_difference_at(well_a, well_b, t_a);
+	var va_aligned := Vector3(va.x, va.y, va.z) + _compute_lca_well_velocity_difference_at(well_a, well_b, t_a);
+	var pb3 := Vector3(pb.x, pb.y, pb.z);
+	var vb3 := Vector3(vb.x, vb.y, vb.z);
+
+	var u2: float = u * u;
+	var u3: float = u2 * u;
+	var h: float = tape.knot_dt;
+	var r_rel: Vector3 = (
+			pa_aligned * (2.0 * u3 - 3.0 * u2 + 1.0)
+			+ va_aligned * ((u3 - 2.0 * u2 + u) * h)
+			+ pb3 * (-2.0 * u3 + 3.0 * u2)
+			+ vb3 * ((u3 - u2) * h)
+	);
+	var dh00: float = (6.0 * u2 - 6.0 * u) * tape.inv_knot_dt;
+	var v_rel: Vector3 = (
+			(pa_aligned - pb3) * dh00
+			+ va_aligned * (3.0 * u2 - 4.0 * u + 1.0)
+			+ vb3 * (3.0 * u2 - 2.0 * u)
+	);
+
+	ballistic.adopt_tape_anchor_element(well_b, well_b_idx);
+	ballistic._state_time = eval_t;
+	if not is_equal_approx(eval_t, time):
+		ballistic._obeying_shared_tape_clock = false;
+	ballistic.apply_sampled_tape_state(r_rel, v_rel);
+	_ballistic_solver.update_body_expected_well_in_atlas(b_idx, well_b_idx);
+
+
 ## Evaluates CPU Cubic Hermite sampling for a single [param ballistic] delegated by GPU fallback
-## (e.g., cross-SOI segment or long-horizon forecast tape exceeding 136 knots).
+## (e.g., cross-SOI segment or long-horizon forecast tape exceeding 264 knots).
 func _sample_single_ballistic_from_tape(ballistic: JrBallisticOrbiter, eval_t: float) -> void:
 	var tape: JrBallisticTrajectoryTape = ballistic._trajectory_tape;
 	if not tape.is_valid:
 		return;
+	if not tape.cpu_knots_resident:
+		tape.ensure_cpu_knots();
 
 	var rel_t: float = eval_t - tape.start_time;
 	if tape.is_periodic_loop:
@@ -2498,6 +2824,9 @@ func _sample_single_ballistic_from_tape(ballistic: JrBallisticOrbiter, eval_t: f
 	if _reference_plane != null and _reference_plane.lock_to_ecliptic:
 		r_rel = _reference_plane.project_vector_to_ecliptic(r_rel);
 	ballistic._anchor_relative_position = r_rel;
+	ballistic._pos_materialized_pass_id = _sampled_time_cell[1];
+	if is_equal_approx(eval_t, time):
+		ballistic._obeying_shared_tape_clock = true;
 	if w_idx != ballistic._tape_anchor_idx:
 		var well_count: int = _runtime_well_elements.size();
 		var new_anchor: JrOrreryElement = (
@@ -2512,6 +2841,8 @@ func _sample_single_ballistic_from_tape(ballistic: JrBallisticOrbiter, eval_t: f
 ## shifting knot `idx_a` into knot `idx_a + 1`'s gravity-well frame at `t_a`.
 func _sample_ballistic_cross_soi_at(ballistic: JrBallisticOrbiter, eval_time: float) -> void:
 	var tape: JrBallisticTrajectoryTape = ballistic._trajectory_tape;
+	if not tape.cpu_knots_resident:
+		tape.ensure_cpu_knots();
 	var rel_t: float = eval_time - tape.start_time;
 	if tape.is_periodic_loop:
 		rel_t = fposmod(rel_t, tape.loop_period);
@@ -2977,16 +3308,18 @@ func _build_forecast_config(
 		bodies: Array[JrBallisticOrbiter],
 		start_time: float
 ) -> JrBallisticForecastConfig:
-	var cfg := JrBallisticForecastConfig.new()
-	cfg.bodies = bodies
-	cfg.start_time = start_time
-	cfg.driver_gravity_strength = _gravity_strength
-	cfg.tidal_cull_threshold = tidal_cull_threshold
-	cfg.driver_element = self
-	cfg.reference_plane = _reference_plane
-	cfg.orbit_sequence = _orbit_sequence
-	cfg.orbiter_parents = _children
-	return cfg
+	var cfg := JrBallisticForecastConfig.new();
+	cfg.bodies = bodies;
+	cfg.start_time = start_time;
+	cfg.driver_gravity_strength = _gravity_strength;
+	cfg.tidal_cull_threshold = tidal_cull_threshold;
+	cfg.driver_element = self;
+	cfg.reference_plane = _reference_plane;
+	cfg.orbit_sequence = _orbit_sequence;
+	cfg.orbiter_parents = _children;
+	if not _runtime_wells_dirty and not _runtime_well_elements.is_empty() and not Engine.is_editor_hint():
+		cfg.prebuilt_wells = _runtime_well_elements;
+	return cfg;
 
 
 ## Converts an anchor-relative forecast polyline [param pts4] (`xyz = r_rel, w = anchor_idx`)
@@ -3059,6 +3392,7 @@ func _update_runtime_ballistic_forecasts(system_basis: Basis) -> void:
 			_any_ballistic_has_forecast_points = false;
 		return;
 
+	_flush_pending_gpu_tape_sample();
 	_refresh_perspective_cache_epoch();
 	_begin_forecast_projection_pass(system_basis);
 	for target: JrBallisticOrbiter in targets:
@@ -3106,6 +3440,7 @@ func _update_runtime_ballistic_forecasts_instrumented(system_basis: Basis) -> vo
 			);
 		return;
 
+	_flush_pending_gpu_tape_sample();
 	var t_proj0: int = Time.get_ticks_usec();
 	_refresh_perspective_cache_epoch();
 	_begin_forecast_projection_pass(system_basis);
@@ -3303,6 +3638,8 @@ func _ensure_forecast_well_arrays(
 func _ensure_tape_inertial_knots(tape: JrBallisticTrajectoryTape) -> void:
 	if tape.inertial_built_count >= tape.knot_count:
 		return;
+	if not tape.cpu_knots_resident:
+		tape.ensure_cpu_knots();
 	var from_k: int = tape.inertial_built_count;
 	var sub_count: int = tape.knot_count - from_k;
 	var sub_t0: float = tape.start_time + float(from_k) * tape.knot_dt;
@@ -3341,6 +3678,8 @@ func _ensure_tape_perspective_knots(tape: JrBallisticTrajectoryTape) -> void:
 		tape.persp_built_count = 0;
 	if tape.persp_built_count >= tape.knot_count:
 		return;
+	if not tape.cpu_knots_resident:
+		tape.ensure_cpu_knots();
 
 	var from_k: int = tape.persp_built_count;
 	var sub_count: int = tape.knot_count - from_k;
@@ -3527,6 +3866,8 @@ func _evaluate_tape_tip_points(
 		tip_well_idx = clampi(int(roundf(tip4.w)), 0, well_limit);
 	else:
 		var tape: JrBallisticTrajectoryTape = ballistic._trajectory_tape;
+		if not tape.cpu_knots_resident:
+			tape.ensure_cpu_knots();
 		var rel_t: float = tip_time - tape.start_time;
 		var max_idx: float = float(tape.knot_count - 1);
 		var scaled: float = clampf(rel_t * tape.inv_knot_dt, 0.0, max_idx);
@@ -3769,6 +4110,8 @@ func _compute_synodic_perspective_basis_at(eval_time: float) -> Basis:
 		var b_node := perspective_node as JrBallisticOrbiter;
 		var b_tape: JrBallisticTrajectoryTape = b_node._trajectory_tape;
 		if not is_equal_approx(eval_time, time) and b_tape.contains_time(eval_time):
+			if not b_tape.cpu_knots_resident:
+				b_tape.ensure_cpu_knots();
 			var rel_t: float = eval_time - b_tape.start_time;
 			if b_tape.is_periodic_loop:
 				rel_t = fposmod(rel_t, b_tape.loop_period);
@@ -3866,18 +4209,20 @@ func _on_subtree_element_added(parent: JrOrreryElement, child: JrOrreryElement) 
 		var ballistic := child as JrBallisticOrbiter;
 		ballistic._fast_root_sync_ready = false;
 		ballistic._direct_system_xf = _last_direct_system_xf_state;
-		ballistic.set_driver_sampled_time_cell(_sampled_time_cell);
+		ballistic.bind_driver_sample_buffers(_sampled_time_cell, _sampled_pos_holder);
+		if ballistic._trajectory_tape.is_valid and not ballistic._trajectory_dirty:
+			ballistic._obeying_shared_tape_clock = true;
 		_queue_non_root_sync_ballistic(ballistic);
 		if not already_tracked:
 			var seq_idx: int = _ballistic_sequence.size();
-			var cohort_idx: int = ((seq_idx * 5) + (seq_idx >> 3)) & 3;
+			var cohort_idx: int = ((seq_idx * 29) + (seq_idx >> 6)) & (TAPE_COHORT_COUNT - 1);
 			ballistic._ballistic_seq_index = seq_idx;
 			ballistic._tape_cohort = cohort_idx;
 			_ballistic_sequence.append(ballistic);
 			_ballistic_tapes.append(ballistic._trajectory_tape);
 			_tape_cohorts[cohort_idx].append(ballistic);
 			_cohort_min_refill[cohort_idx] = -INF;
-			_ballistic_solver.invalidate_tape_atlas();
+			_invalidate_solver_tape_atlas_safely();
 			if ballistic.runtime_forecast_enabled:
 				_forecast_enabled_ballistics.append(ballistic);
 		_pending_ballistic_init = true;
@@ -3948,12 +4293,16 @@ func _on_subtree_element_removed(_parent: JrOrreryElement, child: JrOrreryElemen
 	elif child is JrBallisticOrbiter:
 		var ballistic := child as JrBallisticOrbiter;
 		var old_cohort: int = ballistic._tape_cohort;
+		if ballistic.is_tape_position_pending():
+			ballistic.ensure_tape_position();
+		if ballistic.is_tape_velocity_pending():
+			ballistic.ensure_tape_velocity();
 		ballistic.set_driver_sampled_time_cell(PackedFloat64Array());
 		ballistic._fast_root_sync_ready = false;
 		ballistic._in_non_root_sync_list = false;
 		ballistic._in_dirty_trajectory_queue = false;
 		ballistic._ballistic_seq_index = -1;
-		_ballistic_solver.invalidate_tape_atlas();
+		_invalidate_solver_tape_atlas_safely();
 		if ballistic.ballistic_runtime_dirtied.is_connected(_on_ballistic_runtime_dirtied):
 			ballistic.ballistic_runtime_dirtied.disconnect(_on_ballistic_runtime_dirtied);
 		if ballistic.ballistic_gpu_dirtied.is_connected(_on_ballistic_gpu_dirtied):
@@ -3985,8 +4334,10 @@ func _on_subtree_element_removed(_parent: JrOrreryElement, child: JrOrreryElemen
 				c_list.erase(ballistic);
 		else:
 			_ballistic_sequence.erase(ballistic);
-			_rebuild_ballistic_tape_cohorts();
-		_recompute_tape_schedule_bounds();
+			if _batch_update_depth == 0:
+				_rebuild_ballistic_tape_cohorts();
+		if _batch_update_depth == 0:
+			_recompute_tape_schedule_bounds();
 		if child == perspective_node and is_inside_tree() and not _updating_orbits:
 			update_orbits();
 		return;
@@ -4082,16 +4433,27 @@ func _remove_ballistic_from_sparse_list(
 		list.erase(target);
 
 
-## Rebuilds [member _ballistic_tapes], sequence indices, and 4-bucket [member _tape_cohorts]
+## Rebuilds [member _ballistic_tapes], sequence indices, and 32-bucket [member _tape_cohorts]
 ## after a non-LIFO subtree removal.
 func _rebuild_ballistic_tape_cohorts() -> void:
 	var count: int = _ballistic_sequence.size();
 	_ballistic_tapes.resize(count);
-	for c: int in range(4):
+	for c: int in range(TAPE_COHORT_COUNT):
 		_tape_cohorts[c].clear();
+	if count <= 0:
+		return;
+	var use_contiguous_slices: bool = count >= 1024;
 	for seq_idx: int in range(count):
 		var b: JrBallisticOrbiter = _ballistic_sequence[seq_idx];
-		var cohort_idx: int = ((seq_idx * 5) + (seq_idx >> 3)) & 3;
+		var cohort_idx: int;
+		if use_contiguous_slices:
+			@warning_ignore("integer_division")
+			cohort_idx = mini(
+					TAPE_COHORT_COUNT - 1,
+					(seq_idx * TAPE_COHORT_COUNT) / count
+			);
+		else:
+			cohort_idx = ((seq_idx * 29) + (seq_idx >> 6)) & (TAPE_COHORT_COUNT - 1);
 		b._ballistic_seq_index = seq_idx;
 		b._tape_cohort = cohort_idx;
 		_ballistic_tapes[seq_idx] = b._trajectory_tape;
