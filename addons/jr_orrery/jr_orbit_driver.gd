@@ -513,6 +513,9 @@ var _ballistic_anchors_dirty: bool = true;
 ## Sparse queue of [JrRailOrbiter] nodes whose GPU B-spline lookup tables need baking.
 var _dirty_rail_splines: Array[JrRailOrbiter] = [];
 
+## Sparse list of [JrBallisticOrbiter] nodes that have non-empty [member JrBallisticOrbiter.scheduled_burns].
+var _burn_scheduled_ballistics: Array[JrBallisticOrbiter] = [];
+
 
 ## Initializes the generated [JrReferenceDirection], connects subtree signals,
 ## scans existing descendant elements, and performs an initial orbital update.
@@ -1135,6 +1138,8 @@ func _evaluate_runtime_system_state(playing: bool) -> void:
 				);
 			if not sampled_in_bake:
 				_sample_all_ballistics_from_tapes();
+			if dt > 0.0 and not _burn_scheduled_ballistics.is_empty():
+				_emit_scheduled_burn_events(_last_stepped_time, time);
 
 	_last_stepped_time = time;
 	_sync_all_ballistics_transforms(playing);
@@ -1449,6 +1454,8 @@ func _evaluate_runtime_system_state_instrumented(playing: bool) -> void:
 						JrOrreryTelemetry.PHASE_BALLISTIC_ANCHOR_POST,
 						Time.get_ticks_usec() - t_samp0
 				);
+			if dt > 0.0 and not _burn_scheduled_ballistics.is_empty():
+				_emit_scheduled_burn_events(_last_stepped_time, time);
 
 	_last_stepped_time = time;
 	var t_sync0: int = Time.get_ticks_usec();
@@ -1882,7 +1889,11 @@ func _compute_min_inter_well_periapsis(
 ## Returns the exact 64-bit orbital period when [param ballistic] is permanently unperturbed,
 ## bound, non-forecasted, and SOI-safe across all time (`0.0` otherwise).
 func _try_compute_periodic_loop_period(ballistic: JrBallisticOrbiter) -> float:
-	if (enable_ballistic_forecasts and ballistic.runtime_forecast_enabled) or ballistic._has_external_thrust:
+	if (
+			(enable_ballistic_forecasts and ballistic.runtime_forecast_enabled)
+			or ballistic._has_external_thrust
+			or ballistic.has_pending_or_active_burns_at(ballistic.get_effective_state_time())
+	):
 		return 0.0;
 	var anchor_elem: JrOrreryElement = ballistic.get_anchor_element();
 	if anchor_elem == null or not _is_tracked_or_self(anchor_elem):
@@ -2069,9 +2080,19 @@ func _bake_scheduled_candidate_batch(
 
 		if not needs_reset and not is_fc and abs_dt > 0.0:
 			var desired_dt: float = _compute_tail_desired_knot_dt(b._trajectory_tape, abs_dt);
-			if desired_dt > 4.0 * b._trajectory_tape.knot_dt or desired_dt < 0.2 * b._trajectory_tape.knot_dt:
-				var end_t: float = b._trajectory_tape.get_end_time();
-				var tail_tol: float = maxf(1e-6, 1e-4 * b._trajectory_tape.knot_dt);
+			var end_t: float = b._trajectory_tape.get_end_time();
+			var tail_tol: float = maxf(1e-6, 1e-4 * b._trajectory_tape.knot_dt);
+			var finished_scheduled_burns: bool = (
+					b.has_scheduled_burns()
+					and not b._has_external_thrust
+					and not b.has_pending_or_active_burns_at(end_t)
+					and time >= end_t - tail_tol
+			);
+			if (
+					finished_scheduled_burns
+					or desired_dt > 4.0 * b._trajectory_tape.knot_dt
+					or desired_dt < 0.2 * b._trajectory_tape.knot_dt
+			):
 				if time >= end_t - tail_tol:
 					var tw: int = b.apply_tape_tail_state(end_t);
 					if tw != b._tape_anchor_idx and tw >= 0 and tw < _runtime_well_elements.size():
@@ -2241,7 +2262,7 @@ func _partition_candidates_for_simt_coherence(
 	_batch_perturbed_buf.clear();
 	for i: int in range(candidates.size()):
 		var b: JrBallisticOrbiter = candidates[i];
-		if b._anchor_element == self_elem and not b._has_external_thrust:
+		if b._anchor_element == self_elem and not b._has_external_thrust and not b.has_scheduled_burns():
 			_batch_coasting_buf.append(b);
 		else:
 			_batch_perturbed_buf.append(b);
@@ -2518,6 +2539,8 @@ func _compute_active_substeps_for_body(
 		abs_dt: float,
 		from_tail: bool
 ) -> int:
+	if ballistic.has_scheduled_burns():
+		return maxi(JrBallisticComputeSolver.FORECAST_INTERNAL_SUBSTEPS, ballistic_substeps);
 	var base_subs: int = maxi(1, ballistic_substeps);
 	if abs_dt <= 1e-9:
 		return base_subs;
@@ -4225,6 +4248,8 @@ func _on_subtree_element_added(parent: JrOrreryElement, child: JrOrreryElement) 
 			_invalidate_solver_tape_atlas_safely();
 			if ballistic.runtime_forecast_enabled:
 				_forecast_enabled_ballistics.append(ballistic);
+			if not ballistic.scheduled_burns.is_empty():
+				_burn_scheduled_ballistics.append(ballistic);
 		_pending_ballistic_init = true;
 		if not ballistic.ballistic_runtime_dirtied.is_connected(_on_ballistic_runtime_dirtied):
 			ballistic.ballistic_runtime_dirtied.connect(_on_ballistic_runtime_dirtied);
@@ -4320,6 +4345,7 @@ func _on_subtree_element_removed(_parent: JrOrreryElement, child: JrOrreryElemen
 		_remove_ballistic_from_sparse_list(_non_root_sync_ballistics, ballistic);
 		_remove_ballistic_from_sparse_list(_forecast_enabled_ballistics, ballistic);
 		_remove_ballistic_from_sparse_list(_dirty_trajectory_ballistics, ballistic);
+		_remove_ballistic_from_sparse_list(_burn_scheduled_ballistics, ballistic);
 		if (
 				not _ballistic_sequence.is_empty()
 				and _ballistic_sequence[_ballistic_sequence.size() - 1] == ballistic
@@ -4356,6 +4382,11 @@ func _on_ballistic_runtime_dirtied() -> void:
 
 ## Queues [param ballistic] for trajectory-tape recomputation when [signal JrBallisticOrbiter.ballistic_trajectory_dirtied] fires.
 func _on_ballistic_trajectory_dirtied(ballistic: JrBallisticOrbiter) -> void:
+	if not ballistic.scheduled_burns.is_empty():
+		if not _burn_scheduled_ballistics.has(ballistic):
+			_burn_scheduled_ballistics.append(ballistic);
+	else:
+		_remove_ballistic_from_sparse_list(_burn_scheduled_ballistics, ballistic);
 	_queue_dirty_trajectory_ballistic(ballistic);
 	if (
 			not _should_step_time()
@@ -4364,6 +4395,14 @@ func _on_ballistic_trajectory_dirtied(ballistic: JrBallisticOrbiter) -> void:
 			and not _updating_orbits
 	):
 		_schedule_deferred_orbit_update();
+
+
+## Emits scheduled burn start, stage jettison, and completion signals across `(t_prev, t_curr]`.
+func _emit_scheduled_burn_events(t_prev: float, t_curr: float) -> void:
+	for i: int in range(_burn_scheduled_ballistics.size()):
+		var b: JrBallisticOrbiter = _burn_scheduled_ballistics[i];
+		if is_instance_valid(b) and b._owning_driver == self:
+			b.emit_scheduled_burn_events_between(t_prev, t_curr);
 
 
 ## Appends [param ballistic] to [member _dirty_trajectory_ballistics] if not already queued.

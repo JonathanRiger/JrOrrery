@@ -276,5 +276,30 @@ static func convert_acceleration_to_driver_units(
 		time_unit: TimeUnit
 ) -> Vector3:
 	if accel == Vector3.ZERO or accel_unit == AccelerationUnit.DRIVER_UNITS:
-		return accel
-	return accel * get_acceleration_scale_to_driver(accel_unit, dist_unit, time_unit)
+		return accel;
+	return accel * get_acceleration_scale_to_driver(accel_unit, dist_unit, time_unit);
+
+
+## Returns the multiplicative factor (`time_scale_s / dist_scale_m`) that converts an SI
+## velocity in `m/s` into driver velocity units (`dist_unit / time_unit`).
+static func get_si_to_driver_velocity_factor(
+		dist_unit: DistanceUnit,
+		time_unit: TimeUnit
+) -> float:
+	var dist_m: float = get_distance_scale_meters(dist_unit);
+	var time_s: float = get_time_scale_seconds(time_unit);
+	return time_s / dist_m;
+
+
+## Converts a specific impulse [param isp_seconds] (in SI seconds) into an effective exhaust
+## velocity (`v_e = isp * g_0`) expressed in driver velocity units (`dist_unit / time_unit`).
+static func convert_isp_to_driver_exhaust_velocity(
+		isp_seconds: float,
+		dist_unit: DistanceUnit,
+		time_unit: TimeUnit
+) -> float:
+	if isp_seconds <= 0.0:
+		return 0.0;
+	var ve_si: float = isp_seconds * STANDARD_GRAVITY_SI;
+	return ve_si * get_si_to_driver_velocity_factor(dist_unit, time_unit);
+
