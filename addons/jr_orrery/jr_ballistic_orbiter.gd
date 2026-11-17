@@ -32,6 +32,15 @@ signal ballistic_forecast_toggle_changed(body: JrBallisticOrbiter)
 ## Emitted upward when this body's precomputed trajectory tape is invalidated by thrust or state changes.
 signal ballistic_trajectory_dirtied(body: JrBallisticOrbiter);
 
+## Emitted when runtime simulation time enters a scheduled maneuver [param burn] on [param stage_index].
+signal scheduled_burn_started(burn: JrScheduledBurn, stage_index: int);
+
+## Emitted when runtime simulation time finishes a scheduled maneuver [param burn] on [param stage_index].
+signal scheduled_burn_completed(burn: JrScheduledBurn, stage_index: int);
+
+## Emitted when runtime simulation time jettisons [param stage] at [param stage_index].
+signal vehicle_stage_jettisoned(stage_index: int, stage: JrVehicleStage);
+
 ## Determines how the initial epoch state of this ballistic body is authored and edited.
 enum InitialStateMode {
 	## Authored via Cartesian [member initial_position] and [member initial_velocity] vectors
@@ -282,6 +291,62 @@ var acceleration_unit := JrOrreryUnits.AccelerationUnit.METERS_PER_SECOND_SQUARE
 			invalidate_trajectory();
 			if Engine.is_editor_hint():
 				orbit_visuals_changed.emit();
+
+@export_subgroup("Stages & Scheduled Burns")
+## Ordered rocket stage stack (`index 0` fires and jettisons first; the last element is the
+## uppermost stage). Leave empty to use standalone per-burn masses or [member vehicle_initial_mass].
+@export var vehicle_stages: Array[JrVehicleStage] = []:
+	set(value):
+		_disconnect_stage_signals();
+		vehicle_stages = value;
+		_connect_stage_signals();
+		_on_burns_or_stages_changed();
+
+## Permanent upper payload mass (`>= 0.0`, in [member vehicle_mass_unit]) carried above all
+## stages in [member vehicle_stages].
+@export_range(0.0, 1_000_000_000.0, 0.1, "or_greater")
+var vehicle_payload_mass: float = 0.0:
+	set(value):
+		var clamped: float = maxf(0.0, value);
+		if not is_equal_approx(vehicle_payload_mass, clamped):
+			vehicle_payload_mass = clamped;
+			_on_burns_or_stages_changed();
+
+## Initial vehicle wet mass (`> 0.0`, in [member vehicle_mass_unit]) used when
+## [member vehicle_stages] is empty and burns chain mass via [member JrScheduledBurn.use_vehicle_mass_chain].
+@export_range(0.001, 1_000_000_000.0, 0.1, "or_greater")
+var vehicle_initial_mass: float = 1000.0:
+	set(value):
+		var clamped: float = maxf(1e-6, value);
+		if not is_equal_approx(vehicle_initial_mass, clamped):
+			vehicle_initial_mass = clamped;
+			_on_burns_or_stages_changed();
+
+## Minimum vehicle dry structural mass (`> 0.0`, in [member vehicle_mass_unit]) when
+## [member vehicle_stages] is empty.
+@export_range(0.001, 1_000_000_000.0, 0.1, "or_greater")
+var vehicle_dry_mass: float = 100.0:
+	set(value):
+		var clamped: float = maxf(1e-6, value);
+		if not is_equal_approx(vehicle_dry_mass, clamped):
+			vehicle_dry_mass = clamped;
+			_on_burns_or_stages_changed();
+
+## Physical mass unit for [member vehicle_stages], [member vehicle_payload_mass],
+## [member vehicle_initial_mass], [member vehicle_dry_mass], and [member scheduled_burns].
+@export var vehicle_mass_unit := JrOrreryUnits.MassUnit.KILOGRAMS:
+	set(value):
+		if vehicle_mass_unit != value:
+			vehicle_mass_unit = value;
+			_on_burns_or_stages_changed();
+
+## Scheduled timed maneuver burns integrated along this body's trajectory horizon and forecasts.
+@export var scheduled_burns: Array[JrScheduledBurn] = []:
+	set(value):
+		_disconnect_burn_signals();
+		scheduled_burns = value;
+		_connect_burn_signals();
+		_on_burns_or_stages_changed();
 
 @export_group("Gravity & Anchor")
 ## If [code]true[/code], third-body differential tidal forces (Battin's f(q)) that
@@ -650,7 +715,38 @@ var _has_ghost_position: bool = false
 
 ## Whether the cached Keplerian elements need to be recomputed from [member initial_position] and
 ## [member initial_velocity].
-var _keplerian_cache_dirty: bool = false
+var _keplerian_cache_dirty: bool = false;
+
+## Dirty flag indicating [member _resolved_burn_timing] must be rebuilt from [member vehicle_stages]
+## and [member scheduled_burns].
+var _resolved_burns_dirty: bool = true;
+
+## Resolved elementary burn timing segments (`Vector4(t_start, t_end, ve_driver, dm_frac_rate)`).
+var _resolved_burn_timing: PackedVector4Array = PackedVector4Array();
+
+## Resolved elementary burn directions & frames (`Vector4(dir.x, dir.y, dir.z, is_orbital)`).
+var _resolved_burn_dir_frame: PackedVector4Array = PackedVector4Array();
+
+## Resolved elementary burn stack masses (`Vector4(m0_stack, mf_stack, post_seg_mass, stage_idx)`).
+var _resolved_burn_masses: PackedVector4Array = PackedVector4Array();
+
+## Resolved 4-int metadata per segment (`[burn_idx, is_first_seg, is_last_seg, jettison_stage_idx]`).
+var _resolved_burn_meta: PackedInt32Array = PackedInt32Array();
+
+## Timestamps of resolved stage jettison events across [member scheduled_burns].
+var _resolved_jettison_times: PackedFloat64Array = PackedFloat64Array();
+
+## Stage indices jettisoned at each entry in [member _resolved_jettison_times].
+var _resolved_jettison_stages: PackedInt32Array = PackedInt32Array();
+
+## Total attached vehicle mass immediately after each entry in [member _resolved_jettison_times].
+var _resolved_jettison_post_masses: PackedFloat64Array = PackedFloat64Array();
+
+## Cached initial total vehicle wet mass at epoch (`t = -INF`).
+var _initial_total_vehicle_mass: float = 1000.0;
+
+## Cached sum of Tsiolkovsky delta-v (in SI `m/s`) across all resolved elementary burn segments.
+var _total_resolved_dv_si: float = 0.0;
 
 
 ## Static helper constructing the orthonormal orbital [Basis] ([code]-Z[/code] Prograde,
@@ -1033,6 +1129,7 @@ func set_reference_plane(new_reference_plane: JrReferenceDirection) -> void:
 
 ## Invoked when the owning [JrOrbitDriver] updates its distance or time units.
 func _on_driver_units_updated() -> void:
+	_resolved_burns_dirty = true;
 	invalidate_trajectory();
 
 
@@ -2365,8 +2462,9 @@ func _on_initial_parameters_changed() -> void:
 ## Updates cached transforms and notifies followers when manual orientation changes.
 func _on_orientation_changed() -> void:
 	_driver_basis_dirty = true;
+	_resolved_burns_dirty = true;
 	_clear_fast_root_sync();
-	if _has_external_thrust and thrust_frame == ThrustFrame.BODY_LOCAL:
+	if (_has_external_thrust and thrust_frame == ThrustFrame.BODY_LOCAL) or not scheduled_burns.is_empty():
 		invalidate_trajectory();
 	_rebuild_transforms_from_anchor();
 	if Engine.is_editor_hint() or not _simulation_playing:
@@ -2421,3 +2519,639 @@ func _refresh_ghost_state() -> void:
 	var frac: float = scaled_idx - float(idx_a)
 	_ghost_relative_position = _preview_path_points[idx_a].lerp(_preview_path_points[idx_b], frac)
 	_has_ghost_position = true
+
+
+## Creates, appends, and returns a new [JrVehicleStage] in [member vehicle_stages].
+func add_vehicle_stage(
+		dry_mass: float,
+		propellant_mass: float,
+		isp: float,
+		stage_name: String = ""
+) -> JrVehicleStage:
+	var stage := JrVehicleStage.new();
+	stage.stage_name = stage_name;
+	stage.dry_mass = dry_mass;
+	stage.propellant_mass = propellant_mass;
+	stage.isp = isp;
+	stage.changed.connect(_on_burns_or_stages_changed);
+	vehicle_stages.append(stage);
+	_on_burns_or_stages_changed();
+	return stage;
+
+
+## Removes all stages from [member vehicle_stages].
+func clear_vehicle_stages() -> void:
+	if vehicle_stages.is_empty():
+		return;
+	_disconnect_stage_signals();
+	vehicle_stages.clear();
+	_on_burns_or_stages_changed();
+
+
+## Appends an existing [param burn] resource to [member scheduled_burns].
+func add_scheduled_burn(burn: JrScheduledBurn) -> void:
+	if burn == null:
+		return;
+	if not burn.changed.is_connected(_on_burns_or_stages_changed):
+		burn.changed.connect(_on_burns_or_stages_changed);
+	scheduled_burns.append(burn);
+	_on_burns_or_stages_changed();
+
+
+## Creates, schedules, and returns a standalone [JrScheduledBurn] at [param start_time] with
+## [param duration], specific impulse [param isp] (`s`), and [param direction] (default Prograde).
+func schedule_burn(
+		start_time: float,
+		duration: float,
+		isp: float,
+		direction: Vector3 = Vector3.FORWARD
+) -> JrScheduledBurn:
+	var burn := JrScheduledBurn.new();
+	burn.start_time = start_time;
+	burn.duration = duration;
+	burn.isp = isp;
+	burn.direction = direction;
+	burn.thrust_frame = ThrustFrame.ORBITAL;
+	add_scheduled_burn(burn);
+	return burn;
+
+
+## Creates, schedules, and returns a staged or mass-chained [JrScheduledBurn] at [param start_time]
+## over [param duration] consuming [param propellant_mass] along [param direction].
+func schedule_stage_burn(
+		start_time: float,
+		duration: float,
+		propellant_mass: float,
+		direction: Vector3 = Vector3.FORWARD
+) -> JrScheduledBurn:
+	var burn := JrScheduledBurn.new();
+	burn.start_time = start_time;
+	burn.duration = duration;
+	burn.propellant_mass = propellant_mass;
+	burn.use_vehicle_mass_chain = true;
+	burn.direction = direction;
+	burn.thrust_frame = ThrustFrame.ORBITAL;
+	add_scheduled_burn(burn);
+	return burn;
+
+
+## Removes [param burn] from [member scheduled_burns].
+func remove_scheduled_burn(burn: JrScheduledBurn) -> void:
+	if burn == null or not scheduled_burns.has(burn):
+		return;
+	if burn.changed.is_connected(_on_burns_or_stages_changed):
+		burn.changed.disconnect(_on_burns_or_stages_changed);
+	scheduled_burns.erase(burn);
+	_on_burns_or_stages_changed();
+
+
+## Clears all entries from [member scheduled_burns].
+func clear_scheduled_burns() -> void:
+	if scheduled_burns.is_empty():
+		return;
+	_disconnect_burn_signals();
+	scheduled_burns.clear();
+	_on_burns_or_stages_changed();
+
+
+## Returns `true` when this body has at least one active resolved elementary burn segment.
+func has_scheduled_burns() -> bool:
+	if _resolved_burns_dirty:
+		_rebuild_resolved_burns();
+	return not _resolved_burn_timing.is_empty();
+
+
+## Returns `true` when any resolved burn segment is ongoing at or scheduled after [param eval_time].
+func has_pending_or_active_burns_at(eval_time: float) -> bool:
+	if _resolved_burns_dirty:
+		_rebuild_resolved_burns();
+	var seg_count: int = _resolved_burn_timing.size();
+	if seg_count == 0:
+		return false;
+	return _resolved_burn_timing[seg_count - 1].y > eval_time - 1e-6;
+
+
+## Returns the resolved elementary burn timing segments (`Vector4(t_start, t_end, ve_driver, dm_frac_rate)`).
+func get_resolved_burn_timing() -> PackedVector4Array:
+	if _resolved_burns_dirty:
+		_rebuild_resolved_burns();
+	return _resolved_burn_timing;
+
+
+## Returns the resolved elementary burn direction/frame vectors (`Vector4(dir.x, dir.y, dir.z, is_orbital)`).
+func get_resolved_burn_dir_frame() -> PackedVector4Array:
+	if _resolved_burns_dirty:
+		_rebuild_resolved_burns();
+	return _resolved_burn_dir_frame;
+
+
+## Returns the total vehicle stack mass (in [member vehicle_mass_unit]) at simulation timestamp [param eval_time].
+func get_vehicle_mass_at(eval_time: float) -> float:
+	if _resolved_burns_dirty:
+		_rebuild_resolved_burns();
+	var cur_mass: float = _initial_total_vehicle_mass;
+	var cur_t: float = -INF;
+
+	for j: int in range(_resolved_jettison_times.size()):
+		var jt: float = _resolved_jettison_times[j];
+		if jt <= eval_time and jt >= cur_t:
+			cur_t = jt;
+			cur_mass = _resolved_jettison_post_masses[j];
+
+	for s: int in range(_resolved_burn_timing.size()):
+		var b_time: Vector4 = _resolved_burn_timing[s];
+		var b_mass: Vector4 = _resolved_burn_masses[s];
+		if eval_time < b_time.x:
+			break;
+		if eval_time < b_time.y:
+			var span: float = maxf(1e-9, b_time.y - b_time.x);
+			var frac: float = clampf((eval_time - b_time.x) / span, 0.0, 1.0);
+			return b_mass.x - (b_mass.x - b_mass.y) * frac;
+		if b_time.y >= cur_t:
+			cur_t = b_time.y;
+			cur_mass = b_mass.z;
+
+	return cur_mass;
+
+
+## Returns the active stage index in [member vehicle_stages] at [param eval_time] (`-1` if no stages).
+func get_active_stage_index_at(eval_time: float) -> int:
+	if _resolved_burns_dirty:
+		_rebuild_resolved_burns();
+	var stg_count: int = vehicle_stages.size();
+	if stg_count == 0:
+		return -1;
+	var active_idx: int = 0;
+	for j: int in range(_resolved_jettison_times.size()):
+		if _resolved_jettison_times[j] <= eval_time + 1e-7:
+			active_idx = maxi(active_idx, _resolved_jettison_stages[j] + 1);
+	return mini(active_idx, stg_count - 1);
+
+
+## Returns the remaining usable propellant in stage [param stage_idx] at [param eval_time].
+func get_stage_remaining_propellant_at(stage_idx: int, eval_time: float) -> float:
+	if _resolved_burns_dirty:
+		_rebuild_resolved_burns();
+	if stage_idx < 0 or stage_idx >= vehicle_stages.size() or vehicle_stages[stage_idx] == null:
+		return 0.0;
+	for j: int in range(_resolved_jettison_times.size()):
+		if _resolved_jettison_stages[j] == stage_idx and _resolved_jettison_times[j] <= eval_time + 1e-7:
+			return 0.0;
+
+	var rem: float = maxf(0.0, vehicle_stages[stage_idx].propellant_mass);
+	for s: int in range(_resolved_burn_timing.size()):
+		var b_mass: Vector4 = _resolved_burn_masses[s];
+		if int(roundf(b_mass.w)) != stage_idx:
+			continue;
+		var b_time: Vector4 = _resolved_burn_timing[s];
+		if eval_time <= b_time.x:
+			break;
+		var burned_seg: float = b_mass.x - b_mass.y;
+		if eval_time >= b_time.y:
+			rem -= burned_seg;
+		else:
+			var frac: float = clampf((eval_time - b_time.x) / maxf(1e-9, b_time.y - b_time.x), 0.0, 1.0);
+			rem -= burned_seg * frac;
+	return maxf(0.0, rem);
+
+
+## Returns the total Tsiolkovsky delta-v (in SI `m/s`) across all enabled [member scheduled_burns].
+func get_total_scheduled_delta_v_si() -> float:
+	if _resolved_burns_dirty:
+		_rebuild_resolved_burns();
+	return _total_resolved_dv_si;
+
+
+## Returns the total Tsiolkovsky delta-v in driver velocity units (`dist_unit / time_unit`)
+## across all enabled [member scheduled_burns].
+func get_total_scheduled_delta_v_driver() -> float:
+	return get_total_scheduled_delta_v_si() * JrOrreryUnits.get_si_to_driver_velocity_factor(
+			_driver_distance_unit,
+			_driver_time_unit
+	);
+
+
+## Evaluates the exact Tsiolkovsky velocity increment vector (in driver units) produced by all
+## scheduled burns overlapping `[time_window.x, time_window.y]` at state `([param r_rel], [param v_rel])`.
+func evaluate_scheduled_burns_dv(
+		time_window: Vector2,
+		r_rel: Vector3,
+		v_rel: Vector3
+) -> Vector3:
+	if _resolved_burns_dirty:
+		_rebuild_resolved_burns();
+	var seg_count: int = _resolved_burn_timing.size();
+	if seg_count == 0 or time_window.y <= time_window.x:
+		return Vector3.ZERO;
+
+	var t_a: float = time_window.x;
+	var t_b: float = time_window.y;
+	var total_dv := Vector3.ZERO;
+	var has_rtn: bool = false;
+	var rtn_basis := Basis.IDENTITY;
+
+	for s: int in range(seg_count):
+		var b0: Vector4 = _resolved_burn_timing[s];
+		if b0.w < 0.0:
+			if b0.x >= t_a and b0.x < t_b:
+				var b1_imp: Vector4 = _resolved_burn_dir_frame[s];
+				var dir_imp := Vector3(b1_imp.x, b1_imp.y, b1_imp.z);
+				if b1_imp.w > 0.5:
+					if not has_rtn:
+						rtn_basis = compute_orbital_rtn_basis(r_rel, v_rel);
+						has_rtn = true;
+					total_dv += (rtn_basis * dir_imp) * b0.z;
+				else:
+					total_dv += dir_imp * b0.z;
+			continue;
+		if b0.x >= t_b:
+			break;
+		if b0.y <= t_a:
+			continue;
+		var ov_a: float = maxf(t_a, b0.x) - b0.x;
+		var ov_b: float = minf(t_b, b0.y) - b0.x;
+		if ov_b <= ov_a:
+			continue;
+		var r_rate: float = b0.w;
+		var x: float = (r_rate * (ov_b - ov_a)) / maxf(1e-12, 1.0 - r_rate * ov_b);
+		var dv_mag: float = b0.z * log(1.0 + maxf(0.0, x));
+		var b1: Vector4 = _resolved_burn_dir_frame[s];
+		var dir_vec := Vector3(b1.x, b1.y, b1.z);
+		if b1.w > 0.5:
+			if not has_rtn:
+				rtn_basis = compute_orbital_rtn_basis(r_rel, v_rel);
+				has_rtn = true;
+			total_dv += (rtn_basis * dir_vec) * dv_mag;
+		else:
+			total_dv += dir_vec * dv_mag;
+
+	if is_locked_to_ecliptic() and _reference_plane != null and total_dv != Vector3.ZERO:
+		total_dv = _reference_plane.project_vector_to_ecliptic(total_dv);
+	return total_dv;
+
+
+## Emits [signal scheduled_burn_started], [signal vehicle_stage_jettisoned], and
+## [signal scheduled_burn_completed] for any boundaries crossed in `(t_prev, t_curr]`.
+func emit_scheduled_burn_events_between(t_prev: float, t_curr: float) -> void:
+	if t_curr <= t_prev:
+		return;
+	if _resolved_burns_dirty:
+		_rebuild_resolved_burns();
+	var seg_count: int = _resolved_burn_timing.size();
+	var jet_count: int = _resolved_jettison_times.size();
+	if seg_count == 0 and jet_count == 0:
+		return;
+
+	var include_start: bool = is_zero_approx(t_prev);
+	for s: int in range(seg_count):
+		var b0: Vector4 = _resolved_burn_timing[s];
+		var meta_base: int = s * 4;
+		if _resolved_burn_meta[meta_base + 1] == 1:
+			var hit_start: bool = (
+					(b0.x >= t_prev and b0.x <= t_curr)
+					if include_start
+					else (b0.x > t_prev and b0.x <= t_curr)
+			);
+			if hit_start:
+				var b_idx: int = _resolved_burn_meta[meta_base];
+				var stg_idx: int = int(roundf(_resolved_burn_masses[s].w));
+				if b_idx >= 0 and b_idx < scheduled_burns.size():
+					scheduled_burn_started.emit(scheduled_burns[b_idx], stg_idx);
+
+	for j: int in range(jet_count):
+		var jt: float = _resolved_jettison_times[j];
+		var hit_jet: bool = (jt >= t_prev and jt <= t_curr) if include_start else (jt > t_prev and jt <= t_curr);
+		if hit_jet:
+			var j_stg: int = _resolved_jettison_stages[j];
+			if j_stg >= 0 and j_stg < vehicle_stages.size():
+				vehicle_stage_jettisoned.emit(j_stg, vehicle_stages[j_stg]);
+
+	for s: int in range(seg_count):
+		var b0: Vector4 = _resolved_burn_timing[s];
+		var meta_base: int = s * 4;
+		if _resolved_burn_meta[meta_base + 2] == 1:
+			if b0.y > t_prev and b0.y <= t_curr:
+				var b_idx: int = _resolved_burn_meta[meta_base];
+				var stg_idx: int = int(roundf(_resolved_burn_masses[s].w));
+				if b_idx >= 0 and b_idx < scheduled_burns.size():
+					scheduled_burn_completed.emit(scheduled_burns[b_idx], stg_idx);
+
+
+## Connects `changed` signals on all non-null entries in [member vehicle_stages].
+func _connect_stage_signals() -> void:
+	for s: int in range(vehicle_stages.size()):
+		var stage: JrVehicleStage = vehicle_stages[s];
+		if stage != null and not stage.changed.is_connected(_on_burns_or_stages_changed):
+			stage.changed.connect(_on_burns_or_stages_changed);
+
+
+## Disconnects `changed` signals from all entries in [member vehicle_stages].
+func _disconnect_stage_signals() -> void:
+	for s: int in range(vehicle_stages.size()):
+		var stage: JrVehicleStage = vehicle_stages[s];
+		if stage != null and stage.changed.is_connected(_on_burns_or_stages_changed):
+			stage.changed.disconnect(_on_burns_or_stages_changed);
+
+
+## Connects `changed` signals on all non-null entries in [member scheduled_burns].
+func _connect_burn_signals() -> void:
+	for b: int in range(scheduled_burns.size()):
+		var burn: JrScheduledBurn = scheduled_burns[b];
+		if burn != null and not burn.changed.is_connected(_on_burns_or_stages_changed):
+			burn.changed.connect(_on_burns_or_stages_changed);
+
+
+## Disconnects `changed` signals from all entries in [member scheduled_burns].
+func _disconnect_burn_signals() -> void:
+	for b: int in range(scheduled_burns.size()):
+		var burn: JrScheduledBurn = scheduled_burns[b];
+		if burn != null and burn.changed.is_connected(_on_burns_or_stages_changed):
+			burn.changed.disconnect(_on_burns_or_stages_changed);
+
+
+## Marks resolved burn segments dirty and invalidates this body's trajectory tape when stages or burns mutate.
+func _on_burns_or_stages_changed() -> void:
+	_resolved_burns_dirty = true;
+	invalidate_trajectory();
+	if Engine.is_editor_hint():
+		orbit_visuals_changed.emit();
+
+
+## Rebuilds the sorted, stage-split elementary burn segments (`_resolved_burn_timing`,
+## `_resolved_burn_dir_frame`, `_resolved_burn_masses`, and `_resolved_jettison_times`) from
+## [member vehicle_stages] and [member scheduled_burns].
+func _rebuild_resolved_burns() -> void:
+	_resolved_burns_dirty = false;
+	_resolved_burn_timing.clear();
+	_resolved_burn_dir_frame.clear();
+	_resolved_burn_masses.clear();
+	_resolved_burn_meta.clear();
+	_resolved_jettison_times.clear();
+	_resolved_jettison_stages.clear();
+	_resolved_jettison_post_masses.clear();
+	_total_resolved_dv_si = 0.0;
+
+	var stg_count: int = vehicle_stages.size();
+	var has_stages: bool = false;
+	var stg_dry := PackedFloat64Array();
+	var stg_rem := PackedFloat64Array();
+	var stg_isp := PackedFloat64Array();
+	stg_dry.resize(stg_count);
+	stg_rem.resize(stg_count);
+	stg_isp.resize(stg_count);
+
+	var stack_sum: float = maxf(0.0, vehicle_payload_mass);
+	for s: int in range(stg_count):
+		var stg: JrVehicleStage = vehicle_stages[s];
+		if stg != null:
+			has_stages = true;
+			stg_dry[s] = maxf(0.0, stg.dry_mass);
+			stg_rem[s] = maxf(0.0, stg.propellant_mass);
+			stg_isp[s] = maxf(0.0, stg.isp);
+			stack_sum += stg_dry[s] + stg_rem[s];
+
+	_initial_total_vehicle_mass = (
+			maxf(1e-6, stack_sum)
+			if has_stages
+			else maxf(vehicle_dry_mass, vehicle_initial_mass)
+	);
+	if scheduled_burns.is_empty():
+		return;
+
+	var sorted_indices: PackedInt32Array = _get_sorted_enabled_burn_indices();
+	if sorted_indices.is_empty():
+		return;
+
+	var active_stage: int = 0;
+	var chained_mass: float = _initial_total_vehicle_mass;
+	for order_i: int in range(sorted_indices.size()):
+		var b_idx: int = sorted_indices[order_i];
+		var burn: JrScheduledBurn = scheduled_burns[b_idx];
+		if not has_stages or burn.override_stage_parameters:
+			chained_mass = _append_standalone_burn_segment(b_idx, burn, chained_mass);
+		else:
+			active_stage = _append_staged_burn_segments(
+					b_idx,
+					burn,
+					active_stage,
+					[stg_dry, stg_rem, stg_isp]
+			);
+
+
+## Returns the indices of enabled, non-null [member scheduled_burns] sorted by `start_time`.
+func _get_sorted_enabled_burn_indices() -> PackedInt32Array:
+	var indices := PackedInt32Array();
+	for i: int in range(scheduled_burns.size()):
+		var b: JrScheduledBurn = scheduled_burns[i];
+		if b != null and b.enabled:
+			indices.append(i);
+	var n: int = indices.size();
+	for i: int in range(1, n):
+		var key_idx: int = indices[i];
+		var key_t: float = scheduled_burns[key_idx].start_time;
+		var j: int = i - 1;
+		while j >= 0 and scheduled_burns[indices[j]].start_time > key_t:
+			indices[j + 1] = indices[j];
+			j -= 1;
+		indices[j + 1] = key_idx;
+	return indices;
+
+
+## Appends a standalone (non-staged or override) elementary burn segment and returns updated `chained_mass`.
+func _append_standalone_burn_segment(
+		b_idx: int,
+		burn: JrScheduledBurn,
+		chained_mass: float
+) -> float:
+	var m0: float;
+	var mf: float;
+	if burn.use_vehicle_mass_chain:
+		m0 = maxf(1e-6, chained_mass);
+		mf = maxf(maxf(1e-6, vehicle_dry_mass), m0 - maxf(0.0, burn.propellant_mass));
+	else:
+		m0 = maxf(1e-6, burn.start_mass);
+		mf = clampf(burn.end_mass, 1e-6, m0);
+
+	if m0 <= mf + 1e-9 or burn.isp <= 0.0:
+		return mf;
+
+	var dir_v4: Vector4 = _resolve_burn_dir_and_frame(burn);
+	if Vector3(dir_v4.x, dir_v4.y, dir_v4.z) == Vector3.ZERO:
+		return mf;
+
+	var ve_drv: float = JrOrreryUnits.convert_isp_to_driver_exhaust_velocity(
+			burn.isp,
+			_driver_distance_unit,
+			_driver_time_unit
+	);
+	if burn.duration <= 1e-5:
+		var dv_imp: float = ve_drv * log(m0 / mf);
+		_resolved_burn_timing.append(Vector4(burn.start_time, burn.start_time + 1e-5, dv_imp, -1.0));
+	else:
+		var dm_rate: float = ((m0 - mf) / m0) / burn.duration;
+		_resolved_burn_timing.append(
+				Vector4(burn.start_time, burn.start_time + burn.duration, ve_drv, dm_rate)
+		);
+	_resolved_burn_dir_frame.append(dir_v4);
+	_resolved_burn_masses.append(Vector4(m0, mf, mf, -1.0));
+	_resolved_burn_meta.append_array(PackedInt32Array([b_idx, 1, 1, -1]));
+	_total_resolved_dv_si += burn.isp * JrOrreryUnits.STANDARD_GRAVITY_SI * log(m0 / mf);
+	return mf;
+
+
+## Appends one or more stage-split elementary burn segments for [param burn] (`stage_arrays = [stg_dry, stg_rem, stg_isp]`),
+## returning the updated `active_stage` index.
+func _append_staged_burn_segments(
+		b_idx: int,
+		burn: JrScheduledBurn,
+		active_stage: int,
+		stage_arrays: Array
+) -> int:
+	var stg_dry: PackedFloat64Array = stage_arrays[0];
+	var stg_rem: PackedFloat64Array = stage_arrays[1];
+	var stg_isp: PackedFloat64Array = stage_arrays[2];
+	var stg_count: int = stg_dry.size();
+	var cur_stage: int = active_stage;
+
+	if burn.stage_index >= 0 and burn.stage_index > cur_stage:
+		var target_stg: int = mini(burn.stage_index, stg_count);
+		while cur_stage < target_stg:
+			stg_rem[cur_stage] = 0.0;
+			var post_m: float = _compute_remaining_stack_mass(cur_stage + 1, stg_dry, stg_rem);
+			_resolved_jettison_times.append(burn.start_time);
+			_resolved_jettison_stages.append(cur_stage);
+			_resolved_jettison_post_masses.append(post_m);
+			cur_stage += 1;
+
+	while cur_stage < stg_count and stg_rem[cur_stage] <= 1e-9:
+		if cur_stage < stg_count - 1:
+			var post_dep: float = _compute_remaining_stack_mass(cur_stage + 1, stg_dry, stg_rem);
+			_resolved_jettison_times.append(burn.start_time);
+			_resolved_jettison_stages.append(cur_stage);
+			_resolved_jettison_post_masses.append(post_dep);
+		cur_stage += 1;
+
+	if cur_stage >= stg_count:
+		return cur_stage;
+
+	var avail_total: float = 0.0;
+	for s: int in range(cur_stage, stg_count):
+		avail_total += stg_rem[s];
+	var req_prop: float = (
+			stg_rem[cur_stage]
+			if burn.burn_full_stage
+			else maxf(0.0, burn.propellant_mass)
+	);
+	var total_to_burn: float = minf(req_prop, avail_total);
+	if total_to_burn <= 1e-9:
+		if burn.jettison_after_burn and cur_stage < stg_count:
+			stg_rem[cur_stage] = 0.0;
+			var post_j: float = _compute_remaining_stack_mass(cur_stage + 1, stg_dry, stg_rem);
+			_resolved_jettison_times.append(burn.start_time);
+			_resolved_jettison_stages.append(cur_stage);
+			_resolved_jettison_post_masses.append(post_j);
+			cur_stage += 1;
+		return cur_stage;
+
+	var dir_v4: Vector4 = _resolve_burn_dir_and_frame(burn);
+	if Vector3(dir_v4.x, dir_v4.y, dir_v4.z) == Vector3.ZERO:
+		return cur_stage;
+
+	var rem_to_burn: float = total_to_burn;
+	var cur_t: float = burn.start_time;
+	var is_first: int = 1;
+
+	while rem_to_burn > 1e-9 and cur_stage < stg_count:
+		var avail_s: float = stg_rem[cur_stage];
+		if avail_s <= 1e-9:
+			cur_stage += 1;
+			continue;
+		var burn_s: float = minf(rem_to_burn, avail_s);
+		var is_last: int = 1 if (rem_to_burn - burn_s <= 1e-7) else 0;
+		var raw_dur_s: float = burn.duration * (burn_s / total_to_burn);
+		var eff_dur_s: float = maxf(1e-5, raw_dur_s);
+		var m0_stack: float = _compute_remaining_stack_mass(cur_stage, stg_dry, stg_rem);
+		stg_rem[cur_stage] = maxf(0.0, avail_s - burn_s);
+		var mf_stack: float = maxf(1e-6, m0_stack - burn_s);
+		var post_seg_mass: float = mf_stack;
+		var jet_stage: int = -1;
+
+		var depleted_s: bool = stg_rem[cur_stage] <= 1e-7;
+		var should_jettison: bool = (
+				(depleted_s and cur_stage < stg_count - 1)
+				or (is_last == 1 and burn.jettison_after_burn)
+		);
+		var seg_stage: int = cur_stage;
+		if should_jettison:
+			jet_stage = cur_stage;
+			stg_rem[cur_stage] = 0.0;
+			cur_stage += 1;
+			post_seg_mass = _compute_remaining_stack_mass(cur_stage, stg_dry, stg_rem);
+			_resolved_jettison_times.append(cur_t + eff_dur_s);
+			_resolved_jettison_stages.append(jet_stage);
+			_resolved_jettison_post_masses.append(post_seg_mass);
+
+		var isp_s: float = stg_isp[seg_stage];
+		if m0_stack > mf_stack + 1e-9 and isp_s > 0.0:
+			var ve_drv: float = JrOrreryUnits.convert_isp_to_driver_exhaust_velocity(
+					isp_s,
+					_driver_distance_unit,
+					_driver_time_unit
+			);
+			if raw_dur_s <= 1e-5:
+				var dv_imp_s: float = ve_drv * log(m0_stack / mf_stack);
+				_resolved_burn_timing.append(Vector4(cur_t, cur_t + 1e-5, dv_imp_s, -1.0));
+			else:
+				var dm_rate: float = ((m0_stack - mf_stack) / m0_stack) / raw_dur_s;
+				_resolved_burn_timing.append(Vector4(cur_t, cur_t + raw_dur_s, ve_drv, dm_rate));
+			_resolved_burn_dir_frame.append(dir_v4);
+			_resolved_burn_masses.append(Vector4(m0_stack, mf_stack, post_seg_mass, float(seg_stage)));
+			_resolved_burn_meta.append_array(PackedInt32Array([b_idx, is_first, is_last, jet_stage]));
+			_total_resolved_dv_si += isp_s * JrOrreryUnits.STANDARD_GRAVITY_SI * log(m0_stack / mf_stack);
+			is_first = 0;
+
+		cur_t += eff_dur_s;
+		rem_to_burn -= burn_s;
+
+	return cur_stage;
+
+
+## Sums `vehicle_payload_mass` plus `(dry_mass + remaining_propellant)` for stages `[from_stage .. count - 1]`.
+func _compute_remaining_stack_mass(
+		from_stage: int,
+		stg_dry: PackedFloat64Array,
+		stg_rem: PackedFloat64Array
+) -> float:
+	var total: float = maxf(0.0, vehicle_payload_mass);
+	var count: int = stg_dry.size();
+	if from_stage >= count and total <= 1e-6 and count > 0:
+		return maxf(1e-6, stg_dry[count - 1]);
+	for s: int in range(maxi(0, from_stage), count):
+		total += stg_dry[s] + stg_rem[s];
+	return maxf(1e-6, total);
+
+
+## Resolves the normalized direction and frame flag (`w = 1.0` for `ORBITAL`, `0.0` for inertial/rotated-local)
+## for [param burn].
+func _resolve_burn_dir_and_frame(burn: JrScheduledBurn) -> Vector4:
+	var raw_dir: Vector3 = (
+			Vector3(burn.direction.x, 0.0, burn.direction.z)
+			if is_locked_to_ecliptic()
+			else burn.direction
+	);
+	var len_sq: float = raw_dir.length_squared();
+	if len_sq <= 1e-16:
+		return Vector4.ZERO;
+	var unit_dir: Vector3 = raw_dir / sqrt(len_sq);
+	if burn.thrust_frame == ThrustFrame.ORBITAL:
+		return Vector4(unit_dir.x, unit_dir.y, unit_dir.z, 1.0);
+	if burn.thrust_frame == ThrustFrame.BODY_LOCAL:
+		unit_dir = (_compute_driver_basis() * unit_dir).normalized();
+	if is_locked_to_ecliptic() and _reference_plane != null:
+		unit_dir = _reference_plane.project_vector_to_ecliptic(unit_dir);
+		var p_len: float = unit_dir.length();
+		if p_len <= 1e-8:
+			return Vector4.ZERO;
+		unit_dir /= p_len;
+	return Vector4(unit_dir.x, unit_dir.y, unit_dir.z, 0.0);
+

@@ -83,7 +83,11 @@ Enabling the plugin adds five custom nodes to Godot's **Create New Node** dialog
 - **Continuous Thrusters & Instant Burns**:
   - Apply continuous acceleration (`external_acceleration`) for ion drives, low-thrust spirals, or continuous burns in **Inertial**, **Body-Local**, or **Orbital** (Prograde `-Z`, Normal `+Y`, Radial Outward `+X`) directions.
   - Trigger instant delta-v maneuvers from code with `apply_impulse()`, `apply_local_impulse()`, and `apply_orbital_impulse()`.
-- **Live Trajectory Forecasting**: Automatically predicts and exposes future flight-path points (`get_forecast_points()`, `get_forecast_points_2d()`), accounting for moving planets, continuous prograde/retrograde burns, and upcoming gravity-well transitions.
+- **Scheduled Maneuver Burns & Multi-Stage Vehicles (`JrScheduledBurn`, `JrVehicleStage`)**:
+  - Define multi-stage spacecraft stacks (`vehicle_stages: Array[JrVehicleStage]` + `vehicle_payload_mass`) with per-stage `dry_mass`, `propellant_mass`, and `isp` (specific impulse in SI seconds, $g_0 = 9.80665\text{ m/s}^2$).
+  - Schedule timed finite-duration or impulsive maneuver burns (`scheduled_burns: Array[JrScheduledBurn]`) via the Inspector or GDScript (`schedule_stage_burn()`, `schedule_burn()`).
+  - Exact Tsiolkovsky rocket-equation integration ($a(t) = \frac{I_{\text{sp}} g_0 \dot{m}}{M(t)}$) on both GPU and CPU trajectory-horizon tapes, automatic dry-mass jettisoning and mid-burn stage splitting across stage boundaries, and lifecycle signals (`scheduled_burn_started`, `scheduled_burn_completed`, `vehicle_stage_jettisoned`).
+- **Live Trajectory Forecasting**: Automatically predicts and exposes future flight-path points (`get_forecast_points()`, `get_forecast_points_2d()`), accounting for moving planets, continuous prograde/retrograde burns, scheduled multi-stage burns, and upcoming gravity-well transitions.
 
 ### Dynamic Perspectives & Reference Frames (`JrOrbitDriver`)
 - **Switch Origin to Any Body (`perspective_node`)**: Center the entire visual scene on a planet, moon, space station, or spacecraft at runtime without changing how the physics simulation runs.
@@ -171,6 +175,22 @@ func center_view_on_earth_lagrange_frame() -> void:
 	# Keep Earth at (0, 0, 0) and co-rotate the view with Earth's orbit around the Sun:
 	driver.perspective_node = earth
 	driver.perspective_rotation_mode = JrOrbitDriver.PerspectiveRotationMode.SYNODIC_ORBITAL
+
+
+func configure_two_stage_transfer() -> void:
+	# Configure a 2-stage rocket stack (1,000 kg payload) and schedule a 120s prograde burn at t = 300s:
+	ship.vehicle_payload_mass = 1000.0
+	ship.add_vehicle_stage("Booster", 1500.0, 6500.0, 310.0)
+	ship.add_vehicle_stage("Upper Stage", 500.0, 2500.0, 348.0)
+	var burn_cfg: Dictionary = {
+		"burn_name": "Trans-Lunar Injection",
+		"start_time": 300.0,
+		"duration": 120.0,
+		"propellant_mass": 8000.0, # Automatically depletes Booster (6500 kg), jettisons dry mass, and burns 1500 kg of Upper Stage
+		"thrust_frame": JrBallisticOrbiter.ThrustFrame.ORBITAL,
+		"direction": Vector3.FORWARD,
+	}
+	ship.schedule_stage_burn(burn_cfg)
 ```
 
 ### 3. Spawn Large Asteroid Belts or Debris Clouds
@@ -251,10 +271,10 @@ JR Orrery includes an opt-in, zero-overhead microsecond telemetry profiler (`JrO
 - **Resident VRAM Knot-Major SoA Tape Atlas & Fused GPU Pipeline**: For large swarms (`>= 1,024` bodies), trajectory knots stay resident in VRAM in **Knot-Major SoA layout** (`TapeAtlasBuffer`). Cohort KDK integration (`ballistic_forecast.glsl`), an in-command-list memory barrier, and 4,096-body Cubic Hermite evaluation (`ballistic_tape_sample.glsl`) execute in a **single GPU submission** and **single unified SSBO readback**, overlapped with CPU follower signal emission.
 - **GPU-Baked Periodic Cubic B-Spline Kepler Solver (`rail_kepler_spline.glsl`)**: `JrRailOrbiter` bakes a 256-segment periodic cubic B-spline lookup table (`M -> nu(M) - M`) per unique eccentricity on the GPU, evaluating exact 3D rail orbits in `O(1)` without iterative Newton–Raphson loops.
 
-### Benchmark Comparison (`v1.0` Release vs. Current)
+### Benchmark Comparison (`v1.0` Release vs. `v1.1`)
 Measured on **Godot 4.7-stable (Forward+ D3D12)**, **Intel Core Ultra 9 185H**, **NVIDIA GeForce RTX 4070 Laptop GPU**:
 
-| Benchmark Scenario | `v1.0` Mean (`ms`) | `v1.0` P95 (`ms`) | Current Mean (`ms`) | Current P50 (`ms`) | Current P95 (`ms`) | P95 Speedup |
+| Benchmark Scenario | `v1.0` Mean (`ms`) | `v1.0` P95 (`ms`) | `v1.1` Mean (`ms`) | `v1.1` P50 (`ms`) | `v1.1` P95 (`ms`) | P95 Speedup |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
 | **Planetary System [GPU]** (11 rails, 2 forecast probes) | `29.22` | `34.45` | **`0.62`** | **`0.19`** | **`0.38`** | **`91.3x`** |
 | **Real-Scale LEO [GPU]** (1 AU scale, ion spiral) | `15.93` | `20.08` | **`0.15`** | **`0.12`** | **`0.13`** | **`157.8x`** |
@@ -312,7 +332,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\benchmarks\run_benchmarks.
 ## Author, Version & License
 
 - **Author**: Jonathan Riger
-- **Version**: `1.0`
+- **Version**: `1.1`
 - **Engine Compatibility**: Godot `4.7+` (Forward+ / Vulkan / D3D12 / Metal for GPU compute shaders; automatic CPU fallback on Compatibility / Headless)
 - **License**: Released under the [MIT License](LICENSE) — free for personal and commercial use, modification, and distribution with attribution (preserving the copyright and permission notice).
 - **Development Disclosure**: System architecture, feature design, and custom icons are human-authored; generative AI tools were used to assist with code implementation, debugging, and documentation. Contains no AI-generated art, audio, or runtime AI dependencies.

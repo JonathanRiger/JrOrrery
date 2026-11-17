@@ -313,6 +313,55 @@ vec3 evaluate_thrust_acceleration(vec3 r_rel, vec3 v_rel, vec3 ext_accel, bool i
 	return x_radial * ext_accel.x + y_normal * ext_accel.y + z_back * ext_accel.z;
 }
 
+vec3 evaluate_scheduled_burns_dv(
+	vec3 r_rel,
+	vec3 v_rel,
+	float t_a,
+	float t_b,
+	uint burn_base_vec4,
+	uint burn_count
+) {
+	if (burn_count == 0u || t_b <= t_a) {
+		return vec3(0.0);
+	}
+	vec3 total_dv = vec3(0.0);
+	for (uint b = 0u; b < burn_count; b++) {
+		vec4 b0 = well_samples[burn_base_vec4 + b * 2u];
+		if (b0.w < 0.0) {
+			if (b0.x >= t_a && b0.x < t_b) {
+				vec4 b1_imp = well_samples[burn_base_vec4 + b * 2u + 1u];
+				total_dv += evaluate_thrust_acceleration(
+					r_rel,
+					v_rel,
+					b1_imp.xyz * b0.z,
+					b1_imp.w > 0.5
+				);
+			}
+			continue;
+		}
+		if (b0.x >= t_b) {
+			break;
+		}
+		if (b0.y <= t_a) {
+			continue;
+		}
+		float ov_a = max(t_a, b0.x) - b0.x;
+		float ov_b = min(t_b, b0.y) - b0.x;
+		if (ov_b <= ov_a) {
+			continue;
+		}
+		float r_rate = b0.w;
+		float x = max(0.0, (r_rate * (ov_b - ov_a)) / max(1e-9, 1.0 - r_rate * ov_b));
+		float ln_ratio = (x < 1e-2)
+			? (x * (1.0 - x * (0.5 - x * (0.33333334 - x * 0.25))))
+			: log(1.0 + x);
+		float dv_mag = b0.z * ln_ratio;
+		vec4 b1 = well_samples[burn_base_vec4 + b * 2u + 1u];
+		total_dv += evaluate_thrust_acceleration(r_rel, v_rel, b1.xyz * dv_mag, b1.w > 0.5);
+	}
+	return total_dv;
+}
+
 vec3 compute_timeline_perturbing_gravity(
 	vec3 r_rel,
 	int anchor_idx,
@@ -539,7 +588,12 @@ void main() {
 	uint out_knot_base = uint(round(input_body.anchor_frame_flags.x));
 	int anchor_idx = int(round(input_body.anchor_frame_flags.y));
 	uint mode_bits = uint(round(input_body.anchor_frame_flags.z));
-	uint substeps = clamp(uint(round(input_body.anchor_frame_flags.w)), 1u, 64u);
+	uint packed_w = uint(round(input_body.anchor_frame_flags.w));
+	uint substeps = clamp(packed_w & 127u, 1u, 64u);
+	uint burn_count = (packed_w >> 7u) & 127u;
+	uint burn_base_vec4 = (
+		(params.timeline_segments + 1u) * params.well_count + (packed_w >> 14u)
+	) * 2u;
 
 	uint low_mode = mode_bits & 15u;
 	uint atlas_slot_plus_one = mode_bits >> 4u;
@@ -611,7 +665,7 @@ void main() {
 		pert_active
 	) + evaluate_thrust_acceleration(r_rel, v_rel, ext_accel, is_orbital_thrust);
 
-	bool all_unperturbed = (!has_thrust) && (mu_anchor > 0.0) && (!pert_active);
+	bool all_unperturbed = (!has_thrust) && (burn_count == 0u) && (mu_anchor > 0.0) && (!pert_active);
 	vec3 r_job0 = r_rel;
 	vec3 v_job0 = v_rel;
 	float elapsed0 = elapsed;
@@ -655,9 +709,21 @@ void main() {
 		}
 
 		for (uint s = 0u; s < substeps; s++) {
+			float t_sub0 = elapsed;
+			float t_sub1 = elapsed + sub_dt;
 			v_rel += 0.5 * sub_dt * pert_accel;
+			if (burn_count > 0u) {
+				v_rel += 0.5 * evaluate_scheduled_burns_dv(
+					r_rel,
+					v_rel,
+					t_sub0,
+					t_sub1,
+					burn_base_vec4,
+					burn_count
+				);
+			}
 			kepler_drift(r_rel, v_rel, mu_anchor, sub_dt);
-			elapsed += sub_dt;
+			elapsed = t_sub1;
 
 			pert_accel = compute_timeline_perturbing_gravity(
 				r_rel,
@@ -669,6 +735,16 @@ void main() {
 			) + evaluate_thrust_acceleration(r_rel, v_rel, ext_accel, is_orbital_thrust);
 			if (pert_active) {
 				all_unperturbed = false;
+			}
+			if (burn_count > 0u) {
+				v_rel += 0.5 * evaluate_scheduled_burns_dv(
+					r_rel,
+					v_rel,
+					t_sub0,
+					t_sub1,
+					burn_base_vec4,
+					burn_count
+				);
 			}
 			v_rel += 0.5 * sub_dt * pert_accel;
 		}
